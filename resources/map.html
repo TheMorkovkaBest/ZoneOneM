@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>ZoneM Map</title>
+<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+<link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/@loaders.gl/core@3.3.1/dist/dist.min.js"></script>
+<script src="https://unpkg.com/@loaders.gl/gltf@3.3.1/dist/dist.min.js"></script>
+<script src="https://unpkg.com/deck.gl@8.9.0/dist.min.js"></script>
+<style>
+  :root, body[data-theme="dark"] {
+    --panel: rgba(22,27,34,0.88); --text: #e6eaf0; --dim: #9aa7b6; --border: rgba(255,255,255,0.12);
+    --pin-bg: rgba(22,27,34,0.85);
+  }
+  body[data-theme="light"] {
+    --panel: rgba(255,255,255,0.92); --text: #1c2430; --dim: #607080; --border: rgba(0,0,0,0.15);
+    --pin-bg: rgba(255,255,255,0.92);
+  }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #12161c;
+    font-family: "Segoe UI", system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  .panel { position: absolute; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; font-size: 12px; backdrop-filter: blur(6px); z-index: 5; pointer-events: none; }
+  #mode-indicator { top: 12px; left: 50%; transform: translateX(-50%); padding: 7px 14px; font-weight: 600;
+    display: none; background: rgba(62,139,255,0.92); color: #fff; border: none; max-width: 70%; text-align: center; }
+  #hud { left: 10px; top: 10px; padding: 5px 9px; font-variant-numeric: tabular-nums; }
+  #legend { right: 10px; bottom: 30px; padding: 8px 10px; }
+  #legend .row { display: flex; align-items: center; gap: 7px; margin: 3px 0; }
+  #legend .sw { width: 14px; height: 14px; border-radius: 3px; }
+  #legend .ttl { color: var(--dim); margin-bottom: 4px; font-weight: 600; }
+  #map-error { display: none; position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    background: var(--panel); color: var(--text); padding: 16px 20px; border-radius: 10px; z-index: 9;
+    border: 1px solid var(--border); max-width: 60%; text-align: center; }
+  .tower-pin { display: flex; align-items: center; gap: 5px; pointer-events: none; transform: translateY(-14px); }
+  .tower-pin .dot { width: 11px; height: 11px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 4px #000; }
+  .tower-pin .name { background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px;
+    font-size: 11px; border: 1px solid var(--border); white-space: nowrap; }
+  .tower-pin.selected .dot { box-shadow: 0 0 0 4px rgba(62,139,255,0.7); }
+  .tower-pin.selected .name { border-color: #3e8bff; font-weight: 700; }
+  .lbl { background: rgba(0,0,0,0.78); color: #ffd84a; padding: 2px 7px; border-radius: 4px; font-size: 12px;
+    font-weight: 600; white-space: nowrap; pointer-events: none; }
+  .lbl.total { background: #ffcc00; color: #000; }
+  .probe-pin { background: var(--pin-bg); color: var(--text); border: 3px solid #fff; border-radius: 8px;
+    padding: 3px 8px; font-size: 12px; font-weight: 700; white-space: nowrap; pointer-events: none; }
+  .az-handle { display: flex; align-items: center; gap: 6px; cursor: grab; }
+  .az-handle:active { cursor: grabbing; }
+  .az-handle .knob { width: 20px; height: 20px; border-radius: 50%; background: #3e8bff; border: 3px solid #fff;
+    box-shadow: 0 0 6px rgba(0,0,0,0.6); }
+  .az-handle .az-text { background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px;
+    font-size: 11px; font-weight: 700; border: 1px solid var(--border); pointer-events: none; }
+  .maplibregl-ctrl-attrib { font-size: 10px; }
+</style>
+</head>
+<body data-theme="dark">
+  <div id="map"></div>
+  <div id="hud" class="panel"><span id="hud-coords">—</span></div>
+  <div id="mode-indicator" class="panel"></div>
+  <div id="legend" class="panel">
+    <div class="ttl">Уровень сигнала</div>
+    <div class="row"><span class="sw" style="background:rgba(46,204,113,0.9)"></span>≥ −55 дБм</div>
+    <div class="row"><span class="sw" style="background:rgba(163,217,69,0.9)"></span>≥ −70 дБм</div>
+    <div class="row"><span class="sw" style="background:rgba(241,196,15,0.9)"></span>≥ −85 дБм</div>
+    <div class="row"><span class="sw" style="background:rgba(231,100,50,0.9)"></span>≥ −105 дБм</div>
+  </div>
+  <div id="map-error"></div>
+  <script>/*__GEO_UTILS__*/</script>
+  <script>/*__MAP_APP__*/</script>
+</body>
+</html>
