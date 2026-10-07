@@ -70,11 +70,12 @@ def _closed(poly):
     return ring
 
 
-def project_to_json(types, towers, algo_zone, forbidden):
+def project_to_json(types, towers, algo_zone, forbidden, network=None):
     return json.dumps({
-        "format": "zonem-project", "version": 1, "types": types,
+        "format": "zonem-project", "version": 2, "types": types,
         "towers": [t.to_dict() for t in towers],
         "zones": {"algo": algo_zone, "forbidden": forbidden},
+        "network": network,
     }, ensure_ascii=False, indent=1)
 
 

@@ -305,24 +305,38 @@ class BuildingData:
             return None
         return win >= max(1.0, float(min_height)), cx - gx0, cy - gy0
 
+    def _gather(self, gx, gy):
+        """Высоты по целым глобальным ячейкам (вызывать под self._lock)."""
+        out = np.zeros(gx.shape, dtype=float)
+        tx, ty = gx // TILE, gy // TILE
+        for key in set(zip(ty.tolist(), tx.tolist())):
+            tile = self._tiles.get(key)
+            if tile is None:
+                continue
+            m = (ty == key[0]) & (tx == key[1])
+            out[m] = tile[gy[m] - key[0] * TILE, gx[m] - key[1] * TILE]
+        return out
+
     def heights_along(self, lat, lon, ux, uy, dists_m):
         """Высоты зданий (м, 0 — пусто) вдоль луча из точки; ux/uy — единичный вектор (восток, север)."""
         dists_m = np.asarray(dists_m, dtype=float)
-        out = np.zeros(dists_m.shape, dtype=float)
         with self._lock:
             if self._origin is None or not self._tiles or dists_m.size == 0:
-                return out
+                return np.zeros(dists_m.shape, dtype=float)
             cx, cy = self._to_cells(lat, lon)
             gx = np.floor(float(cx) + ux * dists_m / GRID_RES_M).astype(np.int64)
             gy = np.floor(float(cy) + uy * dists_m / GRID_RES_M).astype(np.int64)
-            tx, ty = gx // TILE, gy // TILE
-            for key in set(zip(ty.tolist(), tx.tolist())):
-                tile = self._tiles.get(key)
-                if tile is None:
-                    continue
-                m = (ty == key[0]) & (tx == key[1])
-                out[m] = tile[gy[m] - key[0] * TILE, gx[m] - key[1] * TILE]
-        return out
+            return self._gather(gx, gy)
+
+    def heights_at(self, lats, lons):
+        """Высоты зданий (м, 0 — пусто) в массиве точек."""
+        lats = np.asarray(lats, dtype=float)
+        lons = np.asarray(lons, dtype=float)
+        with self._lock:
+            if self._origin is None or not self._tiles or lats.size == 0:
+                return np.zeros(lats.shape, dtype=float)
+            cx, cy = self._to_cells(lats, lons)
+            return self._gather(np.floor(cx).astype(np.int64), np.floor(cy).astype(np.int64))
 
     def count_in_radius(self, lat, lon, radius_m):
         """Сколько зданий (по bbox) в радиусе — для информации в интерфейсе."""

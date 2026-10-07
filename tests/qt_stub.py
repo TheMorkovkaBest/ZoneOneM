@@ -66,6 +66,14 @@ class Dummy(metaclass=_Meta):
 
     __ror__ = __or__
 
+    def __and__(self, o):
+        return self
+
+    __rand__ = __and__
+
+    def __invert__(self):
+        return self
+
     def __iter__(self):
         return iter(())
 
@@ -136,18 +144,22 @@ class QComboBox(Dummy):
     currentTextChanged = pyqtSignal()
 
     def __init__(self, *a):
-        self.items, self.cur = [], ""
+        self.items, self.cur, self.datas = [], "", []
 
     def addItems(self, items):
         for i in list(items):
             self.addItem(i)
 
-    def addItem(self, t):
+    def addItem(self, t, data=None):
         self.items.append(t)
+        self.datas.append(data)
         self.cur = self.cur or t
 
     def clear(self):
-        self.items, self.cur = [], ""
+        self.items, self.cur, self.datas = [], "", []
+
+    def currentData(self):
+        return self.datas[self.items.index(self.cur)] if self.cur in self.items else None
 
     def currentText(self):
         return self.cur
@@ -212,8 +224,56 @@ class QAction(QCheckBox):
 
 
 class QSpinBox(Dummy):
+    def __init__(self, *a):
+        self.val = 0
+
+    def setValue(self, v):
+        self.val = v
+
     def value(self):
-        return 10
+        return self.val
+
+
+class QTreeWidgetItem(Dummy):
+    def __init__(self, texts=None, *a):
+        self.texts, self.kids, self._data, self._flags = texts or [""], [], {}, 0
+
+    def addChild(self, c):
+        self.kids.append(c)
+
+    def child(self, i):
+        return self.kids[i]
+
+    def childCount(self):
+        return len(self.kids)
+
+    def setData(self, col, role, val):
+        self._data[(col, "role")] = val
+
+    def data(self, col, role):
+        return self._data.get((col, "role"))
+
+    def flags(self):
+        return 0
+
+    def setFlags(self, f):
+        pass
+
+
+class QTreeWidget(Dummy):
+    itemClicked = pyqtSignal()
+
+    def __init__(self, *a):
+        self.tops = []
+
+    def addTopLevelItem(self, it):
+        self.tops.append(it)
+
+    def topLevelItem(self, i):
+        return self.tops[i]
+
+    def topLevelItemCount(self):
+        return len(self.tops)
 
 
 class QTableWidget(Dummy):
@@ -316,7 +376,7 @@ def install():
         "PyQt6.QtSvg": {},
         "PyQt6.QtWebEngineCore": {"QWebEnginePage": QWebEnginePage},
         "PyQt6.QtWebEngineWidgets": {"QWebEngineView": QWebEngineView},
-        "PyQt6.QtWidgets": {"QMainWindow": QMainWindow, "QLabel": QLabel, "QTextBrowser": QTextBrowser,
+        "PyQt6.QtWidgets": {"QMainWindow": QMainWindow, "QTreeWidget": QTreeWidget, "QTreeWidgetItem": QTreeWidgetItem, "QLabel": QLabel, "QTextBrowser": QTextBrowser,
                             "QComboBox": QComboBox, "QCheckBox": QCheckBox, "QSpinBox": QSpinBox,
                             "QTableWidget": QTableWidget, "QMessageBox": QMessageBox},
         "PyQt6.QtGui.__acts": {"QAction": QAction},

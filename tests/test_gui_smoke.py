@@ -270,3 +270,258 @@ class TestGuiSmoke(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipIf(REAL_QT, "Настоящий PyQt6 установлен — смоук на заглушке не нужен")
+class TestGuiNetwork(unittest.TestCase):
+    """Сетевая часть и тест нагрузки через ту же заглушку Qt."""
+
+    def setUp(self):
+        import tower
+        import gui
+        self.gui = gui
+        self.tmp = tempfile.TemporaryDirectory()
+        tower.TowerDB.DEFAULT_PATH = os.path.join(self.tmp.name, "t.db")
+        gui.BASE_DIR = Path(self.tmp.name)
+        qt_stub.QSettings._store.clear()
+        qt_stub.QMessageBox.calls.clear()
+        self.app = gui.CellTower3DApp()
+        self.app.web_view.loadFinished.emit(True)
+        self.app.building_data._register_area(LAT0, LON0, 5000)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def js(self):
+        return "\n".join(self.app.web_view.page().js)
+
+    def place_tower(self, east=0.0):
+        self.app._mode_actions["place"].setChecked(True)
+        self.app.on_map_event({"type": "place", "lat": LAT0, "lon": LON0 + east / M_LON})
+
+    def place_device(self, model, east, north=0.0):
+        self.app.net_set_model(model, activate=True)              # переключает режим «Устройство»
+        self.assertEqual(self.app._mode, "device")
+        self.app.on_map_event({"type": "net_place", "lat": LAT0 + north / 111320.0, "lon": LON0 + east / M_LON})
+        return max(self.app.net.devices, key=lambda d: int(d[1:]) if d[0] == "D" else -1)
+
+    def test_startup_palette_and_ribbon(self):
+        app = self.app
+        self.assertEqual(app.net_cable, "auto")
+        self.assertEqual(app.net_dev_model, "sw_l2_24poe")
+        roles = [t.texts[0] for t in app.dev_tree.tops]
+        self.assertNotIn("Базовые станции", roles)                 # БС ставятся вкладкой «Радио»
+        self.assertIn("Коммутаторы L2 (доступ)", roles)
+        self.assertEqual(app.cable_tree.tops[0].data(0, 0), "auto")
+        self.assertIn("api.setNetwork(", self.js())
+        self.assertIn("Сеть:", app.lbl_net.text)
+        for m in ("device", "cable", "pdu"):
+            self.assertIn(m, app._mode_actions)
+        self.assertIn("Порты", app.dev_detail.text)
+
+    def test_tower_becomes_network_device(self):
+        self.place_tower()
+        net = self.app.net
+        tid = self.app.towers[0].db_id
+        self.assertIn(f"T{tid}", net.devices)
+        self.assertEqual(net.devices[f"T{tid}"].model, "bs_small")        # высота 5 м
+        self.assertIn('"tower": true', self.js())
+
+    def test_build_network_connect_ping_persist(self):
+        app = self.app
+        self.place_tower()
+        tid = f"T{app.towers[0].db_id}"
+        sw = self.place_device("sw_l2_24poe", 150)
+        csr = self.place_device("rt_csr", 300)
+        core = self.place_device("core_5gc", 600)
+        self.assertEqual(len(app.net.devices), 4)
+        self.assertEqual(app.net.devices[sw].name, "SW-1")
+        for a, b in ((tid, sw), (sw, csr), (csr, core)):
+            app._mode_actions["cable"].setChecked(True)
+            app.on_map_event({"type": "net_connect", "a": a, "b": b})
+        self.assertEqual(len(app.net.links), 3)
+        self.assertTrue(all(s.state in ("up", "warn") for s in app.net.status.values()),
+                        {k: v.reason for k, v in app.net.status.items()})
+        self.assertIn("Сеть: устройств 3, линков 3", app.lbl_net.text)
+        app.net_autoconfigure()
+        self.assertTrue(app.net.devices[core].ips)
+        app._mode_actions["pdu"].setChecked(True)
+        app.on_map_event({"type": "net_pdu", "a": tid, "b": core})
+        self.assertIn("✓", app.ping_log.text)
+        self.assertIn("RTT", app.ping_log.text)
+        self.assertIn("api.animate(", self.js())
+        self.assertTrue(self.js().count("true, \"RTT") >= 1)
+        # сеть переживает перезапуск
+        app.db.close()
+        app2 = self.gui.CellTower3DApp()
+        self.assertEqual(len(app2.net.links), 3)
+        self.assertEqual(set(app2.net.devices), set(app.net.devices))
+        self.assertEqual(app2.net.devices[core].ips, app.net.devices[core].ips)
+
+    def test_bad_cable_choice_reported(self):
+        app = self.app
+        self.place_tower()
+        tid = f"T{app.towers[0].db_id}"
+        sw = self.place_device("sw_l2_24poe", 100)
+        app.net_set_cable("cat6a", activate=True)
+        app.on_map_event({"type": "net_connect", "a": tid, "b": sw})              # у малой соты есть RJ45 — ок
+        self.assertEqual(len(app.net.links), 1)
+        app.net_set_cable("f_100g_sr4", activate=True)                              # QSFP28-оптика: портов нет
+        app.on_map_event({"type": "net_connect", "a": tid, "b": sw})
+        self.assertEqual(len(app.net.links), 1)
+        self.assertEqual(qt_stub.QMessageBox.calls[-1][0], "warning")
+        far = self.place_device("sw_l2_24poe", 400000)
+        app.net_set_cable("cat6a", activate=True)
+        app.on_map_event({"type": "net_connect", "a": sw, "b": far})               # 400 км медью — линк «не работает»
+        link = list(app.net.links.values())[-1]
+        self.assertEqual(app.net.status[link.id].state, "down")
+        self.assertIn("не работает", app.net_info.text)
+        app.net_set_cable("auto", activate=True)
+        far2 = self.place_device("sw_l3_agg10", 500000)
+        n = len(app.net.links)
+        app.on_map_event({"type": "net_connect", "a": sw, "b": far2})              # 500 км — никакой кабель
+        self.assertEqual(len(app.net.links), n)
+        self.assertEqual(qt_stub.QMessageBox.calls[-1][0], "warning")
+
+    def test_select_configure_delete(self):
+        app, gui = self.app, self.gui
+        a = self.place_device("rt_csr", 100)
+        self.assertEqual(app._net_sel, ("dev", a))
+        self.assertIn("Cell Site Router", app.net_info.text)
+        import net_ui
+
+        class FakeDlg:
+            def __init__(self, net, dev, parent=None):
+                self.dev = dev
+
+            def exec(self):
+                return True
+
+            def apply(self):
+                self.dev.name = "CSR-главный"
+                self.dev.ips = {"Te0/1": "10.9.9.1/24"}
+        orig = net_ui.DeviceDialog
+        net_ui.DeviceDialog = FakeDlg
+        try:
+            app.net_configure_selected()
+        finally:
+            net_ui.DeviceDialog = orig
+        self.assertEqual(app.net.devices[a].name, "CSR-главный")
+        self.assertEqual(app.db.get_meta("network")["devices"][0]["ips"], {"Te0/1": "10.9.9.1/24"})
+        app.net_delete_selected()
+        self.assertNotIn(a, app.net.devices)
+        self.assertEqual(app.db.get_meta("network")["devices"], [])
+        # вышку отсюда не удалить
+        self.place_tower()
+        app.on_map_event({"type": "select", "id": app.towers[0].db_id})
+        app.net_delete_selected()
+        self.assertEqual(len(app.towers), 1)
+
+    def test_move_device_updates_length(self):
+        app = self.app
+        a, b = self.place_device("sw_l2_24poe", 100), self.place_device("sw_l2_24poe", 200)
+        app.net_set_cable("cat6a", activate=True)
+        app.on_map_event({"type": "net_connect", "a": a, "b": b})
+        link = next(iter(app.net.links.values()))
+        before = app.net.status[link.id].length_m
+        app.on_map_event({"type": "net_move", "id": b, "lat": LAT0, "lon": LON0 + 500 / M_LON})
+        self.assertGreater(app.net.status[link.id].length_m, before + 100)
+
+    def test_clear_map_keeps_network(self):
+        app = self.app
+        self.place_tower()
+        tid = f"T{app.towers[0].db_id}"
+        sw = self.place_device("sw_l2_24poe", 100)
+        app.on_map_event({"type": "net_connect", "a": tid, "b": sw})
+        self.assertEqual(len(app.net.links), 1)
+        app.clear_map_only()                                       # вышки остаются в БД — кабели не теряем
+        self.assertEqual(len(app.db.get_meta("network")["links"]), 1)
+        app.clear_all()
+        self.assertEqual(len(app.net.devices), 0)
+
+    def test_load_test_radio_only_and_network(self):
+        app = self.app
+        app.on_map_event({"type": "net_pdu", "a": "x", "b": "y"})          # неизвестные id не ломают
+        app.run_load_test()
+        self.assertEqual(qt_stub.QMessageBox.calls[-1][0], "information")   # без вышек — подсказка
+        self.place_tower()
+        app.ld_users.setValue(200)
+        app.ld_steps.setValue(4)
+        app.ld_active.setValue(30)
+        app.run_load_test()
+        res = app._load_result
+        self.assertIsNotNone(res)
+        self.assertEqual(res.transport_mode, "radio_only")
+        self.assertIn("Рекомендации", app.ld_summary.text)
+        self.assertIn("только радио", app.ld_summary.text)
+        self.assertIn("api.setTraffic(", self.js())
+        self.assertIn('"linkUtil"', self.js())
+        self.assertIn("Тест нагрузки:", app.statusBar().last)
+        # с транспортом
+        tid = f"T{app.towers[0].db_id}"
+        csr = self.place_device("rt_csr", 150)
+        core = self.place_device("core_5gc", 400)
+        for a, b in ((tid, csr), (csr, core)):
+            app._mode_actions["cable"].setChecked(True)
+            app.on_map_event({"type": "net_connect", "a": a, "b": b})
+        app.run_load_test()
+        res = app._load_result
+        self.assertEqual(res.transport_mode, "network")
+        self.assertEqual(len(res.link_ids), 2)
+        self.assertIn("Линки", app.ld_summary.text)
+        app._ld_select_step(1)
+        self.assertIn("шаг 2/4", app.ld_step_lbl.text)
+        app.clear_load_results()
+        self.assertIn("api.clearTraffic()", self.js())
+
+    def test_project_export_import_keeps_network(self):
+        app, gui = self.app, self.gui
+        self.place_tower()
+        tid = f"T{app.towers[0].db_id}"
+        sw = self.place_device("sw_l2_24poe", 120)
+        app.on_map_event({"type": "net_connect", "a": tid, "b": sw})
+        path = os.path.join(self.tmp.name, "p.json")
+        app._save_dialog = lambda *a: path
+        app.export_project()
+        data = json.load(open(path, encoding="utf-8"))
+        self.assertEqual(len(data["network"]["links"]), 1)
+
+        class FakeBox:
+            class ButtonRole:
+                DestructiveRole, AcceptRole, RejectRole = 0, 1, 2
+
+            def __init__(self, *a):
+                self.btns = []
+
+            def setWindowTitle(self, *a):
+                pass
+
+            def setText(self, *a):
+                pass
+
+            def addButton(self, text, role):
+                self.btns.append((text, role))
+                return self.btns[-1]
+
+            def exec(self):
+                pass
+
+            def clickedButton(self):
+                return self.btns[0]
+
+        class FakeFD:
+            @staticmethod
+            def getOpenFileName(*a):
+                return path, ""
+        ob, of = gui.QMessageBox, gui.QFileDialog
+        gui.QMessageBox, gui.QFileDialog = FakeBox, FakeFD
+        try:
+            app.import_project()
+        finally:
+            gui.QMessageBox, gui.QFileDialog = ob, of
+        self.assertEqual(len(app.towers), 1)
+        new_tid = f"T{app.towers[0].db_id}"
+        self.assertEqual(len(app.net.links), 1)
+        link = next(iter(app.net.links.values()))
+        self.assertIn(new_tid, (link.a_dev, link.b_dev))              # связь перенесена на новую вышку
+        self.assertEqual(app.net.devices[new_tid].tower_id, app.towers[0].db_id)

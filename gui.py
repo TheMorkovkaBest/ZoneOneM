@@ -3,7 +3,7 @@ import sys
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, QThread, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import QSettings, QSize, QThread, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
 from PyQt6.QtWebEngineCore import QWebEnginePage
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -18,10 +18,14 @@ import coverage
 import exporters
 import geo
 import theme as theming
+import netcatalog
 from buildings import BuildingData
 from calculations import THRESHOLDS, ZONE_LABELS_RU, link_analysis
 from dialogs import (CalculatorDialog, CreateTypeDialog, EditTowerDialog, LinkProfileDialog,
                      QUALITY_COLORS)
+from net_ui import NetworkMixin
+from network import Network
+from ribbon import RibbonBar
 from tower import COLOR_MAP, DEFAULT_PRESETS, PARAM_KEYS, Tower, TowerDB
 
 APP_TITLE = "ZoneM — планирование радиопокрытия"
@@ -140,7 +144,7 @@ class MapPage(QWebEnginePage):
 # --------------------------------------------------------------------------- #
 #  Главное окно
 # --------------------------------------------------------------------------- #
-class CellTower3DApp(QMainWindow):
+class CellTower3DApp(NetworkMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
@@ -153,6 +157,7 @@ class CellTower3DApp(QMainWindow):
         self.base_name = self.settings.value("base", "")        # подложка; пусто — по теме
 
         self.db = TowerDB()
+        self._net_init()
         self.building_data = BuildingData(cache_dir=BASE_DIR / "buildings_cache")
         self.towers = []
         self.selected_id = None
@@ -224,7 +229,8 @@ class CellTower3DApp(QMainWindow):
         self.lbl_buildings = QLabel("Здания: нет данных")
         self.lbl_towers = QLabel("Вышек: 0")
         self.lbl_mode = QLabel("")
-        for w in (self.lbl_buildings, self.lbl_towers, self.lbl_mode):
+        self.lbl_net = QLabel("Сеть: устройств 0, линков 0")
+        for w in (self.lbl_buildings, self.lbl_towers, self.lbl_net, self.lbl_mode):
             sb.addPermanentWidget(w)
         sb.showMessage("Готово")
 
@@ -241,7 +247,10 @@ class CellTower3DApp(QMainWindow):
                 ("measure", "Линейка", "ruler", "Ctrl+3", "Расстояние и азимут между точками"),
                 ("probe", "Замер сигнала", "probe", "Ctrl+4", "Уровень сигнала в точке и профиль трассы"),
                 ("zone_algo", "Участок алгоритма", "polygon", None, "Нарисовать участок для автоматической расстановки"),
-                ("zone_forbidden", "Запретная зона", "ban", None, "Нарисовать зону, где вышки ставить нельзя")]
+                ("zone_forbidden", "Запретная зона", "ban", None, "Нарисовать зону, где вышки ставить нельзя"),
+                ("device", "Устройство", "server", "Ctrl+5", "Поставить сетевое устройство (тип — стрелка рядом или палитра «Сеть»)"),
+                ("cable", "Кабель", "link", "Ctrl+6", "Соединить два устройства (тип — стрелка рядом или палитра «Сеть»)"),
+                ("pdu", "PDU (ping)", "send", "Ctrl+7", "Послать пакет от устройства к устройству и увидеть путь")]
         for name, text, icon, sc, tip in defs:
             act = self._act(text, icon, checkable=True, shortcut=sc, tip=tip)
             act.toggled.connect(lambda checked, n=name: checked and self.set_mode(n))
@@ -251,6 +260,11 @@ class CellTower3DApp(QMainWindow):
         self.act_edit = self._act("Редактировать", "edit", self.edit_selected_tower, tip="Изменить выбранную вышку")
         self.act_delete = self._act("Удалить", "trash", self.delete_selected_tower, shortcut="Del", tip="Удалить выбранную вышку")
         self.act_recalc = self._act("Пересчитать всё", "refresh", self.recalc_all, shortcut="F5", tip="Пересчитать зоны всех вышек")
+        self.act_net_auto = self._act("Авто-IP", "sliders", self.net_autoconfigure, tip="Раздать IP и построить маршруты")
+        self.act_bom = self._act("Спецификация", "list", self.net_export_bom, tip="Спецификация оборудования и кабелей (CSV)")
+        self.act_load = self._act("Тест нагрузки", "zap", self.run_load_test, shortcut="Ctrl+L",
+                                  tip="Абоненты, трафик и загрузка сети: запуск/остановка")
+        self.act_load_clear = self._act("Сброс", "stop", self.clear_load_results, tip="Убрать результаты теста с карты")
         self.act_goto = self._act("Координаты…", "goto", self.goto_coords, shortcut="Ctrl+G", tip="Перейти к координатам")
         self.act_calc = self._act("Калькулятор", "calc", self.show_calculator, shortcut="Ctrl+K", tip="Радиокалькулятор")
         self.act_theme = self._act("Сменить тему", "moon", self.toggle_theme, shortcut="Ctrl+T")
@@ -303,33 +317,51 @@ class CellTower3DApp(QMainWindow):
     def _build_toolbar(self):
         tb = QToolBar("Инструменты")
         tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
-        for name in ("navigate", "place", "measure", "probe"):
-            tb.addAction(self._mode_actions[name])
-        tb.addSeparator()
-        tb.addAction(self.act_edit)
-        tb.addAction(self.act_delete)
-        tb.addSeparator()
-        tb.addAction(self.act_recalc)
-        tb.addAction(self.act_goto)
-        tb.addAction(self.act_calc)
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        tb.addWidget(spacer)
-        tb.addAction(self.act_import)
+        bar = RibbonBar()
+        m = self._mode_actions
+        g = bar.add_group("Карта")
+        g.add_action(m["navigate"])
+        g.add_action(self.act_goto)
+        g = bar.add_group("Радиосеть")
+        g.add_action(m["place"])
+        g.add_action(self.act_edit)
+        g.add_action(self.act_delete)
+        g.add_action(self.act_recalc)
+        g = bar.add_group("Транспортная сеть")
+        self._device_menu = self.build_device_menu()
+        self._cable_menu = self.build_cable_menu()
+        g.add_action(m["device"], self._device_menu)
+        g.add_action(m["cable"], self._cable_menu)
+        g.add_action(m["pdu"])
+        g.add_action(self.act_net_auto)
+        g.add_action(self.act_bom)
+        g = bar.add_group("Измерения")
+        g.add_action(m["measure"])
+        g.add_action(m["probe"])
+        g.add_action(self.act_calc)
+        g = bar.add_group("Нагрузка")
+        g.add_action(self.act_load)
+        g.add_action(self.act_load_clear)
+        bar.add_stretch()
+        g = bar.add_group("Файл и вид")
+        g.add_action(self.act_import)
         exp_btn = QToolButton()
         exp_btn.setText("Экспорт")
         exp_btn.setToolTip("Экспорт данных")
         exp_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        exp_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        exp_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        exp_btn.setIconSize(QSize(26, 26))
+        exp_btn.setProperty("ribbon", True)
+        exp_btn.setAutoRaise(True)
         menu = QMenu(exp_btn)
-        for a in (self.act_exp_json, self.act_exp_csv, self.act_exp_geo, self.act_exp_png):
-            menu.addAction(a)
+        for a_ in (self.act_exp_json, self.act_exp_csv, self.act_exp_geo, self.act_exp_png):
+            menu.addAction(a_)
         exp_btn.setMenu(menu)
         self._export_button = exp_btn
-        tb.addWidget(exp_btn)
-        tb.addAction(self.act_theme)
+        g.add_widget(exp_btn)
+        g.add_action(self.act_theme)
+        tb.addWidget(bar)
 
     def _section(self, text):
         lbl = QLabel(text.upper())
@@ -337,12 +369,16 @@ class CellTower3DApp(QMainWindow):
         return lbl
 
     def _build_left_panel(self):
-        panel = QWidget()
-        panel.setObjectName("panel")
-        lay = QVBoxLayout(panel)
+        tabs = QTabWidget()
+        tabs.setMinimumWidth(270)
+        tabs.setMaximumWidth(360)
+
+        # --- Радио ---
+        radio = QWidget()
+        radio.setObjectName("panel")
+        lay = QVBoxLayout(radio)
         lay.setContentsMargins(14, 10, 14, 14)
         lay.setSpacing(8)
-
         lay.addWidget(self._section("Тип вышки"))
         self.active_type_combo = QComboBox()
         self.active_type_combo.addItems(list(self.tower_types.keys()))
@@ -355,12 +391,22 @@ class CellTower3DApp(QMainWindow):
         btn_new = QPushButton("Новый тип…")
         btn_new.clicked.connect(self.show_add_tower_dialog)
         lay.addWidget(btn_new)
-
         self.chk_buildings = QCheckBox("Учитывать затухание в зданиях")
         self.chk_buildings.setChecked(True)
         self.chk_buildings.toggled.connect(lambda _: self.recalc_all())
         lay.addWidget(self.chk_buildings)
+        lay.addStretch()
+        tabs.addTab(radio, "Радио")
 
+        # --- Сеть ---
+        tabs.addTab(self.build_network_palette(), "Сеть")
+
+        # --- Участок и алгоритмы ---
+        zones = QWidget()
+        zones.setObjectName("panel")
+        lay = QVBoxLayout(zones)
+        lay.setContentsMargins(14, 10, 14, 14)
+        lay.setSpacing(8)
         lay.addWidget(self._section("Участок и зоны"))
         for name in ("zone_algo", "zone_forbidden"):
             btn = QToolButton()
@@ -379,7 +425,6 @@ class CellTower3DApp(QMainWindow):
         self.zone_info.setProperty("role", "dim")
         self.zone_info.setWordWrap(True)
         lay.addWidget(self.zone_info)
-
         lay.addWidget(self._section("Автоматическая расстановка"))
         self.algo_combo = QComboBox()
         self.algo_combo.addItems(list(auto_placement.ALGORITHMS.keys()))
@@ -395,22 +440,20 @@ class CellTower3DApp(QMainWindow):
         self.btn_run_algo.setProperty("primary", True)
         self.btn_run_algo.clicked.connect(self.run_algorithm)
         lay.addWidget(self.btn_run_algo)
-
         lay.addWidget(self._section("Покрытие участка"))
         self.stats_label = QLabel("—")
         self.stats_label.setTextFormat(Qt.TextFormat.RichText)
         self.stats_label.setWordWrap(True)
         lay.addWidget(self.stats_label)
         lay.addStretch()
-
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setWidget(panel)
-        scroll.setMinimumWidth(250)
-        scroll.setMaximumWidth(340)
+        scroll.setWidget(zones)
+        tabs.addTab(scroll, "Участок")
+        self.left_tabs = tabs
         self._update_type_summary()
-        return scroll
+        return tabs
 
     def _build_right_panel(self):
         panel = QWidget()
@@ -460,12 +503,16 @@ class CellTower3DApp(QMainWindow):
         btn_clear.clicked.connect(lambda: self._js("api.clearMeasure();"))
         ml.addWidget(btn_clear)
         tabs.addTab(meas_page, "Измерения")
+        self.net_page = self.build_network_tab()
+        tabs.addTab(self.net_page, "Сеть")
+        self.load_page = self.build_load_tab()
+        tabs.addTab(self.load_page, "Нагрузка")
         self.tabs = tabs
         split.addWidget(tabs)
         split.setSizes([260, 520])
         lay.addWidget(split, stretch=1)
-        panel.setMinimumWidth(300)
-        panel.setMaximumWidth(460)
+        panel.setMinimumWidth(320)
+        panel.setMaximumWidth(520)
         return panel
 
     # ------------------------------------------------------------------ #
@@ -483,7 +530,11 @@ class CellTower3DApp(QMainWindow):
         self._export_button.setIcon(theming.make_icon("download", t["text"]))
         self._push_theme()
         self._update_type_summary()
+        if hasattr(self, "ld_chart"):
+            self.ld_chart.theme = t
+            self.ld_chart.update()
         self._render_info_panels()
+        self._render_net_panels()
 
     def toggle_theme(self):
         self.apply_theme("light" if self.theme_name == "dark" else "dark")
@@ -514,6 +565,7 @@ class CellTower3DApp(QMainWindow):
         self._push_theme()
         self._push_towers()
         self._push_zones()
+        self._push_net()
         self._js(f"api.setMapMode('{self._mode}');")
         self._js(f"api.setRectShape({str(self.chk_rect.isChecked()).lower()});")
 
@@ -545,6 +597,18 @@ class CellTower3DApp(QMainWindow):
             self.do_probe(ev["lat"], ev["lon"])
         elif t == "zone":
             self._on_zone_drawn(ev["kind"], ev["polygon"])
+        elif t == "net_place":
+            self.net_place_device(ev["lat"], ev["lon"])
+        elif t == "net_select":
+            self.net_select_device(ev["id"])
+        elif t == "net_link_select":
+            self.net_select_link(ev["id"])
+        elif t == "net_connect":
+            self.net_connect(ev["a"], ev["b"])
+        elif t == "net_pdu":
+            self.net_ping(ev["a"], ev["b"])
+        elif t == "net_move":
+            self.net_move_device(ev["id"], ev["lat"], ev["lon"])
         elif t == "azimuth":
             self.set_tower_azimuth(ev["id"], ev["azimuth"])
         elif t == "mode":
@@ -555,12 +619,16 @@ class CellTower3DApp(QMainWindow):
         self._mode = mode
         self._js(f"api.setMapMode('{mode}');")
         names = {"navigate": "Навигация", "place": "Размещение вышек", "measure": "Линейка",
-                 "probe": "Замер сигнала", "zone_algo": "Рисование участка", "zone_forbidden": "Рисование запретной зоны"}
+                 "probe": "Замер сигнала", "zone_algo": "Рисование участка", "zone_forbidden": "Рисование запретной зоны",
+                 "device": "Размещение устройств", "cable": "Прокладка кабеля", "pdu": "PDU (ping)"}
         self.lbl_mode.setText(f"Режим: {names[mode]}")
         if mode == "measure":
             self.tabs.setCurrentIndex(2)
         elif mode == "probe":
             self.tabs.setCurrentIndex(1)
+        elif mode in ("device", "cable", "pdu"):
+            self.tabs.setCurrentWidget(self.net_page)
+            self.left_tabs.setCurrentIndex(1)
 
     # ------------------------------------------------------------------ #
     #  Здания
@@ -673,8 +741,33 @@ class CellTower3DApp(QMainWindow):
             self.towers.append(tower)
             self.selected_id = tower.db_id
 
+    def _apply_pending_network(self):
+        """Сеть из импортированного проекта: id вышек новые, поэтому БС сопоставляются по имени."""
+        data, self._pending_network = getattr(self, "_pending_network", None), None
+        if not data:
+            return
+        by_name = {t.name: t.db_id for t in self.towers}
+        remap, devices = {}, []
+        for d in data.get("devices", []):
+            if d.get("tower_id") is not None:
+                new = by_name.get(d["name"])
+                if new is None:
+                    continue
+                remap[d["id"]] = f"T{new}"
+                d = dict(d, id=f"T{new}", tower_id=new)
+            devices.append(d)
+        keep = {d["id"] for d in devices}
+        links = []
+        for l in data.get("links", []):
+            l = dict(l, a_dev=remap.get(l["a_dev"], l["a_dev"]), b_dev=remap.get(l["b_dev"], l["b_dev"]))
+            if l["a_dev"] in keep and l["b_dev"] in keep:
+                links.append(l)
+        self.net = Network.from_dict(dict(data, devices=devices, links=links))
+
     def _on_calc_finished(self, info):
         self._needs_recalc = False
+        if getattr(self, "_pending_network", None) and not self._job_queue:
+            self._apply_pending_network()
         self._refresh_all()
         if info["count"] == 1:
             t = self._current_tower()
@@ -713,13 +806,15 @@ class CellTower3DApp(QMainWindow):
     def _current_tower(self):
         return next((t for t in self.towers if t.db_id == self.selected_id), None)
 
-    def _refresh_all(self):
+    def _refresh_all(self, sync_net=True):
         self._refresh_table()
         self._push_towers()
         self._render_info_panels()
         self._update_stats()
         self._update_action_states()
         self.lbl_towers.setText(f"Вышек: {len(self.towers)}")
+        if sync_net:
+            self.net_after_towers_changed()
 
     def _refresh_table(self):
         self._block_table = True
@@ -749,6 +844,7 @@ class CellTower3DApp(QMainWindow):
                 self.tower_table.selectRow(r)
         self._block_table = False
         self._js(f"api.selectTower({json.dumps(tid)});")
+        self.net_on_tower_selected(tid)
         self._render_info_panels()
         self._update_action_states()
         if tid is not None:
@@ -830,7 +926,7 @@ class CellTower3DApp(QMainWindow):
     def clear_map_only(self):
         self.towers.clear()
         self.selected_id = None
-        self._refresh_all()
+        self._refresh_all(sync_net=False)             # вышки остаются в БД — их кабели в сети не трогаем
         self.statusBar().showMessage("Карта очищена; в БД вышки сохранены до следующей очистки/удаления")
 
     def clear_all(self):
@@ -840,9 +936,11 @@ class CellTower3DApp(QMainWindow):
         self.towers.clear()
         self.selected_id = None
         self.tower_counter = 1
+        self.net = Network()
         self._refresh_all()
 
     def load_state_from_db(self):
+        self.net_load_from_db()
         saved = self.db.get_meta("types")
         if saved:
             self.tower_types.update(saved)
@@ -1046,7 +1144,8 @@ class CellTower3DApp(QMainWindow):
     def export_project(self):
         path = self._save_dialog("Экспорт проекта", "zonem_project.json", "Проект ZoneM (*.json)")
         if path:
-            self._write(path, exporters.project_to_json(self.tower_types, self.towers, self.zone_algo, self.zone_forbidden))
+            self._write(path, exporters.project_to_json(self.tower_types, self.towers, self.zone_algo, self.zone_forbidden,
+                                                        self.net.to_dict()))
 
     def export_csv(self):
         path = self._save_dialog("Экспорт таблицы вышек", "towers.csv", "CSV (*.csv)")
@@ -1086,10 +1185,12 @@ class CellTower3DApp(QMainWindow):
         clicked = box.clickedButton()
         if clicked not in (b_replace, b_add):
             return
+        self._pending_network = None
         if clicked is b_replace:
             self.db.clear_all()
             self.towers.clear()
             self.selected_id = None
+            self._pending_network = data.get("network")
         self.tower_types.update(data.get("types") or {})
         self.db.set_meta("types", self.tower_types)
         self.active_type_combo.clear()
@@ -1115,7 +1216,7 @@ class CellTower3DApp(QMainWindow):
     def show_help(self):
         QMessageBox.information(self, "Горячие клавиши", (
             "Ctrl+1 — навигация / выбор вышки кликом\nCtrl+2 — ставить вышки\nCtrl+3 — линейка\n"
-            "Ctrl+4 — замер сигнала\nEsc — вернуться к навигации\nDel — удалить выбранную вышку\n"
+            "Ctrl+4 — замер сигнала\nCtrl+5 — устройство, Ctrl+6 — кабель, Ctrl+7 — PDU (ping)\nCtrl+L — тест нагрузки\nEsc — вернуться к навигации\nDel — удалить выбранную вышку\n"
             "F5 — пересчитать все вышки\nCtrl+G — перейти к координатам\nCtrl+K — калькулятор\n"
             "Ctrl+T — тема\n\nНа карте: Backspace / ПКМ — отменить последнюю точку, "
             "Enter или двойной клик — завершить участок.\n\nАзимут секторной вышки: выберите её и перетащите синюю ручку на карте."))
@@ -1128,7 +1229,9 @@ class CellTower3DApp(QMainWindow):
     # ------------------------------------------------------------------ #
     def closeEvent(self, event):
         self._job_queue.clear()
-        for w in (self._worker, self._hover_worker, self._cache_worker, self._algo_worker):
+        if self._load_worker:
+            self._load_worker.cancelled = True
+        for w in (self._worker, self._hover_worker, self._cache_worker, self._algo_worker, self._load_worker):
             if w and w.isRunning():
                 if not w.wait(3000):                 # сеть может висеть до таймаута — не ждём вечно
                     w.terminate()

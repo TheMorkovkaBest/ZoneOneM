@@ -12,7 +12,7 @@ out.checks.fmt = [U.fmtDist(250), U.fmtDist(1500), U.fmtBearing(45)];
 // ---------- заглушки ----------
 global.window = global;
 const makeEl = () => {
-  const el = { style: {}, textContent: '', innerHTML: '', _cls: new Set(), _kids: {},
+  const el = { style: { setProperty(k, v) { this[k] = v; } }, textContent: '', innerHTML: '', _cls: new Set(), _kids: {},
     setAttribute() {}, addEventListener() {},
     classList: { toggle(c, on) { on ? el._cls.add(c) : el._cls.delete(c); }, add(c) { el._cls.add(c); } },
     querySelector(sel) { return (el._kids[sel] = el._kids[sel] || makeEl()); } };
@@ -24,6 +24,9 @@ global.document = { getElementById: () => makeEl(), createElement: makeEl,
 global.console = { log: (m) => { if (String(m).startsWith('PY:')) out.messages.push(JSON.parse(m.slice(3))); },
   warn() {}, error() {} };
 
+const frames = [];
+global.requestAnimationFrame = (f) => { frames.push(f); return frames.length; };
+global.cancelAnimationFrame = () => {};
 let mapInst = null, markersAlive = 0;
 const markers = [];
 class Marker { constructor(o) { this.el = o.element; this.opt = o; this.h = {}; this.ll = null; this.alive = false; markers.push(this); }
@@ -125,10 +128,57 @@ api.setMapMode('measure');
 out.checks.handleHiddenInMeasure = !liveHandle();
 api.setMapMode('navigate');
 
+// ---- сеть: устройства, кабель, PDU, выбор линка, анимация, трафик ----
+const netDev = (id, role, lat, lon, tower) => ({ id, name: id, role, lat, lon, tower, powered: true, model: 'x' });
+const NET = { devices: [netDev('T1', 'tower', 47.0, 28.0, true), netDev('D1', 'switch_l2', 47.0, 28.1, false),
+                        netDev('D2', 'core', 47.0, 28.2, false)],
+  links: [{ id: 'L1', a: [47.0, 28.0], b: [47.0, 28.1], state: 'up', color: '#4cc9f0', width: 3, label: '10G · 90 м', group: 'copper', speed: 10000 },
+          { id: 'L2', a: [47.0, 28.1], b: [47.0, 28.2], state: 'down', color: '#ffb703', width: 2, label: '✕ 12000 м', group: 'fiber', speed: 0 }] };
+api.setTowers([]);                       // башни-«пины» не мешают выбору устройств
+api.setNetwork(NET);
+out.checks.netLinkFeatures = mapInst.getSource('netlinks').data.features.length;
+out.checks.netMarkers = markers.filter((m) => m.alive && m.el.className === 'net-dev').length;   // башни без своего маркера
+out.checks.linkLabels = markers.filter((m) => m.alive && m.el.className === 'link-lbl').length;
+api.setMapMode('cable'); out.messages.length = 0;
+click(0, 0, 28000 + 3, 47000 - 2);       // у T1
+fire('mousemove', { lngLat: { lat: 47.0, lng: 28.05 }, point: { x: 0, y: 0 } });
+out.checks.rubberBand = mapInst.getSource('draft').data.features.some((f) => f.geometry.type === 'LineString');
+click(0, 0, 28100 + 2, 47000 + 1);       // у D1
+out.checks.cableMsg = out.messages.filter((m) => m.type === 'net_connect').map((m) => [m.a, m.b]);
+api.setMapMode('pdu'); out.messages.length = 0;
+click(0, 0, 28100, 47000); click(0, 0, 28200, 47000);
+out.checks.pduMsg = out.messages.filter((m) => m.type === 'net_pdu').map((m) => [m.a, m.b]);
+api.setMapMode('device'); out.messages.length = 0; click(47.3, 28.3);
+out.checks.deviceMsg = out.messages.map((m) => m.type);
+api.setMapMode('navigate'); out.messages.length = 0;
+click(0, 0, 28200 + 1, 47000);           // устройство D2
+click(0, 0, 28050, 47000 + 3);           // линк L1 (между T1 и D1)
+out.checks.netSelect = out.messages.map((m) => m.type + ':' + m.id);
+const alive0 = markersAlive;
+api.animate([[47.0, 28.0], [47.0, 28.1], [47.0, 28.2]], true, 'RTT 1.2 мс');
+out.checks.animStarted = markersAlive - alive0;        // пакет
+let tNow = performance.now();
+while (frames.length) { const f = frames.shift(); tNow += 400; f(tNow); }
+out.checks.animResult = markers.filter((m) => m.alive && String(m.el.className).startsWith('pkt-result')).map((m) => m.el.textContent);
+api.animate([[47.0, 28.0]], false, 'нет маршрута');    // пакет не вышел — только метка ✗
+out.checks.animFail = markers.filter((m) => m.alive && String(m.el.className).includes('fail')).map((m) => m.el.textContent);
+api.setTraffic({ users: [[47.0, 28.05, 1], [47.0, 28.06, 3], [47.0, 28.07, 0]], lines: [[47.0, 28.05, 47.0, 28.0, 1]],
+                 linkUtil: { L1: 0.9, L2: 0.0 } });
+out.checks.trafficUsers = mapInst.getSource('trfusers').data.features.length;
+out.checks.trafficLines = mapInst.getSource('trflines').data.features.length;
+out.checks.flowDots = mapInst.getSource('flow').data.features.length > 0;
+out.checks.linkRecolored = String(mapInst.getSource('netlinks').data.features[0].properties.col).startsWith('hsl(');
+out.checks.labelPct = markers.filter((m) => m.alive && m.el.className.startsWith('link-lbl')).some((m) => m.el.textContent.includes('90%'));
+api.clearTraffic();
+out.checks.trafficCleared = mapInst.getSource('trfusers').data.features.length === 0;
+frames.length = 0;
+api.setTowers([T(1, 47.0, 28.0, rays, 360, 0), T(2, 47.1, 28.1, sector, 65, 90)]);   // вернуть вышки для проверки подложки
+api.setMapMode('navigate');
+
 // смена подложки: слои восстанавливаются, данные на месте
 api.setBase('light');
 out.checks.styleSwitch = mapInst.style.includes('positron') && !!mapInst.getLayer('coverage-fill') &&
   mapInst.getSource('coverage').data.features.length === 8;
 api.setProbe(1, 2, '-70 дБм', '#0f0'); api.clearProbe();
 console.log = () => {};
-process.stdout.write(JSON.stringify(out));
+process.stdout.write(JSON.stringify(out), () => process.exit(0));   // таймеры анимации не должны держать процесс

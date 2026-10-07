@@ -49,6 +49,23 @@
     box-shadow: 0 0 6px rgba(0,0,0,0.6); }
   .az-handle .az-text { background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px;
     font-size: 11px; font-weight: 700; border: 1px solid var(--border); pointer-events: none; }
+  .net-dev { display: flex; align-items: center; gap: 5px; cursor: grab; transform: translateY(-2px); }
+  .net-dev svg { background: var(--c, #888); border: 2px solid #fff; border-radius: 7px; padding: 4px; box-sizing: content-box;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.6); }
+  .net-dev .nm { background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px; font-size: 11px;
+    border: 1px solid var(--border); white-space: nowrap; }
+  .net-dev.selected svg { box-shadow: 0 0 0 4px rgba(62,139,255,0.8); }
+  .net-dev.unpowered svg { background: #555; opacity: 0.7; border-color: #e5484d; }
+  .link-lbl { background: var(--pin-bg); color: var(--text); padding: 0 6px; border-radius: 4px; font-size: 10.5px;
+    border: 1px solid var(--border); white-space: nowrap; pointer-events: none; }
+  .link-lbl.warn { border-color: #f5a524; } .link-lbl.bad { border-color: #e5484d; color: #ff8a8e; }
+  .link-lbl.selected { border-color: #3e8bff; font-weight: 700; }
+  .arm-ring { width: 40px; height: 40px; border-radius: 50%; border: 3px solid #3e8bff; box-shadow: 0 0 10px #3e8bff;
+    pointer-events: none; }
+  .pkt { font-size: 22px; pointer-events: none; filter: drop-shadow(0 0 4px #000); }
+  .pkt-result { padding: 3px 9px; border-radius: 12px; font-weight: 700; font-size: 12px; color: #fff; pointer-events: none;
+    transform: translateY(-26px); white-space: nowrap; }
+  .pkt-result.ok { background: #1f9d57; } .pkt-result.fail { background: #d63a40; }
   .maplibregl-ctrl-attrib { font-size: 10px; }
 </style>
 </head>

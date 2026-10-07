@@ -55,6 +55,25 @@ class TestJs(unittest.TestCase):
         self.assertEqual(c["esc"], ["mode:navigate"])
         self.assertTrue(c["styleSwitch"])
 
+    def test_network_layer(self):
+        c = self.out["checks"]
+        self.assertEqual(c["netLinkFeatures"], 2)
+        self.assertEqual(c["netMarkers"], 2)               # у башен собственных маркеров нет (рисуются как вышки)
+        self.assertEqual(c["linkLabels"], 2)
+        self.assertTrue(c["rubberBand"])
+        self.assertEqual(c["cableMsg"], [["T1", "D1"]])
+        self.assertEqual(c["pduMsg"], [["D1", "D2"]])
+        self.assertEqual(c["deviceMsg"], ["net_place"])
+        self.assertEqual(c["netSelect"], ["net_select:D2", "net_link_select:L1"])
+        self.assertEqual(c["animStarted"], 1)
+        self.assertEqual(c["animResult"], ["✓ RTT 1.2 мс"])
+        self.assertEqual(c["animFail"], ["✗ нет маршрута"])
+        self.assertEqual((c["trafficUsers"], c["trafficLines"]), (3, 1))
+        self.assertTrue(c["flowDots"])
+        self.assertTrue(c["linkRecolored"])
+        self.assertTrue(c["labelPct"])
+        self.assertTrue(c["trafficCleared"])
+
     def test_azimuth_handle(self):
         c = self.out["checks"]
         self.assertTrue(c["noHandleForOmni"])               # у круговой вышки азимут ни на что не влияет

@@ -44,6 +44,14 @@ ICONS = {
     "plus": '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
     "layers": '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
     "activity": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+    "server": '<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>',
+    "link": '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+    "send": '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+    "zap": '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+    "stop": '<rect x="5" y="5" width="14" height="14" rx="2"/>',
+    "bar": '<line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/>',
+    "sliders": '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+    "list": '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>',
     "x": '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
 }
 
@@ -97,6 +105,17 @@ QToolButton:pressed { background: @bg2; }
 QToolButton:checked { background: @accent; color: @accent_text; }
 QToolButton:disabled { color: @dim; }
 QToolButton::menu-indicator { image: none; width: 0px; }
+QSlider::groove:horizontal { height: 4px; background: @bg3; border-radius: 2px; }
+QSlider::handle:horizontal { background: @accent; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }
+QSlider::sub-page:horizontal { background: @accent; border-radius: 2px; }
+QTreeWidget { background: @bg1; border: 1px solid @border; border-radius: 8px; outline: none;
+    selection-background-color: @accent; selection-color: @accent_text; }
+QTreeWidget::item { padding: 3px 2px; }
+QPlainTextEdit { font-family: "Consolas", "Cascadia Mono", monospace; }
+QToolButton[ribbon="true"] { padding: 4px 5px; min-width: 54px; border-radius: 8px; }
+QToolButton[ribbon="true"]::menu-button { border: none; width: 12px; }
+QFrame#ribbonGroup { border: none; border-right: 1px solid @border; background: transparent; }
+QLabel[role="ribbon"] { color: @dim; font-size: 10px; }
 QToolButton[role="zone"] { background: @bg2; border: 1px solid @border; padding: 7px 10px; text-align: left; }
 QToolButton[role="zone"]:hover { border-color: @accent; }
 QToolButton[role="zone"]:checked { background: @accent; border-color: @accent; }

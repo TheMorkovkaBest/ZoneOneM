@@ -25,6 +25,20 @@
     probe: 'Замер сигнала — кликните в любую точку',
     zone_algo: 'Участок алгоритма: ЛКМ — вершины, двойной клик/Enter — завершить, ПКМ — отменить',
     zone_forbidden: 'Запретная зона: ЛКМ — вершины, двойной клик/Enter — завершить, ПКМ — отменить',
+    device: 'Установка устройства — кликните на карту (тип выбран в палитре «Сеть»)',
+    cable: 'Кабель: кликните первое устройство, затем второе (Esc — отмена)',
+    pdu: 'PDU (ping): кликните устройство-источник, затем получателя',
+  };
+  const ROLE_COLORS = { tower: '#ff5d5d', switch_l2: '#3e8bff', switch_l3: '#7c5cff', router: '#2ec4b6',
+    firewall: '#ff9f1c', radio: '#ff4d9d', core: '#30c26f' };
+  const ROLE_ICONS = {
+    switch_l2: '<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>',
+    switch_l3: '<rect x="3" y="4" width="18" height="6" rx="1"/><rect x="3" y="14" width="18" height="6" rx="1"/><line x1="7" y1="7" x2="7.01" y2="7"/><line x1="7" y1="17" x2="7.01" y2="17"/><line x1="12" y1="10" x2="12" y2="14"/>',
+    router: '<circle cx="12" cy="12" r="9"/><polyline points="9 9 12 6 15 9"/><polyline points="9 15 12 18 15 15"/><polyline points="9 9 6 12 9 15"/><polyline points="15 9 18 12 15 15"/>',
+    firewall: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+    radio: '<circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49"/>',
+    core: '<path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>',
+    tower: '<circle cx="12" cy="12" r="2"/>',
   };
   const EMPTY = { type: 'FeatureCollection', features: [] };
 
@@ -32,10 +46,14 @@
     mode: 'navigate', towers: [], selectedId: null, theme: 'dark', base: 'dark',
     zones: { algo: null, forbidden: [] }, measure: [], draft: [], rectShape: false,
     probe: null, ready: false, azPreview: null,
+    net: { devices: [], links: [] }, selDevice: null, selLink: null, cableFrom: null, traffic: null,
+    mouse: null,
   };
   let map = null, deckOverlay = null;
   const towerMarkers = new Map();
   let measureMarkers = [], probeMarker = null, azMarker = null, azDragging = false, azTimer = null;
+  const devMarkers = new Map(), linkLabels = new Map();
+  let armMarker = null, animReq = 0, animTimer = null, animMarkers = [], flowReq = 0;
 
   const $ = (id) => document.getElementById(id);
 
@@ -192,6 +210,193 @@
     azTimer = setTimeout(() => { if (!azDragging && state.azPreview) { state.azPreview = null; renderCoverage(); } }, 3000);
   }
 
+
+  /* ---------------- сеть: устройства, кабели, трафик ---------------- */
+  const utilColor = (u) => 'hsl(' + Math.round(120 * (1 - Math.min(Math.max(u, 0), 1))) + ',85%,48%)';
+  const linkUtil = (id) => (state.traffic && state.traffic.linkUtil && state.traffic.linkUtil[id] !== undefined)
+    ? state.traffic.linkUtil[id] : null;
+
+  function linkFeatures() {
+    return { type: 'FeatureCollection', features: state.net.links.map((l) => {
+      const u = linkUtil(l.id);
+      const col = (u !== null && l.state !== 'down') ? utilColor(u) : (l.state === 'warn' ? '#f5a524' : l.color);
+      return { type: 'Feature', properties: { id: l.id, state: l.state, col, width: l.width,
+        sel: l.id === state.selLink ? 1 : 0 },
+        geometry: { type: 'LineString', coordinates: [[l.a[1], l.a[0]], [l.b[1], l.b[0]]] } };
+    }) };
+  }
+
+  function renderNet() {
+    setData('netlinks', linkFeatures());
+    if (!map) return;
+    const ids = new Set(state.net.devices.filter((d) => !d.tower).map((d) => d.id));
+    for (const [id, m] of devMarkers) if (!ids.has(id)) { m.remove(); devMarkers.delete(id); }
+    for (const d of state.net.devices) {
+      if (d.tower) continue;
+      let m = devMarkers.get(d.id);
+      if (!m) {
+        const el = document.createElement('div');
+        el.className = 'net-dev';
+        el.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2" ' +
+          'stroke-linecap="round" stroke-linejoin="round">' + (ROLE_ICONS[d.role] || '') + '</svg><span class="nm"></span>';
+        m = new maplibregl.Marker({ element: el, draggable: true }).setLngLat([d.lon, d.lat]).addTo(map);
+        m.on('dragend', () => { const ll = m.getLngLat(); send({ type: 'net_move', id: d.id, lat: ll.lat, lon: ll.lng }); });
+        devMarkers.set(d.id, m);
+      }
+      m.setLngLat([d.lon, d.lat]);
+      const el = m.getElement();
+      el.style.setProperty('--c', ROLE_COLORS[d.role] || '#888');
+      el.querySelector('.nm').textContent = d.name;
+      el.classList.toggle('selected', d.id === state.selDevice);
+      el.classList.toggle('unpowered', d.powered === false);
+    }
+    const lids = new Set(state.net.links.map((l) => l.id));
+    for (const [id, m] of linkLabels) if (!lids.has(id)) { m.remove(); linkLabels.delete(id); }
+    for (const l of state.net.links) {
+      let m = linkLabels.get(l.id);
+      if (!m) {
+        const el = document.createElement('div');
+        el.className = 'link-lbl';
+        m = new maplibregl.Marker({ element: el }).addTo(map);
+        linkLabels.set(l.id, m);
+      }
+      m.setLngLat([(l.a[1] + l.b[1]) / 2, (l.a[0] + l.b[0]) / 2]);
+      const el = m.getElement();
+      const u = linkUtil(l.id);
+      el.textContent = l.label + (u !== null ? ' · ' + Math.round(u * 100) + '%' : '');
+      el.classList.toggle('bad', l.state === 'down');
+      el.classList.toggle('warn', l.state === 'warn');
+      el.classList.toggle('selected', l.id === state.selLink);
+    }
+    updateLinkLabelVisibility();
+    renderFlowDots(performance.now());
+    renderArm();
+  }
+
+  function updateLinkLabelVisibility() {
+    if (!map) return;
+    const show = map.getZoom() >= 14.5;
+    for (const [id, m] of linkLabels) m.getElement().style.display = (show || id === state.selLink) ? '' : 'none';
+  }
+
+  function renderArm() {
+    const d = state.cableFrom && state.net.devices.find((x) => x.id === state.cableFrom);
+    if (!d) { if (armMarker) { armMarker.remove(); armMarker = null; } return; }
+    if (!armMarker) {
+      const el = document.createElement('div');
+      el.className = 'arm-ring';
+      armMarker = new maplibregl.Marker({ element: el }).addTo(map);
+    }
+    armMarker.setLngLat([d.lon, d.lat]);
+  }
+
+  function pickDevice(point) {
+    let best = null, bestD = 26;
+    for (const d of state.net.devices) {
+      const p = map.project([d.lon, d.lat]);
+      const dist = Math.hypot(p.x - point.x, p.y - point.y);
+      if (dist < bestD) { bestD = dist; best = d; }
+    }
+    return best;
+  }
+  function segDist(p, a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y, len2 = dx * dx + dy * dy;
+    const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2));
+    return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+  }
+  function pickLink(point) {
+    let best = null, bestD = 9;
+    for (const l of state.net.links) {
+      const d = segDist(point, map.project([l.a[1], l.a[0]]), map.project([l.b[1], l.b[0]]));
+      if (d < bestD) { bestD = d; best = l; }
+    }
+    return best;
+  }
+
+  function renderTraffic() {
+    const t = state.traffic;
+    const users = t ? t.users.map((u) => ({ type: 'Feature', properties: { st: u[2] },
+      geometry: { type: 'Point', coordinates: [u[1], u[0]] } })) : [];
+    const lines = t ? t.lines.map((l) => ({ type: 'Feature', properties: { st: l[4] },
+      geometry: { type: 'LineString', coordinates: [[l[1], l[0]], [l[3], l[2]]] } })) : [];
+    setData('trfusers', { type: 'FeatureCollection', features: users });
+    setData('trflines', { type: 'FeatureCollection', features: lines });
+    renderNet();
+    if (t && !flowReq) flowReq = requestAnimationFrame(flowTick);
+  }
+
+  function renderFlowDots(now) {
+    const feats = [];
+    if (state.traffic && state.traffic.linkUtil) {
+      for (const l of state.net.links) {
+        const u = linkUtil(l.id);
+        if (u === null || u <= 0.01 || l.state === 'down') continue;
+        const n = 1 + Math.round(u * 5), period = 2600 - u * 1700;
+        for (let k = 0; k < n; k++) {
+          const f = ((now / period) + k / n) % 1;
+          const g = 1 - (((now / period) * 0.8 + (k + 0.5) / n) % 1);
+          feats.push({ type: 'Feature', properties: { col: utilColor(u) }, geometry: { type: 'Point',
+            coordinates: [l.a[1] + (l.b[1] - l.a[1]) * f, l.a[0] + (l.b[0] - l.a[0]) * f] } });
+          if (k % 2 === 0) feats.push({ type: 'Feature', properties: { col: utilColor(u) }, geometry: { type: 'Point',
+            coordinates: [l.a[1] + (l.b[1] - l.a[1]) * g, l.a[0] + (l.b[0] - l.a[0]) * g] } });
+        }
+      }
+    }
+    setData('flow', { type: 'FeatureCollection', features: feats });
+  }
+  function flowTick(now) {
+    flowReq = 0;
+    if (!state.traffic) { renderFlowDots(now); return; }
+    renderFlowDots(now);
+    flowReq = requestAnimationFrame(flowTick);
+  }
+
+  function clearAnim() {
+    if (animReq) { cancelAnimationFrame(animReq); animReq = 0; }
+    clearTimeout(animTimer);
+    animMarkers.forEach((m) => m.remove());
+    animMarkers = [];
+  }
+  /* path — [[lat, lon], ...] через все узлы; пакет «едет» по ломаной, по окончании — результат ✓/✗ */
+  function animate(path, ok, label) {
+    clearAnim();
+    if (!map || !path.length) return;
+    const mk = (cls, text, ll) => {
+      const el = document.createElement('div');
+      el.className = cls;
+      el.textContent = text;
+      const m = new maplibregl.Marker({ element: el }).setLngLat([ll[1], ll[0]]).addTo(map);
+      animMarkers.push(m);
+      return m;
+    };
+    const finish = () => {
+      const end = path[path.length - 1];
+      mk('pkt-result ' + (ok ? 'ok' : 'fail'), (ok ? '✓ ' : '✗ ') + (label || ''), end);
+      animTimer = setTimeout(clearAnim, 5000);
+    };
+    if (path.length < 2) { finish(); return; }
+    const pkt = mk('pkt', '✉', path[0]);
+    const segs = [];
+    for (let i = 0; i < path.length - 1; i++) {
+      const d = U.haversine(path[i][0], path[i][1], path[i + 1][0], path[i + 1][1]);
+      segs.push({ a: path[i], b: path[i + 1], dur: Math.max(350, Math.min(1100, d / 2)) });
+    }
+    let i = 0, t0 = performance.now();
+    const step = (now) => {
+      const sg = segs[i], k = Math.min(1, (now - t0) / sg.dur);
+      pkt.setLngLat([sg.a[1] + (sg.b[1] - sg.a[1]) * k, sg.a[0] + (sg.b[0] - sg.a[0]) * k]);
+      if (k >= 1) { i++; t0 = now; if (i >= segs.length) { pkt.remove(); finish(); return; } }
+      animReq = requestAnimationFrame(step);
+    };
+    animReq = requestAnimationFrame(step);
+  }
+
+  function rubberBand() {
+    const d = state.cableFrom && state.net.devices.find((x) => x.id === state.cableFrom);
+    if (!d || !state.mouse) { renderDraft(); return; }
+    setData('draft', lineFrom([d.lon, d.lat], [state.mouse.lng, state.mouse.lat]));
+  }
+
   function renderDeck() {
     if (!deckOverlay || typeof deck === 'undefined') return;
     const layers = [];
@@ -213,7 +418,7 @@
   /* ---------------- слои карты (пересоздаются при смене подложки) ---------------- */
   function setupLayers() {
     if (map.getSource('coverage')) return;
-    for (const id of ['coverage', 'zones', 'draft', 'measure', 'azline']) map.addSource(id, { type: 'geojson', data: EMPTY });
+    for (const id of ['coverage', 'zones', 'draft', 'measure', 'azline', 'netlinks', 'flow', 'trfusers', 'trflines']) map.addSource(id, { type: 'geojson', data: EMPTY });
     map.addLayer({ id: 'coverage-fill', type: 'fill', source: 'coverage',
       paint: { 'fill-color': ['get', 'fill'], 'fill-opacity': 0.75 } });
     map.addLayer({ id: 'coverage-outline', type: 'line', source: 'coverage',
@@ -243,7 +448,21 @@
       paint: { 'circle-radius': 4.5, 'circle-color': '#ffffff', 'circle-stroke-color': '#3e8bff', 'circle-stroke-width': 2 } });
     map.addLayer({ id: 'azline', type: 'line', source: 'azline',
       paint: { 'line-color': '#3e8bff', 'line-width': 2.5, 'line-dasharray': [2, 1.5] } });
-    renderCoverage(); renderZones(); renderMeasure(); renderDraft();
+    map.addLayer({ id: 'trf-lines', type: 'line', source: 'trflines',
+      paint: { 'line-color': ['match', ['get', 'st'], 2, 'rgba(245,165,36,0.45)', 'rgba(46,204,113,0.35)'], 'line-width': 1 } });
+    map.addLayer({ id: 'trf-users', type: 'circle', source: 'trfusers', paint: {
+      'circle-radius': ['match', ['get', 'st'], 0, 2, 3.5],
+      'circle-color': ['match', ['get', 'st'], 1, '#2ecc71', 2, '#f5a524', 3, '#e5484d', '#8a93a0'],
+      'circle-opacity': ['match', ['get', 'st'], 0, 0.45, 0.95], 'circle-stroke-width': 0.5,
+      'circle-stroke-color': '#000' } });
+    map.addLayer({ id: 'netlinks-down', type: 'line', source: 'netlinks', filter: ['==', ['get', 'state'], 'down'],
+      paint: { 'line-color': '#e5484d', 'line-width': 3, 'line-dasharray': [1.5, 1.5] } });
+    map.addLayer({ id: 'netlinks-solid', type: 'line', source: 'netlinks', filter: ['!=', ['get', 'state'], 'down'],
+      paint: { 'line-color': ['get', 'col'],
+        'line-width': ['+', ['get', 'width'], ['case', ['==', ['get', 'sel'], 1], 3, 0]] } });
+    map.addLayer({ id: 'flow-dots', type: 'circle', source: 'flow', paint: {
+      'circle-radius': 3.2, 'circle-color': '#ffffff', 'circle-stroke-color': ['get', 'col'], 'circle-stroke-width': 1.5 } });
+    renderCoverage(); renderZones(); renderMeasure(); renderDraft(); renderNet(); renderTraffic();
   }
 
   /* ---------------- режимы и взаимодействие ---------------- */
@@ -252,11 +471,12 @@
   function setMapMode(mode) {
     if (drawing() && state.mode !== mode) { state.draft = []; renderDraft(); }
     state.mode = mode;
+    state.cableFrom = null; renderArm(); renderDraft();
     const ind = $('mode-indicator');
     if (ind) { ind.textContent = HINTS[mode] || ''; ind.style.display = HINTS[mode] ? 'block' : 'none'; }
     if (map) {
-      map.getCanvas().style.cursor = { select: 'pointer', place: 'cell', measure: 'crosshair',
-        probe: 'crosshair', zone_algo: 'crosshair', zone_forbidden: 'crosshair' }[mode] || '';
+      map.getCanvas().style.cursor = { select: 'pointer', place: 'cell', measure: 'crosshair', device: 'cell',
+        cable: 'alias', pdu: 'alias', probe: 'crosshair', zone_algo: 'crosshair', zone_forbidden: 'crosshair' }[mode] || '';
       if (drawing()) map.doubleClickZoom.disable(); else map.doubleClickZoom.enable();
     }
     renderAzimuthHandle();
@@ -287,7 +507,23 @@
     switch (state.mode) {
       case 'navigate': case 'select': {
         const t = pickTower(e.point);
-        if (t || state.mode === 'select') send({ type: 'select', id: t ? t.id : null });
+        if (t) { send({ type: 'select', id: t.id }); break; }
+        const d = pickDevice(e.point);
+        if (d) { state.selDevice = d.id; state.selLink = null; renderNet(); send({ type: 'net_select', id: d.id }); break; }
+        const l = pickLink(e.point);
+        if (l) { state.selLink = l.id; state.selDevice = null; renderNet(); renderCoverage(); send({ type: 'net_link_select', id: l.id }); break; }
+        if (state.mode === 'select') send({ type: 'select', id: null });
+        break;
+      }
+      case 'device': send({ type: 'net_place', lat, lon }); break;
+      case 'cable': case 'pdu': {
+        const d = pickDevice(e.point);
+        if (!d) break;
+        if (!state.cableFrom) { state.cableFrom = d.id; renderArm(); break; }
+        if (d.id === state.cableFrom) break;
+        const a = state.cableFrom;
+        state.cableFrom = null; renderArm(); renderDraft();
+        send({ type: state.mode === 'cable' ? 'net_connect' : 'net_pdu', a, b: d.id });
         break;
       }
       case 'place': send({ type: 'place', lat, lon }); break;
@@ -315,7 +551,7 @@
 
   function onKey(ev) {
     if (ev.key === 'Escape') {
-      state.draft = []; renderDraft();
+      state.draft = []; state.cableFrom = null; renderArm(); renderDraft(); clearAnim();
       send({ type: 'mode', mode: 'navigate' });
     } else if (ev.key === 'Backspace') undoLast();
     else if (ev.key === 'Enter' && drawing() && !state.rectShape) finishZone();
@@ -354,6 +590,12 @@
       state.base = name;
       map.setStyle(STYLES[name]);       // слои вернёт обработчик style.load
     },
+    setNetwork(net) { state.net = net; renderNet(); },
+    selectDevice(id) { state.selDevice = id; if (id) state.selLink = null; renderNet(); },
+    selectLink(id) { state.selLink = id; if (id) state.selDevice = null; renderNet(); },
+    animate,
+    setTraffic(t) { state.traffic = t; renderTraffic(); },
+    clearTraffic() { state.traffic = null; renderTraffic(); },
     getState() { return state; },
   };
   window.api = api;
@@ -378,7 +620,7 @@
     if (!state.ready) { state.ready = true; send({ type: 'ready' }); }
   });
   map.on('error', (e) => { if (e && e.error) console.warn('map error: ' + e.error.message); });
-  map.on('zoom', () => { if (!azDragging) renderAzimuthHandle(); });
+  map.on('zoom', () => { if (!azDragging) renderAzimuthHandle(); updateLinkLabelVisibility(); });
   map.on('click', onClick);
   map.on('dblclick', onDblClick);
   map.on('contextmenu', (e) => { e.preventDefault(); undoLast(); });
@@ -386,6 +628,8 @@
   let hoverThrottle = 0, hudThrottle = 0;
   map.on('mousemove', (e) => {
     const now = Date.now();
+    state.mouse = e.lngLat;
+    if (state.cableFrom) rubberBand();
     if (now - hudThrottle > 40) {
       hudThrottle = now;
       const h = $('hud-coords');
