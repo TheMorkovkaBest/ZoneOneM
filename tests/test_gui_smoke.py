@@ -33,7 +33,7 @@ class TestGuiSmoke(unittest.TestCase):
         import tower
         import gui
         self.gui = gui
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         tower.TowerDB.DEFAULT_PATH = os.path.join(self.tmp.name, "t.db")
         gui.BASE_DIR = Path(self.tmp.name)
         qt_stub.QSettings._store.clear()
@@ -46,6 +46,7 @@ class TestGuiSmoke(unittest.TestCase):
         self.app.web_view.loadFinished.emit(True)
 
     def tearDown(self):
+        self.app.db.close()                # Windows: открытый файл БД не даёт удалить временную папку
         self.tmp.cleanup()
 
     def js(self):
@@ -280,7 +281,7 @@ class TestGuiNetwork(unittest.TestCase):
         import tower
         import gui
         self.gui = gui
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         tower.TowerDB.DEFAULT_PATH = os.path.join(self.tmp.name, "t.db")
         gui.BASE_DIR = Path(self.tmp.name)
         qt_stub.QSettings._store.clear()
@@ -290,6 +291,7 @@ class TestGuiNetwork(unittest.TestCase):
         self.app.building_data._register_area(LAT0, LON0, 5000)
 
     def tearDown(self):
+        self.app.db.close()                # Windows: открытый файл БД не даёт удалить временную папку
         self.tmp.cleanup()
 
     def js(self):
@@ -525,3 +527,145 @@ class TestGuiNetwork(unittest.TestCase):
         link = next(iter(app.net.links.values()))
         self.assertIn(new_tid, (link.a_dev, link.b_dev))              # связь перенесена на новую вышку
         self.assertEqual(app.net.devices[new_tid].tower_id, app.towers[0].db_id)
+
+
+@unittest.skipIf(REAL_QT, "Настоящий PyQt6 установлен — смоук на заглушке не нужен")
+class TestGuiRegressions(unittest.TestCase):
+    """Первая вышка без ожидания сети, очередь расчётов, кабели после «Очистить карту», импорт сети."""
+
+    def setUp(self):
+        import tower
+        import gui
+        self.gui = gui
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        tower.TowerDB.DEFAULT_PATH = os.path.join(self.tmp.name, "t.db")
+        gui.BASE_DIR = Path(self.tmp.name)
+        qt_stub.QSettings._store.clear()
+        qt_stub.QMessageBox.calls.clear()
+        self.app = gui.CellTower3DApp()
+        self.app.web_view.loadFinished.emit(True)
+
+    def tearDown(self):
+        self.app.db.close()
+        self.tmp.cleanup()
+
+    def place(self, east=0.0):
+        self.app._mode_actions["place"].setChecked(True)
+        self.app.on_map_event({"type": "place", "lat": LAT0, "lon": LON0 + east / M_LON})
+
+    def test_first_tower_does_not_wait_for_network(self):
+        app, city = self.app, make_city()
+        events = []
+
+        def slow_fetch(lat, lon, need_m=600.0, radius_m=900, cancel=None):
+            events.append(("fetch", len(app.towers)))          # к началу загрузки вышка уже на карте
+            app.building_data.add_buildings([{"id": b["id"], "height": b["height"], "poly": b["poly"]}
+                                             for b in city.buildings])
+            app.building_data._register_area(LAT0, LON0, 5000)
+            return True
+        app.building_data.ensure_loaded = slow_fetch
+        self.place()
+        self.assertEqual(events, [("fetch", 1)])
+        t = app.towers[0]
+        self.assertTrue(t.used_buildings)                         # после загрузки — пересчитана со зданиями
+        self.assertFalse(t.buildings_pending)
+        self.assertEqual(len(app.db.load_all_towers()), 1)        # не задвоилась
+
+    def test_network_failure_keeps_tower_and_reports(self):
+        app = self.app
+        app.building_data.ensure_loaded = lambda *a, **k: False
+        self.place()
+        self.assertEqual(len(app.towers), 1)
+        self.assertTrue(app.towers[0].buildings_pending)
+        self.assertIn("НЕТ СЕТИ", app.statusBar().last)
+
+    def test_queue_does_not_stall_while_thread_finishing(self):
+        app, gui = self.app, self.gui
+        app.building_data._register_area(LAT0, LON0, 5000)
+        orig = gui.CalcWorker.isRunning
+        gui.CalcWorker.isRunning = lambda self: True              # «готово» пришло, поток ещё не вышел из run()
+        first = app._on_tower_done
+        state = {"n": 0}
+
+        def on_done(tower, job):
+            first(tower, job)
+            state["n"] += 1
+            if state["n"] == 1:                                   # пользователь кликнул второй раз во время расчёта
+                self.place(300)
+        app._on_tower_done = on_done
+        try:
+            self.place()
+        finally:
+            gui.CalcWorker.isRunning = orig
+        self.assertEqual(len(app.towers), 2)
+
+    def test_clear_map_then_new_tower_keeps_old_cables(self):
+        app = self.app
+        app.building_data._register_area(LAT0, LON0, 5000)
+        self.place()
+        tid = f"T{app.towers[0].db_id}"
+        app.net_set_model("sw_l2_24poe", activate=True)
+        app.on_map_event({"type": "net_place", "lat": LAT0, "lon": LON0 + 100 / M_LON})
+        sw = next(d for d in app.net.devices if d.startswith("D"))
+        app.on_map_event({"type": "net_connect", "a": tid, "b": sw})
+        self.assertEqual(len(app.net.links), 1)
+        app.clear_map_only()
+        self.place(500)                                           # новая вышка: раньше sync удалял кабели старой
+        self.assertEqual(len(app.net.links), 1)
+        self.assertIn(tid, app.net.devices)
+        js = next(j for j in reversed(app.web_view.page().js) if "setNetwork" in j)
+        self.assertNotIn(f'"id": "{tid}"', js)                    # невидимую БС на карту не отдаём
+
+    def test_import_maps_network_by_tower_id_not_name(self):
+        app, gui = self.app, self.gui
+        app.building_data._register_area(LAT0, LON0, 5000)
+        self.place()
+        self.place(400)
+        for t in app.towers:                                      # одинаковые имена у разных вышек
+            t.name = "Вышка"
+        app.net_after_towers_changed()
+        t1, t2 = (f"T{t.db_id}" for t in app.towers)
+        app.net_set_model("sw_l3_agg10", activate=True)
+        app.on_map_event({"type": "net_place", "lat": LAT0, "lon": LON0 + 600 / M_LON})
+        sw = next(d for d in app.net.devices if d.startswith("D"))
+        app.on_map_event({"type": "net_connect", "a": t2, "b": sw})
+        path = os.path.join(self.tmp.name, "p.json")
+        app._save_dialog = lambda *a: path
+        app.export_project()
+
+        class FakeBox:
+            class ButtonRole:
+                DestructiveRole, AcceptRole, RejectRole = 0, 1, 2
+
+            def __init__(self, *a):
+                self.btns = []
+
+            def setWindowTitle(self, *a):
+                pass
+
+            def setText(self, *a):
+                pass
+
+            def addButton(self, text, role):
+                self.btns.append((text, role))
+                return self.btns[-1]
+
+            def exec(self):
+                pass
+
+            def clickedButton(self):
+                return self.btns[0]
+
+        class FakeFD:
+            @staticmethod
+            def getOpenFileName(*a):
+                return path, ""
+        ob, of = gui.QMessageBox, gui.QFileDialog
+        gui.QMessageBox, gui.QFileDialog = FakeBox, FakeFD
+        try:
+            app.import_project()
+        finally:
+            gui.QMessageBox, gui.QFileDialog = ob, of
+        link = next(iter(app.net.links.values()))
+        second = f"T{app.towers[1].db_id}"                        # кабель был у второй вышки
+        self.assertIn(second, (link.a_dev, link.b_dev))

@@ -26,7 +26,7 @@
     zone_algo: 'Участок алгоритма: ЛКМ — вершины, двойной клик/Enter — завершить, ПКМ — отменить',
     zone_forbidden: 'Запретная зона: ЛКМ — вершины, двойной клик/Enter — завершить, ПКМ — отменить',
     device: 'Установка устройства — кликните на карту (тип выбран в палитре «Сеть»)',
-    cable: 'Кабель: кликните первое устройство, затем второе (Esc — отмена)',
+    cable: 'Кабель: кликните первое устройство или вышку, затем второе (ПКМ — отменить выбор, Esc — выход)',
     pdu: 'PDU (ping): кликните устройство-источник, затем получателя',
   };
   const ROLE_COLORS = { tower: '#ff5d5d', switch_l2: '#3e8bff', switch_l3: '#7c5cff', router: '#2ec4b6',
@@ -237,14 +237,16 @@
       if (!m) {
         const el = document.createElement('div');
         el.className = 'net-dev';
+        if (el.dataset) el.dataset.devId = d.id;
         el.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2" ' +
           'stroke-linecap="round" stroke-linejoin="round">' + (ROLE_ICONS[d.role] || '') + '</svg><span class="nm"></span>';
-        m = new maplibregl.Marker({ element: el, draggable: true }).setLngLat([d.lon, d.lat]).addTo(map);
+        m = new maplibregl.Marker({ element: el, draggable: canDrag() }).setLngLat([d.lon, d.lat]).addTo(map);
         m.on('dragend', () => { const ll = m.getLngLat(); send({ type: 'net_move', id: d.id, lat: ll.lat, lon: ll.lng }); });
         devMarkers.set(d.id, m);
       }
       m.setLngLat([d.lon, d.lat]);
       const el = m.getElement();
+      el.classList.toggle('movable', canDrag());
       el.style.setProperty('--c', ROLE_COLORS[d.role] || '#888');
       el.querySelector('.nm').textContent = d.name;
       el.classList.toggle('selected', d.id === state.selDevice);
@@ -290,7 +292,27 @@
     armMarker.setLngLat([d.lon, d.lat]);
   }
 
-  function pickDevice(point) {
+  /* Устройства перетаскиваются только в режиме навигации: в режимах «Кабель»/PDU малейшее
+     движение мыши при клике превращало клик в перетаскивание — устройство сдвигалось, а кабель не создавался. */
+  const canDrag = () => state.mode === 'navigate';
+  function updateDraggable() {
+    for (const m of devMarkers.values()) {
+      if (m.setDraggable) m.setDraggable(canDrag());
+      m.getElement().classList.toggle('movable', canDrag());
+    }
+  }
+
+  /* Клик пришёлся прямо на значок устройства — берём его без поиска по расстоянию. */
+  function deviceFromEvent(e) {
+    const tgt = e && e.originalEvent && e.originalEvent.target;
+    const el = tgt && tgt.closest ? tgt.closest('.net-dev') : null;
+    const id = el && el.dataset ? el.dataset.devId : null;
+    return id ? state.net.devices.find((x) => x.id === id) || null : null;
+  }
+
+  function pickDevice(point, e) {
+    const direct = deviceFromEvent(e);
+    if (direct) return direct;
     let best = null, bestD = 26;
     for (const d of state.net.devices) {
       const p = map.project([d.lon, d.lat]);
@@ -471,7 +493,7 @@
   function setMapMode(mode) {
     if (drawing() && state.mode !== mode) { state.draft = []; renderDraft(); }
     state.mode = mode;
-    state.cableFrom = null; renderArm(); renderDraft();
+    state.cableFrom = null; renderArm(); renderDraft(); updateDraggable();
     const ind = $('mode-indicator');
     if (ind) { ind.textContent = HINTS[mode] || ''; ind.style.display = HINTS[mode] ? 'block' : 'none'; }
     if (map) {
@@ -498,6 +520,7 @@
     state.draft = []; renderDraft();
   }
   function undoLast() {
+    if (state.cableFrom) { state.cableFrom = null; renderArm(); renderDraft(); return; }   // отмена начатого кабеля
     if (state.mode === 'measure') { state.measure.pop(); renderMeasure(); send({ type: 'measure', points: state.measure.slice() }); }
     else if (drawing()) { state.draft.pop(); renderDraft(); }
   }
@@ -506,9 +529,9 @@
     const lat = e.lngLat.lat, lon = e.lngLat.lng;
     switch (state.mode) {
       case 'navigate': case 'select': {
-        const t = pickTower(e.point);
+        const t = deviceFromEvent(e) ? null : pickTower(e.point);
         if (t) { send({ type: 'select', id: t.id }); break; }
-        const d = pickDevice(e.point);
+        const d = pickDevice(e.point, e);
         if (d) { state.selDevice = d.id; state.selLink = null; renderNet(); send({ type: 'net_select', id: d.id }); break; }
         const l = pickLink(e.point);
         if (l) { state.selLink = l.id; state.selDevice = null; renderNet(); renderCoverage(); send({ type: 'net_link_select', id: l.id }); break; }
@@ -517,7 +540,7 @@
       }
       case 'device': send({ type: 'net_place', lat, lon }); break;
       case 'cable': case 'pdu': {
-        const d = pickDevice(e.point);
+        const d = pickDevice(e.point, e);
         if (!d) break;
         if (!state.cableFrom) { state.cableFrom = d.id; renderArm(); break; }
         if (d.id === state.cableFrom) break;
@@ -635,7 +658,7 @@
       const h = $('hud-coords');
       if (h) h.textContent = e.lngLat.lat.toFixed(6) + ', ' + e.lngLat.lng.toFixed(6);
     }
-    if (now - hoverThrottle > 1500) {
+    if ((state.mode === 'place' || state.mode === 'probe') && now - hoverThrottle > 1500) {   // предзагрузка зданий
       hoverThrottle = now;
       send({ type: 'hover_load', lat: e.lngLat.lat, lon: e.lngLat.lng });
     }

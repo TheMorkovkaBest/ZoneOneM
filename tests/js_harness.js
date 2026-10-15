@@ -13,7 +13,8 @@ out.checks.fmt = [U.fmtDist(250), U.fmtDist(1500), U.fmtBearing(45)];
 global.window = global;
 const makeEl = () => {
   const el = { style: { setProperty(k, v) { this[k] = v; } }, textContent: '', innerHTML: '', _cls: new Set(), _kids: {},
-    setAttribute() {}, addEventListener() {},
+    dataset: {}, setAttribute() {}, addEventListener() {},
+    closest(sel) { return sel === '.' + String(el.className).split(' ')[0] ? el : null; },
     classList: { toggle(c, on) { on ? el._cls.add(c) : el._cls.delete(c); }, add(c) { el._cls.add(c); } },
     querySelector(sel) { return (el._kids[sel] = el._kids[sel] || makeEl()); } };
   return el;
@@ -32,6 +33,7 @@ const markers = [];
 class Marker { constructor(o) { this.el = o.element; this.opt = o; this.h = {}; this.ll = null; this.alive = false; markers.push(this); }
   setLngLat(ll) { this.ll = ll; return this; } getLngLat() { return { lng: this.ll[0], lat: this.ll[1] }; }
   on(e, f) { this.h[e] = f; return this; }
+  setDraggable(v) { this.opt.draggable = v; return this; }
   addTo() { markersAlive++; this.alive = true; return this; }
   remove() { if (this.alive) markersAlive--; this.alive = false; } getElement() { return this.el; } }
 class Src { constructor(d) { this.data = d.data; } setData(d) { this.data = d; } }
@@ -50,7 +52,8 @@ global.maplibregl = { Map: MapMock, Marker, NavigationControl: class {}, ScaleCo
 
 vm.runInThisContext(res('map_app.js'));
 const fire = (e, ev) => handlers[e](ev);
-const click = (lat, lon, x = 0, y = 0) => fire('click', { lngLat: { lat, lng: lon }, point: { x, y } });
+const click = (lat, lon, x = 0, y = 0, target = null) =>
+  fire('click', { lngLat: { lat, lng: lon }, point: { x, y }, originalEvent: target ? { target } : undefined });
 
 fire('style.load');
 out.checks.ready = out.messages.some((m) => m.type === 'ready');
@@ -145,6 +148,23 @@ fire('mousemove', { lngLat: { lat: 47.0, lng: 28.05 }, point: { x: 0, y: 0 } });
 out.checks.rubberBand = mapInst.getSource('draft').data.features.some((f) => f.geometry.type === 'LineString');
 click(0, 0, 28100 + 2, 47000 + 1);       // у D1
 out.checks.cableMsg = out.messages.filter((m) => m.type === 'net_connect').map((m) => [m.a, m.b]);
+// в режиме «Кабель» устройства не перетаскиваются (клик не превращается в перемещение)
+const devMarker = (id) => markers.find((m) => m.alive && m.el.className === 'net-dev' && m.el.dataset.devId === id);
+out.checks.dragInCable = devMarker('D1').opt.draggable;
+// клик прямо по значку устройства далеко от его координат (значок крупный) — всё равно попадание
+out.messages.length = 0;
+click(0, 0, 0, 0, devMarker('D2').el); click(0, 0, 0, 0, devMarker('D1').el);
+out.checks.cableByIcon = out.messages.filter((m) => m.type === 'net_connect').map((m) => [m.a, m.b]);
+// ПКМ отменяет выбранное первое устройство
+out.messages.length = 0;
+click(0, 0, 28000 + 3, 47000 - 2); fire('contextmenu', { preventDefault() {} }); click(0, 0, 28100, 47000);
+out.checks.cableCancelled = out.messages.filter((m) => m.type === 'net_connect').length;
+api.setMapMode('navigate');
+out.checks.dragInNavigate = devMarker('D1').opt.draggable;
+out.messages.length = 0;
+fire('mousemove', { lngLat: { lat: 1, lng: 2 } });
+out.checks.noHoverInNavigate = !out.messages.some((m) => m.type === 'hover_load');
+api.setMapMode('cable');
 api.setMapMode('pdu'); out.messages.length = 0;
 click(0, 0, 28100, 47000); click(0, 0, 28200, 47000);
 out.checks.pduMsg = out.messages.filter((m) => m.type === 'net_pdu').map((m) => [m.a, m.b]);

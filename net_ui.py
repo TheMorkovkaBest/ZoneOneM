@@ -343,7 +343,8 @@ class NetworkMixin:
         self.lbl_net.setText(self._net_summary_text())
 
     def net_after_towers_changed(self):
-        self.net.sync_towers(self.towers)
+        # вышки, убранные «Очистить карту», остаются в БД — их БС и кабели не удаляем
+        self.net.sync_towers(self.towers, keep_ids=self.db.tower_ids())
         self.net.evaluate(self.building_data)
         self.net_persist()
         self._push_net()
@@ -357,7 +358,8 @@ class NetworkMixin:
         return f"Сеть: устройств {devs}, линков {len(self.net.links)}" + (f", ✕ {down}" if down else "")
 
     def _push_net(self):
-        self._js(f"api.setNetwork({json.dumps(self.net.to_map())});")
+        visible = {t.db_id for t in self.towers}
+        self._js(f"api.setNetwork({json.dumps(self.net.to_map(visible_towers=visible))});")
 
     # ------------------------------ палитры ------------------------------ #
     def build_network_palette(self):
@@ -677,7 +679,10 @@ class NetworkMixin:
                     return
                 pa, pb = dlg.ports()
             else:
-                pa, pb = fa[0].name, fb[0].name
+                # раньше брались первые подходящие порты — например, 1G-порт вместо свободного 10G
+                # или порт, на котором линк «не поднимается»; теперь — лучшая пара для этого кабеля
+                best = net.suggest_cable(a, b, self.building_data, cable_id=cid)
+                pa, pb = (best["a_port"], best["b_port"]) if best else (fa[0].name, fb[0].name)
         link, err = net.connect(a, pa, b, pb, cid)
         if link is None:
             QMessageBox.warning(self, "Кабель", err)
@@ -721,8 +726,6 @@ class NetworkMixin:
         dlg = DeviceDialog(self.net, dev, self)
         if dlg.exec():
             dlg.apply()
-            if dev.tower_id is None:
-                pass
             self.net_after_change()
 
     def net_autoconfigure(self):

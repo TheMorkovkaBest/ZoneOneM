@@ -32,9 +32,15 @@
   #map-error { display: none; position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
     background: var(--panel); color: var(--text); padding: 16px 20px; border-radius: 10px; z-index: 9;
     border: 1px solid var(--border); max-width: 60%; text-align: center; }
-  .tower-pin { display: flex; align-items: center; gap: 5px; pointer-events: none; transform: translateY(-14px); }
-  .tower-pin .dot { width: 11px; height: 11px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 4px #000; }
-  .tower-pin .name { background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px;
+  /* Точка привязки маркера = центр значка (подпись вынесена абсолютным позиционированием).
+     Раньше маркер центрировался по «значок + подпись», и значок вышки/устройства оказывался
+     на 20–40 px левее реальных координат: клик по значку не попадал в радиус выбора, кабель не тянулся.
+     position не задаём: у .maplibregl-marker уже absolute (relative сдвигал маркеры друг под друга). */
+  .tower-pin { width: 15px; height: 15px; pointer-events: none; }
+  .tower-pin .dot { position: absolute; inset: 0; box-sizing: border-box; border-radius: 50%; border: 2px solid #fff;
+    box-shadow: 0 0 4px #000; }
+  .tower-pin .name { position: absolute; left: 20px; top: 50%; transform: translateY(-50%);
+    background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px;
     font-size: 11px; border: 1px solid var(--border); white-space: nowrap; }
   .tower-pin.selected .dot { box-shadow: 0 0 0 4px rgba(62,139,255,0.7); }
   .tower-pin.selected .name { border-color: #3e8bff; font-weight: 700; }
@@ -49,11 +55,13 @@
     box-shadow: 0 0 6px rgba(0,0,0,0.6); }
   .az-handle .az-text { background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px;
     font-size: 11px; font-weight: 700; border: 1px solid var(--border); pointer-events: none; }
-  .net-dev { display: flex; align-items: center; gap: 5px; cursor: grab; transform: translateY(-2px); }
-  .net-dev svg { background: var(--c, #888); border: 2px solid #fff; border-radius: 7px; padding: 4px; box-sizing: content-box;
-    box-shadow: 0 1px 6px rgba(0,0,0,0.6); }
-  .net-dev .nm { background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px; font-size: 11px;
-    border: 1px solid var(--border); white-space: nowrap; }
+  .net-dev { width: 30px; height: 30px; cursor: pointer; }
+  .net-dev.movable { cursor: grab; }
+  .net-dev svg { display: block; background: var(--c, #888); border: 2px solid #fff; border-radius: 7px; padding: 4px;
+    box-sizing: content-box; box-shadow: 0 1px 6px rgba(0,0,0,0.6); }
+  .net-dev .nm { position: absolute; left: 35px; top: 50%; transform: translateY(-50%);
+    background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px; font-size: 11px;
+    border: 1px solid var(--border); white-space: nowrap; pointer-events: none; }
   .net-dev.selected svg { box-shadow: 0 0 0 4px rgba(62,139,255,0.8); }
   .net-dev.unpowered svg { background: #555; opacity: 0.7; border-color: #e5484d; }
   .link-lbl { background: var(--pin-bg); color: var(--text); padding: 0 6px; border-radius: 4px; font-size: 10.5px;

@@ -76,7 +76,9 @@ class Tower:
 
         self.calc_ms = 0.0
         self.used_buildings = False
+        self.buildings_pending = False   # зоны посчитаны без зданий: район ещё загружается
         self.walls_total = 0
+        self._rays_js = None
         if reach is not None:                      # готовый результат (из БД / импорта)
             self.reach = np.asarray(reach, dtype=float)
             self.angles = ray_angles(len(self.reach))
@@ -96,6 +98,7 @@ class Tower:
         self._update_derived()
 
     def _update_derived(self):
+        self._rays_js = None
         self.r_green, self.r_exc, self.r_good, self.r_weak = radii_from_reach(self.reach)
         self.areas = areas_from_reach(self.reach)            # км²: green, excellent, good, weak
         self.eirp_dbm = eirp_dbm(self.power, self.beamwidth)
@@ -123,15 +126,19 @@ class Tower:
         return d
 
     def to_js(self):
-        """Компактный вид для карты: только лучи внутри сектора."""
-        rays = []
-        for i, a in enumerate(self.angles):
-            if is_in_sector(a, self.azimuth, self.beamwidth):
-                rays.append([round(float(a), 2)] + [round(float(v), 1) for v in self.reach[i]])
+        """Компактный вид для карты: только лучи внутри сектора.
+
+        Лучи считаются один раз (векторно) и кэшируются: карта получает список всех вышек
+        после каждого изменения, и раньше это был цикл Python по 180 лучам каждой вышки.
+        """
+        if self._rays_js is None:
+            sel = np.asarray(is_in_sector(self.angles, self.azimuth, self.beamwidth), dtype=bool)
+            self._rays_js = np.column_stack([np.round(self.angles[sel], 2),
+                                             np.round(self.reach[sel], 1)]).tolist()
         return {"id": self.db_id, "name": self.name, "lat": self.lat, "lon": self.lon,
                 "height": self.height, "tilt": self.tilt, "scale": self.scale, "color": self.color,
                 "azimuth": self.azimuth, "beamwidth": self.beamwidth,
-                "model_b64": self.model_b64, "rays": rays}
+                "model_b64": self.model_b64, "rays": self._rays_js}
 
     @classmethod
     def from_dict(cls, data, building_data=None, recalc=True):
@@ -218,6 +225,9 @@ class TowerDB:
 
     def load_all_towers(self):
         return self.conn.execute("SELECT * FROM towers ORDER BY id").fetchall()
+
+    def tower_ids(self):
+        return {r[0] for r in self.conn.execute("SELECT id FROM towers")}
 
     def delete_tower(self, key):
         """key — id (int) или имя (str, удалит все одноимённые)."""

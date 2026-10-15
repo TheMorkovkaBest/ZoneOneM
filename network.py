@@ -10,7 +10,8 @@ import ipaddress
 import json
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from functools import lru_cache
 
 import numpy as np
 
@@ -31,13 +32,20 @@ def fmt_speed(mbps):
     return f"{mbps:g}M"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Port:
     name: str
     kind: str
     mbps: float
     pse: str = None
     pd: str = None
+
+
+@lru_cache(maxsize=None)
+def _model_port_table(model):
+    """(порты по порядку, порты по имени) — одни и те же неизменяемые объекты для всех устройств модели."""
+    ports = tuple(Port(*p) for p in model_ports(model))
+    return ports, {p.name: p for p in ports}
 
 
 @dataclass
@@ -64,10 +72,10 @@ class Device:
         return self.spec["role"]
 
     def ports(self):
-        return [Port(*p) for p in model_ports(self.model)]
+        return list(_model_port_table(self.model)[0])
 
     def port(self, name):
-        return next((p for p in self.ports() if p.name == name), None)
+        return _model_port_table(self.model)[1].get(name)
 
 
 @dataclass
@@ -103,10 +111,47 @@ class PingResult:
     dst_ip: str = ""
 
 
+class _VersionedDict(dict):
+    """dict, который считает свои изменения (для кэша индекса портов)."""
+    version = 0
+
+    def _touch(self):
+        self.version += 1
+
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        self._touch()
+
+    def __delitem__(self, k):
+        super().__delitem__(k)
+        self._touch()
+
+    def pop(self, *a):
+        self._touch()
+        return super().pop(*a)
+
+    def popitem(self):
+        self._touch()
+        return super().popitem()
+
+    def clear(self):
+        self._touch()
+        super().clear()
+
+    def update(self, *a, **kw):
+        self._touch()
+        super().update(*a, **kw)
+
+    def setdefault(self, k, v=None):
+        self._touch()
+        return super().setdefault(k, v)
+
+
 class Network:
     def __init__(self):
         self.devices = {}
-        self.links = {}
+        self.links = _VersionedDict()
+        self._port_index = None
         self.status = {}          # link_id -> LinkStatus
         self.dev_state = {}       # dev_id -> {"powered": bool, "reason": str, "poe_used_w": float}
         self._next_dev = 1
@@ -129,18 +174,28 @@ class Network:
         """Устройство-БС для вышки (создаётся один раз, координаты и имя синхронизируются)."""
         did = f"T{tower.db_id}"
         dev = self.devices.get(did)
+        model = default_model_for_tower(tower.freq, tower.height)
         if dev is None:
-            model = default_model_for_tower(tower.freq, tower.height)
             spec = MODELS[model]
             dev = Device(did, model, tower.name, tower.lat, tower.lon, tower_id=tower.db_id,
                          radio=dict(spec["radio"]), mount_h=tower.height)
             self.devices[did] = dev
+        elif dev.model != model and not any(did in (l.a_dev, l.b_dev) for l in self.links.values()):
+            # вышку отредактировали (высота/частота) и кабелей у неё нет — меняем и класс БС,
+            # иначе у бывшей макросоты остаются порты, которых у новой нет (и наоборот)
+            dev.model, dev.radio, dev.ips, dev.routes, dev.gateway = model, dict(MODELS[model]["radio"]), {}, [], ""
+            if dev.power_mode == "poe" and not any(p.pd for p in dev.ports()):
+                dev.power_mode = "local"
         dev.name, dev.lat, dev.lon, dev.mount_h = tower.name, tower.lat, tower.lon, tower.height
         return dev
 
-    def sync_towers(self, towers):
-        """Приводит устройства-БС в соответствие со списком вышек (лишние удаляются вместе с кабелями)."""
-        ids = {f"T{t.db_id}" for t in towers}
+    def sync_towers(self, towers, keep_ids=()):
+        """Приводит устройства-БС в соответствие со списком вышек (лишние удаляются вместе с кабелями).
+
+        keep_ids — id вышек, которых сейчас нет на карте, но они остались в БД («Очистить карту»):
+        их устройства и кабели сохраняются.
+        """
+        ids = {f"T{t.db_id}" for t in towers} | {f"T{i}" for i in keep_ids}
         for did in [d for d, dev in self.devices.items() if dev.tower_id is not None and d not in ids]:
             self.remove_device(did)
         for t in towers:
@@ -159,14 +214,24 @@ class Network:
     # ------------------------------------------------------------------ #
     #  Порты и соединения
     # ------------------------------------------------------------------ #
+    def _ports_used(self):
+        """{(устройство, порт): линк} — индекс вместо перебора всех линков на каждый запрос порта.
+
+        Перестраивается при любом изменении self.links (версия словаря), в том числе в обход connect().
+        """
+        if self._port_index is None or self._port_index[0] != self.links.version:
+            idx = {}
+            for l in self.links.values():
+                idx[(l.a_dev, l.a_port)] = l
+                idx[(l.b_dev, l.b_port)] = l
+            self._port_index = (self.links.version, idx)
+        return self._port_index[1]
+
     def port_link(self, did, port):
-        for l in self.links.values():
-            if (l.a_dev == did and l.a_port == port) or (l.b_dev == did and l.b_port == port):
-                return l
-        return None
+        return self._ports_used().get((did, port))
 
     def free_ports(self, did):
-        used = {(l.a_dev, l.a_port) for l in self.links.values()} | {(l.b_dev, l.b_port) for l in self.links.values()}
+        used = self._ports_used()
         return [p for p in self.devices[did].ports() if (did, p.name) not in used]
 
     @staticmethod
@@ -381,9 +446,13 @@ class Network:
     # ------------------------------------------------------------------ #
     #  Подбор кабеля
     # ------------------------------------------------------------------ #
-    def suggest_cable(self, a_id, b_id, building_data=None, group=None):
-        """Лучшая комбинация (кабель, порт A, порт B): макс. скорость, затем без предупреждений, затем дешевле."""
+    def suggest_cable(self, a_id, b_id, building_data=None, group=None, cable_id=None):
+        """Лучшая комбинация (кабель, порт A, порт B): макс. скорость, затем без предупреждений, затем дешевле.
+
+        cable_id — тип кабеля задан пользователем, подбираются только порты.
+        """
         da, db = self.devices[a_id], self.devices[b_id]
+        cables = [CABLES[cable_id]] if cable_id else list(CABLES.values())
 
         def uniq(dev):
             seen = {}
@@ -393,7 +462,7 @@ class Network:
         best = None
         for pa in uniq(da):
             for pb in uniq(db):
-                for cable in CABLES.values():
+                for cable in cables:
                     if group and cable["group"] != group:
                         continue
                     if self.check_connector(cable, pa, pb, da, db):
@@ -533,10 +602,12 @@ class Network:
             return None, f"{self.devices[src_id].name}: к порту {src_port} не подключён кабель"
         if not self._usable(link):
             return None, f"Линк {link.id} не работает: {self.status[link.id].reason}"
-        start = (src_id, src_port)
-        q = deque([(start, [], [src_id], {src_id})])
+        # BFS с общим множеством посещённых коммутаторов: кратчайший путь, и кольца/резервные кабели
+        # между коммутаторами больше не дают экспоненциального перебора всех простых путей
+        q = deque([((src_id, src_port), [], [src_id])])
+        visited = {src_id}
         while q:
-            (did, port), lpath, dpath, seen = q.popleft()
+            (did, port), lpath, dpath = q.popleft()
             l = self.port_link(did, port)
             if l is None or not self._usable(l):
                 continue
@@ -544,10 +615,12 @@ class Network:
             lp, dp = lpath + [l.id], dpath + [n_id]
             if (n_id, n_port) == (dst_id, dst_port):
                 return lp, dp
-            if self._is_l2(self.devices[n_id]) and n_id not in seen:
+            if self._is_l2(self.devices[n_id]) and n_id not in visited:
+                visited.add(n_id)
+                used = self._ports_used()
                 for p in self.devices[n_id].ports():
-                    if p.name != n_port:
-                        q.append(((n_id, p.name), lp, dp, seen | {n_id}))
+                    if p.name != n_port and (n_id, p.name) in used:
+                        q.append(((n_id, p.name), lp, dp))
         return None, f"Между {self.devices[src_id].name} и {self.devices[dst_id].name} нет L2-связности"
 
     def trace(self, src_id, dst_ip, max_hops=24):
@@ -640,26 +713,51 @@ class Network:
 
     @classmethod
     def from_dict(cls, data):
+        """Восстановление сети. Лишние/устаревшие поля игнорируются, битые линки отбрасываются."""
         net = cls()
-        net._next_dev, net._next_link = data.get("next_dev", 1), data.get("next_link", 1)
+        dev_keys = {f.name for f in fields(Device)}
+        link_keys = {f.name for f in fields(Link)}
         for d in data.get("devices", []):
-            if d.get("model") in MODELS:
-                net.devices[d["id"]] = Device(**d)
+            if d.get("model") in MODELS and d.get("id"):
+                net.devices[d["id"]] = Device(**{k: v for k, v in d.items() if k in dev_keys})
+        used = set()
         for l in data.get("links", []):
-            if l.get("cable") in CABLES and l["a_dev"] in net.devices and l["b_dev"] in net.devices:
-                net.links[l["id"]] = Link(**l)
+            if not (l.get("cable") in CABLES and l.get("a_dev") in net.devices and l.get("b_dev") in net.devices):
+                continue
+            link = Link(**{k: v for k, v in l.items() if k in link_keys})
+            ends = {(link.a_dev, link.a_port), (link.b_dev, link.b_port)}
+            pa, pb = net.devices[link.a_dev].port(link.a_port), net.devices[link.b_dev].port(link.b_port)
+            if link.a_dev == link.b_dev or not (pa and pb) or ends & used:
+                continue                           # порт не существует или уже занят другим кабелем
+            used |= ends
+            net.links[link.id] = link
+
+        def next_num(prefix, ids, stored):
+            nums = [int(i[len(prefix):]) for i in ids if i.startswith(prefix) and i[len(prefix):].isdigit()]
+            return max([int(stored or 1)] + [n + 1 for n in nums])
+        # счётчики не меньше существующих id: иначе новый кабель/устройство перезапишет старый
+        net._next_dev = next_num("D", net.devices, data.get("next_dev"))
+        net._next_link = next_num("L", net.links, data.get("next_link"))
         return net
 
     def to_json(self):
         return json.dumps(self.to_dict(), ensure_ascii=False)
 
-    def to_map(self):
-        """Данные для отрисовки на карте."""
+    def to_map(self, visible_towers=None):
+        """Данные для отрисовки на карте.
+
+        visible_towers — id вышек, показанных на карте; БС остальных (убраны «Очистить карту»)
+        и их кабели не рисуются, чтобы по невидимым точкам нельзя было «попасть» кабелем.
+        """
+        def shown(d):
+            return d.tower_id is None or visible_towers is None or d.tower_id in visible_towers
         devs = [{"id": d.id, "name": d.name, "role": d.role, "lat": d.lat, "lon": d.lon,
                  "tower": d.tower_id is not None, "powered": self.dev_state.get(d.id, {}).get("powered", True),
-                 "model": d.spec["name"]} for d in self.devices.values()]
+                 "model": d.spec["name"]} for d in self.devices.values() if shown(d)]
         links = []
         for l in self.links.values():
+            if not (shown(self.devices[l.a_dev]) and shown(self.devices[l.b_dev])):
+                continue
             st = self.status.get(l.id) or LinkStatus()
             a, b = self.devices[l.a_dev], self.devices[l.b_dev]
             cable = CABLES[l.cable]

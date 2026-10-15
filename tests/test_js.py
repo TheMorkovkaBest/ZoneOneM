@@ -20,7 +20,7 @@ class TestJs(unittest.TestCase):
         cls.cases = [[rnd.uniform(-60, 60), rnd.uniform(-179, 179), rnd.uniform(-60, 60), rnd.uniform(-179, 179)]
                      for _ in range(200)]
         p = subprocess.run(["node", os.path.join(HERE, "js_harness.js")], input=json.dumps({"geo": cls.cases}),
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, encoding="utf-8", timeout=60)
         if p.returncode != 0:
             raise RuntimeError(p.stderr)
         cls.out = json.loads(p.stdout)
@@ -62,6 +62,11 @@ class TestJs(unittest.TestCase):
         self.assertEqual(c["linkLabels"], 2)
         self.assertTrue(c["rubberBand"])
         self.assertEqual(c["cableMsg"], [["T1", "D1"]])
+        self.assertFalse(c["dragInCable"])                 # в режиме «Кабель» клик не двигает устройство
+        self.assertEqual(c["cableByIcon"], [["D2", "D1"]])  # клик по значку устройства выбирает его
+        self.assertEqual(c["cableCancelled"], 0)           # ПКМ сбросил первый конец кабеля
+        self.assertTrue(c["dragInNavigate"])
+        self.assertTrue(c["noHoverInNavigate"])            # предзагрузка зданий только при расстановке/замере
         self.assertEqual(c["pduMsg"], [["D1", "D2"]])
         self.assertEqual(c["deviceMsg"], ["net_place"])
         self.assertEqual(c["netSelect"], ["net_select:D2", "net_link_select:L1"])

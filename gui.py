@@ -43,16 +43,26 @@ def load_map_html():
 # --------------------------------------------------------------------------- #
 #  Фоновые потоки
 # --------------------------------------------------------------------------- #
-class HoverWorker(QThread):
-    """Предзагрузка зданий вокруг курсора."""
+BUILDINGS_NEED_M = 600.0          # радиус, в котором для расчёта вышки нужны здания (= WINDOW_HALF_M)
 
-    def __init__(self, lat, lon, building_data):
+
+class BuildingFetchWorker(QThread):
+    """Докачивает здания OSM для списка точек (вышки, курсор). Расчёт вышек её не ждёт."""
+    area_done = pyqtSignal(bool)                 # успех загрузки очередной точки
+
+    def __init__(self, points, building_data):
         super().__init__()
-        self.lat, self.lon, self.building_data = lat, lon, building_data
+        self.points, self.building_data = points, building_data
+        self.cancelled = False
 
     def run(self):
-        if self.building_data:
-            self.building_data.fetch(self.lat, self.lon, radius_m=1000)
+        for lat, lon in self.points:
+            if self.cancelled:
+                break
+            ok = self.building_data.ensure_loaded(lat, lon, need_m=BUILDINGS_NEED_M,
+                                                  cancel=lambda: self.cancelled)
+            if not self.cancelled:
+                self.area_done.emit(ok)
 
 
 class CacheWorker(QThread):
@@ -68,7 +78,12 @@ class CacheWorker(QThread):
 
 
 class CalcWorker(QThread):
-    """Считает пачку вышек. Здания докачиваются при необходимости, сам расчёт — миллисекунды."""
+    """Считает пачку вышек по уже загруженным зданиям — миллисекунды на вышку.
+
+    Раньше здесь же качались здания (Overpass отвечает 20–40 с), и первая вышка появлялась на карте
+    только после загрузки. Теперь вышка считается сразу; если зданий вокруг ещё нет, она помечается
+    buildings_pending, а главное окно докачивает район и пересчитывает её.
+    """
     progress = pyqtSignal(str)
     tower_done = pyqtSignal(object, object)      # Tower, job
     all_done = pyqtSignal(dict)
@@ -79,24 +94,26 @@ class CalcWorker(QThread):
 
     def run(self):
         t0 = time.perf_counter()
-        buildings_ok, calc_ms = True, 0.0
+        calc_ms, pending, errors = 0.0, 0, []
+        bd = self.building_data if self.use_buildings else None
         for i, job in enumerate(self.jobs):
-            bd = None
-            if self.use_buildings:
-                if not self.building_data.is_covered(job["lat"], job["lon"], 600.0):
-                    self.progress.emit("Загрузка зданий из OpenStreetMap…")
-                buildings_ok = self.building_data.ensure_loaded(job["lat"], job["lon"], need_m=600.0) and buildings_ok
-                bd = self.building_data
-            p = job["params"]
-            tower = Tower(job["name"], job["lat"], job["lon"], p["freq"], p["power"], p["height"], p["tilt"],
-                          p["wall_loss"], job["color"], scale=job.get("scale", 1.0), building_data=bd,
-                          azimuth=p["azimuth"], beamwidth=p["beamwidth"],
-                          type_name=job.get("type_name"), db_id=job.get("db_id"))
+            try:
+                missing = bd is not None and not bd.is_covered(job["lat"], job["lon"], BUILDINGS_NEED_M)
+                p = job["params"]
+                tower = Tower(job["name"], job["lat"], job["lon"], p["freq"], p["power"], p["height"], p["tilt"],
+                              p["wall_loss"], job["color"], scale=job.get("scale", 1.0), building_data=bd,
+                              azimuth=p["azimuth"], beamwidth=p["beamwidth"],
+                              type_name=job.get("type_name"), db_id=job.get("db_id"))
+            except Exception as exc:              # одна битая вышка не должна останавливать очередь
+                errors.append(f"{job.get('name')}: {type(exc).__name__}: {exc}")
+                continue
+            tower.buildings_pending = missing
+            pending += missing
             calc_ms += tower.calc_ms
             self.tower_done.emit(tower, job)
             if len(self.jobs) > 1:
                 self.progress.emit(f"Расчёт вышек: {i + 1}/{len(self.jobs)}")
-        self.all_done.emit({"count": len(self.jobs), "buildings_ok": buildings_ok,
+        self.all_done.emit({"count": len(self.jobs), "pending": pending, "errors": errors,
                             "calc_ms": calc_ms, "total_ms": (time.perf_counter() - t0) * 1000.0})
 
 
@@ -168,7 +185,14 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._mode = "navigate"
         self._map_ready = False
         self._job_queue = []
-        self._worker = self._hover_worker = self._cache_worker = self._algo_worker = None
+        self._worker = self._fetch_worker = self._cache_worker = self._algo_worker = None
+        # Занятость отслеживаем флагами, а не isRunning(): сигнал «готово» приходит, когда поток
+        # ещё не завершился, и проверка isRunning() в обработчике «теряла» очередь задач.
+        self._calc_busy = self._fetch_busy = False
+        self._threads = set()                  # ссылки на потоки до их завершения (иначе Qt падает)
+        self._fetch_queue = []                 # точки (lat, lon), где нужны здания для вышек
+        self._hover_point = None               # последняя точка под курсором для предзагрузки
+        self._import_ids = {}                  # id вышки в импортируемом проекте -> новый id в БД
         self._last_hover_time = 0.0
         self._needs_recalc = False
         self._block_table = False
@@ -633,25 +657,79 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     # ------------------------------------------------------------------ #
     #  Здания
     # ------------------------------------------------------------------ #
+    def _keep(self, worker):
+        """Держит ссылку на поток, пока он не завершится."""
+        self._threads.add(worker)
+        worker.finished.connect(lambda w=worker: self._threads.discard(w))
+        return worker
+
     def preload_buildings_at(self, lat, lon):
-        now = time.time()
-        if now - self._last_hover_time < 1.2 or not self.chk_buildings.isChecked():
+        """Предзагрузка зданий под курсором — только когда пользователь собирается ставить вышку/мерить.
+
+        Раньше запросы шли при любом движении мыши; публичные Overpass отвечали отказом (429/504),
+        включалась пауза «нет сети», и первая вышка считалась вообще без зданий.
+        """
+        if self._mode not in ("place", "probe") or not self.chk_buildings.isChecked():
             return
-        if self._hover_worker and self._hover_worker.isRunning():
+        now = time.time()
+        if now - self._last_hover_time < 1.2 or self.building_data.is_covered(lat, lon, BUILDINGS_NEED_M):
             return
         self._last_hover_time = now
-        self._hover_worker = HoverWorker(lat, lon, self.building_data)
-        self._hover_worker.finished.connect(self._update_buildings_label)
-        self._hover_worker.start()
+        self._hover_point = (lat, lon)
+        self._start_fetch()
+
+    def _request_buildings(self, points):
+        for p in points:
+            if all(geo.haversine_m(p[0], p[1], q[0], q[1]) > 150.0 for q in self._fetch_queue):
+                self._fetch_queue.append(p)
+        self._start_fetch()
+
+    def _start_fetch(self):
+        if self._fetch_busy:
+            return
+        pts = self._fetch_queue + ([self._hover_point] if self._hover_point else [])
+        self._fetch_queue, self._hover_point = [], None
+        pts = [p for p in pts if not self.building_data.is_covered(p[0], p[1], BUILDINGS_NEED_M)]
+        if not pts:
+            return
+        self._fetch_busy = True
+        w = self._fetch_worker = self._keep(BuildingFetchWorker(pts, self.building_data))
+        w.area_done.connect(self._on_buildings_area)
+        w.finished.connect(self._on_fetch_finished)
+        self._update_buildings_label()
+        w.start()
+
+    def _on_buildings_area(self, ok):
+        self._update_buildings_label()
+        if ok:
+            self._recalc_pending()
+        elif any(t.buildings_pending for t in self.towers):
+            self.statusBar().showMessage("НЕТ СЕТИ: здания OpenStreetMap не загружены — зоны рассчитаны без них "
+                                         f"({self.building_data.last_error or 'сервер не ответил'}). F5 — повторить.")
+
+    def _on_fetch_finished(self):
+        self._fetch_busy = False
+        self._start_fetch()
+
+    def _recalc_pending(self):
+        """Пересчитать вышки, которые ждали загрузки зданий в своём районе."""
+        if not self.chk_buildings.isChecked():
+            return
+        queued = {j.get("db_id") for j in self._job_queue}
+        jobs = [self._job_from_tower(t) for t in self.towers
+                if t.buildings_pending and t.db_id not in queued
+                and self.building_data.is_covered(t.lat, t.lon, BUILDINGS_NEED_M)]
+        if jobs:
+            self._enqueue(jobs)
 
     def _start_cache_loading(self):
-        self._cache_worker = CacheWorker(self.building_data)
+        self._cache_worker = self._keep(CacheWorker(self.building_data))
         self._cache_worker.done.connect(self._on_cache_loaded)
         self._cache_worker.start()
 
     def _on_cache_loaded(self, n):
         self._update_buildings_label()
-        if n and (self._needs_recalc or self.towers):
+        if self.towers and (n or self._needs_recalc):
             self.recalc_all()                      # вышки из БД пересчитываем с учётом загруженных зданий
 
     def _update_buildings_label(self):
@@ -719,10 +797,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._start_next()
 
     def _start_next(self):
-        if (self._worker and self._worker.isRunning()) or not self._job_queue:
+        if self._calc_busy or not self._job_queue:
             return
         jobs, self._job_queue = self._job_queue, []
-        self._worker = CalcWorker(jobs, self.building_data, self.chk_buildings.isChecked())
+        self._calc_busy = True
+        self._worker = self._keep(CalcWorker(jobs, self.building_data, self.chk_buildings.isChecked()))
         self._worker.progress.connect(lambda s: self.statusBar().showMessage(s))
         self._worker.tower_done.connect(self._on_tower_done)
         self._worker.all_done.connect(self._on_calc_finished)
@@ -740,17 +819,27 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             tower.db_id = self.db.save_tower(tower.to_dict())
             self.towers.append(tower)
             self.selected_id = tower.db_id
+            if job.get("src_id") is not None:
+                self._import_ids[job["src_id"]] = tower.db_id
+            self._bump_counter(tower.name)
+
+    def _bump_counter(self, name):
+        """Счётчик имён «Вышка #N» не должен выдавать уже занятые номера (импорт, алгоритм)."""
+        tail = name.split("#")[-1]
+        if name.startswith("Вышка #") and tail.isdigit():
+            self.tower_counter = max(self.tower_counter, int(tail) + 1)
 
     def _apply_pending_network(self):
-        """Сеть из импортированного проекта: id вышек новые, поэтому БС сопоставляются по имени."""
+        """Сеть из импортированного проекта: у вышек новые id, БС сопоставляются по старому id (или имени)."""
         data, self._pending_network = getattr(self, "_pending_network", None), None
+        ids, self._import_ids = self._import_ids, {}
         if not data:
             return
         by_name = {t.name: t.db_id for t in self.towers}
         remap, devices = {}, []
         for d in data.get("devices", []):
             if d.get("tower_id") is not None:
-                new = by_name.get(d["name"])
+                new = ids.get(d["tower_id"], by_name.get(d.get("name")))
                 if new is None:
                     continue
                 remap[d["id"]] = f"T{new}"
@@ -759,28 +848,38 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         keep = {d["id"] for d in devices}
         links = []
         for l in data.get("links", []):
-            l = dict(l, a_dev=remap.get(l["a_dev"], l["a_dev"]), b_dev=remap.get(l["b_dev"], l["b_dev"]))
+            l = dict(l, a_dev=remap.get(l.get("a_dev"), l.get("a_dev")), b_dev=remap.get(l.get("b_dev"), l.get("b_dev")))
             if l["a_dev"] in keep and l["b_dev"] in keep:
                 links.append(l)
-        self.net = Network.from_dict(dict(data, devices=devices, links=links))
+        try:
+            self.net = Network.from_dict(dict(data, devices=devices, links=links))
+        except (TypeError, KeyError, ValueError) as exc:
+            QMessageBox.warning(self, "Импорт", f"Сеть из проекта не прочитана: {exc}")
 
     def _on_calc_finished(self, info):
+        self._calc_busy = False
         self._needs_recalc = False
         if getattr(self, "_pending_network", None) and not self._job_queue:
             self._apply_pending_network()
         self._refresh_all()
+        use_bd = self.chk_buildings.isChecked()
         if info["count"] == 1:
             t = self._current_tower()
             extra = ""
-            if self.chk_buildings.isChecked():
-                extra = ", здания учтены" if (t and t.used_buildings) else ", зданий в зоне нет"
+            if use_bd:
+                extra = (", здания загружаются…" if info["pending"] else
+                         ", здания учтены" if (t and t.used_buildings) else ", зданий в зоне нет")
             msg = f"Рассчитано за {info['calc_ms']:.1f} мс{extra}"
         else:
             msg = f"Пересчитано вышек: {info['count']} за {info['total_ms']:.0f} мс"
-        if self.chk_buildings.isChecked() and not info["buildings_ok"]:
-            msg += " — НЕТ СЕТИ: здания не загружены, расчёт без них"
+            if use_bd and info["pending"]:
+                msg += f"; для {info['pending']} загружаются здания…"
+        if info["errors"]:
+            msg += f" — ошибки расчёта: {'; '.join(info['errors'][:3])}"
         self.statusBar().showMessage(msg)
         self._update_buildings_label()
+        if use_bd and info["pending"]:
+            self._request_buildings([(t.lat, t.lon) for t in self.towers if t.buildings_pending])
         self._start_next()
 
     def set_tower_azimuth(self, tid, azimuth):
@@ -1186,6 +1285,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         if clicked not in (b_replace, b_add):
             return
         self._pending_network = None
+        self._import_ids = {}
         if clicked is b_replace:
             self.db.clear_all()
             self.towers.clear()
@@ -1206,7 +1306,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         jobs = []
         for d in data.get("towers", []):
             jobs.append({"action": "new", "name": d["name"], "lat": d["lat"], "lon": d["lon"],
-                         "type_name": d.get("type_name"),
+                         "type_name": d.get("type_name"), "src_id": d.get("id"),
                          "params": {k: d.get(k, defaults[k]) for k in PARAM_KEYS},
                          "color": d.get("color", [255, 0, 0, 255]), "scale": d.get("scale", 1.0)})
         self._refresh_all()
@@ -1229,9 +1329,12 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     # ------------------------------------------------------------------ #
     def closeEvent(self, event):
         self._job_queue.clear()
-        if self._load_worker:
-            self._load_worker.cancelled = True
-        for w in (self._worker, self._hover_worker, self._cache_worker, self._algo_worker, self._load_worker):
+        self._fetch_queue.clear()
+        self._hover_point = None
+        for w in (self._load_worker, self._fetch_worker):
+            if w:
+                w.cancelled = True                   # загрузка зданий прерывается за ~0.25 с
+        for w in set(self._threads) | {self._algo_worker, self._load_worker}:
             if w and w.isRunning():
                 if not w.wait(3000):                 # сеть может висеть до таймаута — не ждём вечно
                     w.terminate()

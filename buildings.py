@@ -8,6 +8,7 @@
 import hashlib
 import json
 import math
+import queue
 import re
 import threading
 import time
@@ -23,11 +24,18 @@ except ImportError:          # оффлайн-режим / тесты без req
 from calculations import GRID_RES_M, M_PER_DEG_LAT
 
 TILE = 256
+# Публичные серверы Overpass часто отвечают 502/504 или по 20–35 с, поэтому опрашиваются
+# параллельно (по OVERPASS_PARALLEL), а первым идёт сервер, ответивший успешно в прошлый раз.
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
 ]
-FAIL_COOLDOWN_S = 30.0
+OVERPASS_PARALLEL = 2
+HTTP_TIMEOUT = (6.0, 75.0)       # (соединение, чтение), с: большие ответы идут десятки секунд
+FAIL_COOLDOWN_S = 20.0
+RASTER_CHUNK = 200               # зданий за один захват блокировки (расчёт вышки не ждёт всю пачку)
 DEFAULT_HEIGHT_M = 15.0
 # Высоты по типу здания, если в OSM нет ни height, ни building:levels.
 TYPE_HEIGHTS = {
@@ -68,9 +76,11 @@ class BuildingData:
         self.last_error = None
         self._ids = set()
         self._lock = threading.RLock()
+        self._fetch_lock = threading.Lock()   # одна загрузка за раз: второй поток ждёт и берёт её результат
         self._origin = None           # (lat0, lon0) начало растровой системы координат
         self._tiles = {}              # (ty, tx) -> uint8[TILE, TILE]
         self._fail_until = 0.0
+        self._good_url = None         # сервер, ответивший успешно последним
         self.cache_dir = Path(cache_dir) if cache_dir else None
 
     # ------------------------------------------------------------------ #
@@ -86,52 +96,90 @@ class BuildingData:
                     return True
         return False
 
-    def ensure_loaded(self, lat, lon, need_m=600.0, radius_m=1000):
+    def ensure_loaded(self, lat, lon, need_m=600.0, radius_m=900, cancel=None):
         """Гарантирует наличие зданий вокруг точки. True, если данные есть."""
         if self.is_covered(lat, lon, need_m):
             return True
-        return self.fetch(lat, lon, radius_m=max(radius_m, need_m + 400), need_m=need_m)
+        return self.fetch(lat, lon, radius_m=max(radius_m, need_m + 150), need_m=need_m, cancel=cancel)
 
-    def fetch(self, lat, lon, radius_m=1200, need_m=400.0):
-        """Скачивает здания вокруг точки. True — успех (или уже загружено)."""
+    def fetch(self, lat, lon, radius_m=900, need_m=400.0, cancel=None):
+        """Скачивает здания вокруг точки. True — успех (или уже загружено).
+
+        cancel — необязательная функция без аргументов; вернула True — загрузка прерывается.
+        """
         if self.is_covered(lat, lon, need_m):
             return True
-        if requests is None:
-            self.last_error = "не установлен модуль requests"
-            return False
-        if time.time() < self._fail_until:      # недавно была ошибка сети — не долбим сервер
-            return False
+        with self._fetch_lock:
+            # пока ждали блокировку, другой поток мог скачать этот же район — второй запрос не нужен
+            if self.is_covered(lat, lon, need_m):
+                return True
+            if requests is None:
+                self.last_error = "не установлен модуль requests"
+                return False
+            if time.time() < self._fail_until:      # недавно была ошибка сети — не долбим сервер
+                return False
+            self.status = "загрузка зданий…"
+            data = self._download(self._query(lat, lon, radius_m), cancel)
+            if data is None:
+                if not (cancel and cancel()):
+                    self._fail_until = time.time() + FAIL_COOLDOWN_S
+                    self.status = "нет сети — расчёт без зданий"
+                return False
+            self._save_cache(lat, lon, radius_m, data)
+            n = self.add_buildings(self._parse_overpass(data))
+            self._register_area(lat, lon, radius_m)       # только после растеризации: иначе расчёт возьмёт пустой растр
+            self.status = f"зданий: {len(self.buildings)} (+{n})"
+            self.last_error = None
+            return True
 
-        query = f"""
-        [out:json][timeout:25];
-        (
-          way["building"](around:{radius_m},{lat},{lon});
-          relation["building"](around:{radius_m},{lat},{lon});
-        );
-        out body;
-        >;
-        out skel qt;
-        """
-        headers = {'User-Agent': 'ZoneM/1.0 (radio planning student project)',
-                   'Content-Type': 'text/plain; charset=utf-8'}
-        self.status = "загрузка зданий…"
-        for url in OVERPASS_URLS:
+    @staticmethod
+    def _query(lat, lon, radius_m):
+        return (f'[out:json][timeout:60];'
+                f'(way["building"](around:{radius_m:.0f},{lat:.6f},{lon:.6f});'
+                f'relation["building"](around:{radius_m:.0f},{lat:.6f},{lon:.6f}););'
+                f'out body;>;out skel qt;')
+
+    def _download(self, query, cancel=None):
+        """Запрос к серверам Overpass: по OVERPASS_PARALLEL одновременно, побеждает первый успешный ответ."""
+        urls = sorted(OVERPASS_URLS, key=lambda u: u != self._good_url)
+        results = queue.Queue()
+        headers = {'User-Agent': 'ZoneM/1.0 (radio planning student project)'}
+
+        def worker(url):
             try:
-                resp = requests.post(url, data=query.encode('utf-8'), headers=headers, timeout=20)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    self._save_cache(lat, lon, radius_m, data)
-                    self._register_area(lat, lon, radius_m)
-                    n = self.add_buildings(self._parse_overpass(data))
-                    self.status = f"зданий: {len(self.buildings)} (+{n})"
-                    self.last_error = None
-                    return True
-                self.last_error = f"{url}: HTTP {resp.status_code}"
-            except Exception as exc:      # сеть/JSON — пробуем следующий сервер
-                self.last_error = f"{url}: {exc}"
-        self._fail_until = time.time() + FAIL_COOLDOWN_S
-        self.status = "нет сети — расчёт без зданий"
-        return False
+                resp = requests.post(url, data={'data': query}, headers=headers, timeout=HTTP_TIMEOUT)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                data = resp.json()
+                remark = str(data.get('remark', ''))
+                if 'error' in remark.lower():       # тайм-аут на сервере: ответ неполный, в кэш его нельзя
+                    raise RuntimeError(remark[:120])
+                results.put((url, data, None))
+            except Exception as exc:             # сеть/JSON — пробуем следующий сервер
+                results.put((url, None, exc))
+
+        pending, running = list(urls), 0
+        while pending and running < OVERPASS_PARALLEL:
+            threading.Thread(target=worker, args=(pending.pop(0),), daemon=True).start()
+            running += 1
+        errors = []
+        while running:
+            try:
+                url, data, exc = results.get(timeout=0.25)
+            except queue.Empty:
+                if cancel and cancel():
+                    return None                   # потоки-демоны доработают сами, их ответ никому не нужен
+                continue
+            running -= 1
+            if data is not None:
+                self._good_url = url
+                return data
+            errors.append(f"{url}: {exc}")
+            if pending:
+                threading.Thread(target=worker, args=(pending.pop(0),), daemon=True).start()
+                running += 1
+        self.last_error = "; ".join(errors)
+        return None
 
     def _register_area(self, lat, lon, radius_m):
         with self._lock:
@@ -160,8 +208,8 @@ class BuildingData:
         for f in sorted(self.cache_dir.glob("overpass_*.json")):
             try:
                 p = json.loads(f.read_text(encoding="utf-8"))
-                self._register_area(p["lat"], p["lon"], p["radius_m"])
                 total += self.add_buildings(self._parse_overpass(p["data"]))
+                self._register_area(p["lat"], p["lon"], p["radius_m"])
             except Exception as exc:
                 self.last_error = f"кэш {f.name}: {exc}"
         if total:
@@ -211,25 +259,33 @@ class BuildingData:
         импорт своих данных).
         """
         added = 0
-        with self._lock:
-            for b in items:
-                bid = b.get('id')
-                if bid is not None:
-                    if bid in self._ids:
+        items = list(items)
+        for start in range(0, len(items), RASTER_CHUNK):
+            recs = []
+            with self._lock:
+                for b in items[start:start + RASTER_CHUNK]:
+                    bid = b.get('id')
+                    if bid is not None:
+                        if bid in self._ids:
+                            continue
+                        self._ids.add(bid)
+                    poly = [(float(p[0]), float(p[1])) for p in b['poly']]
+                    if len(poly) < 3:
                         continue
-                    self._ids.add(bid)
-                poly = [(float(p[0]), float(p[1])) for p in b['poly']]
-                if len(poly) < 3:
-                    continue
-                if self._origin is None:
-                    self._origin = (poly[0][0], poly[0][1])
-                lats = [p[0] for p in poly]
-                lons = [p[1] for p in poly]
-                rec = {'id': bid, 'height': float(b.get('height', DEFAULT_HEIGHT_M)), 'poly': poly,
-                       'bbox': (min(lats), max(lats), min(lons), max(lons))}
-                self.buildings.append(rec)
-                self._rasterize(rec)
-                added += 1
+                    if self._origin is None:
+                        self._origin = (poly[0][0], poly[0][1])
+                    lats = [p[0] for p in poly]
+                    lons = [p[1] for p in poly]
+                    recs.append({'id': bid, 'height': float(b.get('height', DEFAULT_HEIGHT_M)), 'poly': poly,
+                                 'bbox': (min(lats), max(lats), min(lons), max(lons))})
+            # маски считаются без блокировки (начало координат растра после установки не меняется),
+            # под блокировкой — только быстрая запись в плитки
+            masks = [self._building_mask(rec) for rec in recs]
+            with self._lock:
+                for rec, m in zip(recs, masks):
+                    self.buildings.append(rec)
+                    self._stamp(rec, *m)
+            added += len(recs)
         return added
 
     def _to_cells(self, lat, lon):
@@ -239,23 +295,40 @@ class BuildingData:
         return x, y
 
     def _rasterize(self, b):
+        self._stamp(b, *self._building_mask(b))
+
+    def _building_mask(self, b):
+        """Маска ячеек внутри контура: (mask[h, w], x0, y0). Правило чёт-нечет по центрам ячеек.
+
+        Построчная развёртка: для каждой строки считаются точки пересечения с рёбрами, затем
+        гистограмма + накопленная сумма дают число пересечений правее каждой ячейки.
+        Память O(h·(E + w)) вместо прежних O(h·E·w) — большие промзоны больше не «съедают» гигабайты.
+        """
         xs, ys = self._to_cells([p[0] for p in b['poly']], [p[1] for p in b['poly']])
         x0, x1 = int(math.floor(xs.min())), int(math.ceil(xs.max()))
         y0, y1 = int(math.floor(ys.min())), int(math.ceil(ys.max()))
         w, h = max(1, x1 - x0), max(1, y1 - y0)
-        px = x0 + np.arange(w) + 0.5                          # центры ячеек
-        py = y0 + np.arange(h) + 0.5
+        py = y0 + np.arange(h) + 0.5                          # центры ячеек по строкам
         ex1, ey1 = xs, ys
         ex2, ey2 = np.roll(xs, -1), np.roll(ys, -1)
-        # чёт-нечет сразу по всем рёбрам: пересечения горизонтального луча справа от ячейки
         valid = (ey1[None, :] > py[:, None]) != (ey2[None, :] > py[:, None])        # [h, E]
         dy = np.where(ey2 == ey1, 1.0, ey2 - ey1)
         xc = ex1[None, :] + (py[:, None] - ey1[None, :]) * ((ex2 - ex1) / dy)[None, :]
-        crossings = (valid[:, :, None] & (xc[:, :, None] > px[None, None, :])).sum(axis=1)
-        mask = (crossings & 1).astype(bool)                   # [h, w]
+        rows, cols = np.nonzero(valid)
+        # ячейка j (центр x0 + j + 0.5) левее пересечения xc  <=>  j < xc - x0 - 0.5
+        k = np.clip(np.ceil(xc[rows, cols] - x0 - 0.5), 0, w).astype(np.intp)
+        hist = np.zeros((h, w + 1), dtype=np.int32)
+        np.add.at(hist, (rows, k), 1)
+        right = np.cumsum(hist[:, ::-1], axis=1)[:, ::-1]     # right[:, j] = пересечений с k >= j
+        mask = (right[:, 1:] & 1).astype(bool)                # для ячейки j нужны k > j
         if not mask.any():                                    # совсем крошечное здание
             mask = np.zeros((h, w), dtype=bool)
             mask[min(h - 1, int(ys.mean() - y0)), min(w - 1, int(xs.mean() - x0))] = True
+        return mask, x0, y0
+
+    def _stamp(self, b, mask, x0, y0):
+        """Записывает маску здания в плитки (вызывать под self._lock)."""
+        h, w = mask.shape
         hv = np.uint8(min(255, max(1, round(b['height']))))
         for ty in range(y0 // TILE, (y0 + h - 1) // TILE + 1):
             for tx in range(x0 // TILE, (x0 + w - 1) // TILE + 1):
