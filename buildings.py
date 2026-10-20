@@ -36,6 +36,8 @@ OVERPASS_PARALLEL = 2
 HTTP_TIMEOUT = (6.0, 75.0)       # (соединение, чтение), с: большие ответы идут десятки секунд
 FAIL_COOLDOWN_S = 20.0
 RASTER_CHUNK = 200               # зданий за один захват блокировки (расчёт вышки не ждёт всю пачку)
+RASTER_FILE = "raster_cache.npz"
+RASTER_VERSION = 1
 DEFAULT_HEIGHT_M = 15.0
 # Высоты по типу здания, если в OSM нет ни height, ни building:levels.
 TYPE_HEIGHTS = {
@@ -128,8 +130,9 @@ class BuildingData:
             self._save_cache(lat, lon, radius_m, data)
             n = self.add_buildings(self._parse_overpass(data))
             self._register_area(lat, lon, radius_m)       # только после растеризации: иначе расчёт возьмёт пустой растр
-            self.status = f"зданий: {len(self.buildings)} (+{n})"
+            self.status = f"зданий: {self.n_buildings} (+{n})"
             self.last_error = None
+            self.save_raster()
             return True
 
     @staticmethod
@@ -200,10 +203,23 @@ class BuildingData:
         except Exception as exc:
             self.last_error = f"кэш не записан: {exc}"
 
+    def _sources(self):
+        """Сохранённые ответы Overpass: [(имя файла, размер)] — по ним проверяется актуальность растра."""
+        return sorted((f.name, f.stat().st_size) for f in self.cache_dir.glob("overpass_*.json"))
+
     def load_cache(self):
-        """Читает все сохранённые ответы Overpass. Возвращает число зданий."""
+        """Восстанавливает здания с диска. Возвращает число зданий.
+
+        Быстрый путь — готовый растр (raster_cache.npz, миллисекунды). Медленный — разбор всех
+        ответов Overpass (секунды и постоянный захват GIL фоновым потоком: интерфейс подтормаживал
+        при каждом запуске); после него растр сохраняется, и следующий запуск снова быстрый.
+        """
         if not self.cache_dir or not self.cache_dir.is_dir():
             return 0
+        sources = self._sources()
+        if sources and self._load_raster(sources):
+            self.status = f"зданий: {self.n_buildings} (кэш)"
+            return self.n_buildings
         total = 0
         for f in sorted(self.cache_dir.glob("overpass_*.json")):
             try:
@@ -213,8 +229,52 @@ class BuildingData:
             except Exception as exc:
                 self.last_error = f"кэш {f.name}: {exc}"
         if total:
-            self.status = f"зданий: {len(self.buildings)} (кэш)"
+            self.status = f"зданий: {self.n_buildings} (кэш)"
+            self.save_raster()
         return total
+
+    @property
+    def n_buildings(self):
+        return len(self._ids) if self._ids else len(self.buildings)
+
+    def _raster_path(self):
+        return self.cache_dir / RASTER_FILE
+
+    def save_raster(self):
+        """Снимок растра на диск (атомарно: временный файл + переименование)."""
+        if not self.cache_dir:
+            return
+        try:
+            with self._lock:
+                if self._origin is None or not self._tiles:
+                    return
+                keys = np.array(list(self._tiles.keys()), dtype=np.int32).reshape(-1, 2)
+                tiles = np.stack(list(self._tiles.values()))
+                meta = {"version": RASTER_VERSION, "origin": list(self._origin), "centers": self.loaded_centers,
+                        "ids": [i for i in self._ids if isinstance(i, (str, int))], "sources": self._sources()}
+            tmp = self._raster_path().with_suffix(".tmp.npz")
+            np.savez_compressed(tmp, keys=keys, tiles=tiles, meta=np.array(json.dumps(meta)))
+            tmp.replace(self._raster_path())
+        except Exception as exc:
+            self.last_error = f"растр не сохранён: {exc}"
+
+    def _load_raster(self, sources):
+        try:
+            with np.load(self._raster_path()) as z:
+                meta = json.loads(str(z["meta"]))
+                if meta.get("version") != RASTER_VERSION or [list(s) for s in sources] != meta.get("sources"):
+                    return False                      # появились/изменились ответы Overpass — пересобрать
+                keys, tiles = z["keys"], z["tiles"]
+        except (OSError, KeyError, ValueError):
+            return False
+        with self._lock:
+            if self._tiles:                           # растр уже не пуст (данные пришли раньше) — не смешиваем
+                return False
+            self._origin = tuple(meta["origin"])
+            self._tiles = {(int(k[0]), int(k[1])): tiles[i].copy() for i, k in enumerate(keys)}
+            self._ids = set(meta["ids"])
+            self.loaded_centers = [tuple(c) for c in meta["centers"]]
+        return True
 
     # ------------------------------------------------------------------ #
     #  Разбор Overpass
@@ -354,6 +414,14 @@ class BuildingData:
                  min_height и положение вышки в ячейках окна; либо None, если в
                  этой области нет ни одной плитки с данными.
         """
+        win = self.height_window(lat, lon, half_m)
+        if win is None:
+            return None
+        hw, px, py = win
+        return hw >= max(1.0, float(min_height)), px, py
+
+    def height_window(self, lat, lon, half_m):
+        """Окно растра высот (uint8, м) вокруг точки: (heights[H×W], px, py) или None, если данных нет."""
         with self._lock:
             if self._origin is None or not self._tiles:
                 return None
@@ -376,7 +444,7 @@ class BuildingData:
                         tile[ya - ty * TILE:yb - ty * TILE, xa - tx * TILE:xb - tx * TILE]
         if win is None:
             return None
-        return win >= max(1.0, float(min_height)), cx - gx0, cy - gy0
+        return win, cx - gx0, cy - gy0
 
     def _gather(self, gx, gy):
         """Высоты по целым глобальным ячейкам (вызывать под self._lock)."""

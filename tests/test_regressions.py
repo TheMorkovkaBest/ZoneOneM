@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -220,3 +221,83 @@ class TestNetworkFixes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRasterCache(unittest.TestCase):
+    def setUp(self):
+        if buildings.requests is None:
+            self.skipTest("нет модуля requests")
+
+    def test_restart_loads_raster_without_parsing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            bd = BuildingData(cache_dir=d)
+            with mock.patch.object(buildings.requests, "post", return_value=_Resp(OVERPASS_OK)):
+                self.assertTrue(bd.fetch(LAT0, LON0))
+            h = bd.heights_at([LAT0 + 10 / 111320.0], [LON0 + 20 / M_LON])[0]
+            self.assertGreater(h, 0)
+            bd2 = BuildingData(cache_dir=d)
+            with mock.patch.object(BuildingData, "_parse_overpass", side_effect=AssertionError("разбор JSON")):
+                self.assertEqual(bd2.load_cache(), 1)                  # из растра, без разбора JSON
+            self.assertEqual(bd2.heights_at([LAT0 + 10 / 111320.0], [LON0 + 20 / M_LON])[0], h)
+            self.assertTrue(bd2.is_covered(LAT0, LON0, 600))
+            self.assertEqual(bd2.add_buildings([{"id": "w10", "height": 5, "poly": rect(0, 0, 10, 10)}]), 0)   # дубль
+            # новый ответ Overpass на диске — растр устарел, собирается заново из JSON
+            (Path(d) / "overpass_extra.json").write_text(
+                '{"lat": 47.1, "lon": 28.9, "radius_m": 900, "data": {"elements": []}}', encoding="utf-8")
+            bd3 = BuildingData(cache_dir=d)
+            self.assertEqual(bd3.load_cache(), 1)
+            self.assertEqual(len(bd3.loaded_centers), 2)
+
+
+class TestSnmp(unittest.TestCase):
+    def test_walk_over_network_and_tables(self):
+        import snmp
+        from tools_path import build_demo
+        types, towers, net = build_demo()
+        r = snmp.poll(net, "T2", tower=towers[1])
+        self.assertTrue(r.reachable)
+        self.assertNotEqual(r.transport, "network")          # до «Авто-IP» адресов нет — только craft-порт
+        net.autoconfigure()
+        r = snmp.poll(net, "T2", tower=towers[1])
+        self.assertEqual(r.transport, "network", r.status)
+        self.assertIn("RTT", r.status)
+        self.assertEqual(r.path[0], "CORE")
+        names = {n for _, n, _ in r.system}
+        self.assertIn("SNMPv2-MIB::sysName.0", names)
+        self.assertEqual(len(r.interfaces), len(net.devices["T2"].ports()))
+        up = [i for i in r.interfaces if i["ifOperStatus"] == "up(1)"]
+        self.assertTrue(up and all(i["ifHCInOctets"] > 0 for i in up))
+        self.assertTrue(r.ip_addrs and r.neighbors)
+        self.assertEqual(r.extra_title, "Радио БС")
+        self.assertIn("ifHCInOctets", r.walk_text())
+        # счётчики растут со временем, загрузка из теста нагрузки увеличивает трафик
+        r2 = snmp.poll(net, "T2", tower=towers[1], now=time.time() + 3600)
+        self.assertGreater(r2.interfaces[0]["ifHCInOctets"], up[0]["ifHCInOctets"] if up[0]["ifIndex"] == 1 else 0)
+        lid = net.port_link("T2", up[0]["ifDescr"]).id
+        hot = snmp.poll(net, "T2", link_util={lid: 0.9})
+        cold = snmp.poll(net, "T2", link_util={lid: 0.01})
+        k = up[0]["ifIndex"] - 1
+        self.assertGreater(hot.interfaces[k]["ifHCOutOctets"], cold.interfaces[k]["ifHCOutOctets"])
+
+    def test_unreachable_and_unpowered(self):
+        import snmp
+        from tools_path import build_demo
+        types, towers, net = build_demo()
+        net.autoconfigure()
+        lid = net.port_link("T2", "Hu1").id                        # обрыв единственного транспорта БС
+        net.links[lid].length_m = 99999
+        net.evaluate()
+        r = snmp.poll(net, "T2")
+        self.assertIn("Timeout", r.status)
+        self.assertTrue(r.reachable)                               # но локально (craft) таблицы видны
+        down = next(i for i in r.interfaces if i["ifDescr"] == "Hu1")
+        self.assertNotEqual(down["ifOperStatus"], "up(1)")
+        cell = next(d for d in net.devices.values() if d.power_mode == "poe")
+        sw_link = next(l for l in net.links.values() if cell.id in (l.a_dev, l.b_dev))
+        net.remove_link(sw_link.id)
+        net.evaluate()
+        r = snmp.poll(net, cell.id)
+        self.assertFalse(r.reachable)
+        self.assertIn("питания", r.status)
+        self.assertIn("Timeout", r.walk_text())

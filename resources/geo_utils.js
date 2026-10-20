@@ -28,7 +28,7 @@
     if (!t.rays || t.rays.length === 0) return null;
     const mLon = M_LAT * Math.cos(rad(t.lat));
     const rays = t.rays.slice();
-    const sector = t.beamwidth < 360;
+    const sector = t.beamwidth < 360 && !t.full;     // full — есть лучи по всему кругу (задний лепесток)
     rays.sort((a, b) => angleOffset(a[0], t.azimuth) - angleOffset(b[0], t.azimuth));
     const ring = [];
     if (sector) ring.push([t.lon, t.lat]);

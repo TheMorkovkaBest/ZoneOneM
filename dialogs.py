@@ -257,7 +257,9 @@ class LinkProfileDialog(QDialog):
             f" ({ZONE_LABELS_RU.get(q, 'нет покрытия')})<br>"
             f"Расстояние: {geo.format_distance(res['distance_m'])}, азимут {geo.format_bearing(res['azimuth'])}<br>"
             f"EIRP {res['eirp_dbm']:.1f} дБм − потери на трассе {res['path_loss_db']:.1f} дБ"
-            f" − здания {res['wall_loss_db']:.1f} дБ = {total_txt}<br>"
+            f" − стены {res['wall_loss_db']:.1f} дБ − дифракция {res.get('diffraction_db', 0.0):.1f} дБ"
+            + (f" − диаграмма антенны {res['pattern_db']:.1f} дБ" if res.get('pattern_db') else "")
+            + f" = {total_txt}<br>"
             f"Пересечено стен: {res['walls']}, путь внутри зданий: {res['inside_m']:.0f} м<br>"
             f"Геометрическая прямая видимость: {los}; запас по 1-й зоне Френеля: "
             f"{res['fresnel_clearance'] * 100:.0f}% радиуса"
@@ -265,7 +267,7 @@ class LinkProfileDialog(QDialog):
         lay.addWidget(info)
         lay.addWidget(LinkProfileWidget(res, theme), stretch=1)
         legend = QLabel("<span style='color:#e76432'>■</span> здание учитывается моделью (не ниже антенны) &nbsp; "
-                        "<span style='color:#8c96a5'>■</span> ниже антенны — сигнал проходит над ним &nbsp; "
+                        "<span style='color:#8c96a5'>■</span> ниже антенны — дифракция, если заходит в зону Френеля &nbsp; "
                         "<span style='color:#3e8bff'>■</span> зона Френеля")
         legend.setProperty("role", "dim")
         lay.addWidget(legend)

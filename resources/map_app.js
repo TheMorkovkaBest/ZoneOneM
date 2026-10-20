@@ -47,12 +47,14 @@
     zones: { algo: null, forbidden: [] }, measure: [], draft: [], rectShape: false,
     probe: null, ready: false, azPreview: null,
     net: { devices: [], links: [] }, selDevice: null, selLink: null, cableFrom: null, traffic: null,
-    mouse: null,
+    mouse: null, towerDrag: null,
   };
   let map = null, deckOverlay = null;
-  const towerMarkers = new Map();
-  let measureMarkers = [], probeMarker = null, azMarker = null, azDragging = false, azTimer = null;
-  const devMarkers = new Map(), linkLabels = new Map();
+  let measureMarkers = [], probeMarker = null, azMarker = null, azDragging = false, azTimer = null, dragTimer = null;
+  const devMarkers = new Map();
+  const rayCache = new Map();               // id вышки -> {rev, rays}: Python не пересылает неизменившиеся лучи
+  const ringCache = new Map();              // id вышки -> {key, rings}: полигоны зон не пересчитываются зря
+  let activeId = null;                      // вышка, которую сейчас крутят/тащат: рисуется в отдельном источнике
   let armMarker = null, animReq = 0, animTimer = null, animMarkers = [], flowReq = 0;
 
   const $ = (id) => document.getElementById(id);
@@ -60,25 +62,49 @@
   function fail(msg) { const e = $('map-error'); if (e) { e.textContent = msg; e.style.display = 'block'; } }
 
   /* ---------------- построение данных ---------------- */
-  function rotated(t) {                     // предпросмотр поворота: те же дальности, другие углы
+  function previewOf(t0) {                  // предпросмотр поворота/переноса: те же дальности, другие углы/центр
+    let t = t0;
     const p = state.azPreview;
-    if (!p || p.id !== t.id) return t;
-    const d = p.azimuth - t.azimuth;
-    return Object.assign({}, t, { azimuth: p.azimuth,
-      rays: t.rays.map((r) => [((r[0] + d) % 360 + 360) % 360, r[1], r[2], r[3], r[4]]) });
+    if (p && p.id === t.id) {
+      const d = p.azimuth - t.azimuth;
+      t = Object.assign({}, t, { azimuth: p.azimuth,
+        rays: t.rays.map((r) => [((r[0] + d) % 360 + 360) % 360, r[1], r[2], r[3], r[4]]) });
+    }
+    const g = state.towerDrag;
+    if (g && g.id === t.id && g.moved) t = Object.assign({}, t, { lat: g.lat, lon: g.lon });
+    return t;
   }
 
-  function coverageFeatures() {
+  function towerRings(t0) {
+    const t = previewOf(t0);
+    const key = t.rev + '|' + t.azimuth + '|' + t.lat + '|' + t.lon;
+    const c = ringCache.get(t.id);
+    if (c && c.key === key) return c.rings;
+    const rings = ZONES.map((z) => U.zoneRing(t, z.col));
+    ringCache.set(t.id, { key, rings });
+    return rings;
+  }
+
+  function coverageFeatures(only) {         // only: undefined — все, кроме активной; id — только эта вышка
     const feats = [];
-    for (const t0 of state.towers) {
-      const t = rotated(t0);
-      for (const z of ZONES) {
-        const ring = U.zoneRing(t, z.col);
-        if (ring) feats.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] },
-          properties: { fill: z.fill, stroke: z.stroke, sel: t.id === state.selectedId ? 1 : 0 } });
-      }
+    for (const t of state.towers) {
+      if (only === undefined ? t.id === activeId : t.id !== only) continue;
+      const rings = towerRings(t), sel = t.id === state.selectedId ? 1 : 0;
+      ZONES.forEach((z, k) => {
+        if (rings[k]) feats.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [rings[k]] },
+          properties: { fill: z.fill, stroke: z.stroke, sel } });
+      });
     }
     return { type: 'FeatureCollection', features: feats };
+  }
+
+  function towerPoints() {
+    return { type: 'FeatureCollection', features: state.towers.map((t0) => {
+      const t = previewOf(t0);
+      return { type: 'Feature', geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
+        properties: { id: t.id, name: t.name, color: 'rgb(' + t.color.slice(0, 3).join(',') + ')',
+          sel: t.id === state.selectedId ? 1 : 0 } };
+    }) };
   }
   const toRing = (poly) => { const r = poly.map((p) => [p[1], p[0]]); r.push(r[0].slice()); return r; };
 
@@ -103,7 +129,23 @@
   /* ---------------- отрисовка ---------------- */
   function setData(id, data) { const s = map && map.getSource(id); if (s) s.setData(data); }
 
-  function renderCoverage() { setData('coverage', coverageFeatures()); renderDeck(); renderTowerMarkers(); renderAzimuthHandle(); }
+  function renderCoverage() {
+    setData('coverage', coverageFeatures());
+    setData('coverage-active', activeId === null ? EMPTY : coverageFeatures(activeId));
+    setData('towers', towerPoints());
+    renderDeck(); renderAzimuthHandle();
+  }
+  /* Во время поворота/переноса меняется одна вышка: обновляем только её источник и точки,
+     а не перестраиваем полигоны всех вышек на каждое движение мыши. */
+  function setActive(id) {
+    if (activeId === id) return;
+    activeId = id;
+    setData('coverage', coverageFeatures());
+  }
+  function renderActive() {
+    setData('coverage-active', activeId === null ? EMPTY : coverageFeatures(activeId));
+    setData('towers', towerPoints());
+  }
   function renderZones() { setData('zones', zoneFeatures()); }
   function renderDraft() { setData('draft', lineAndPoints(state.draft, true)); }
 
@@ -130,27 +172,6 @@
       el.textContent = 'Σ ' + U.fmtDist(total);
       measureMarkers.push(new maplibregl.Marker({ element: el, offset: [0, -22] })
         .setLngLat([last[1], last[0]]).addTo(map));
-    }
-  }
-
-  function renderTowerMarkers() {
-    if (!map) return;
-    const ids = new Set(state.towers.map((t) => t.id));
-    for (const [id, m] of towerMarkers) if (!ids.has(id)) { m.remove(); towerMarkers.delete(id); }
-    for (const t of state.towers) {
-      let m = towerMarkers.get(t.id);
-      if (!m) {
-        const el = document.createElement('div');
-        el.className = 'tower-pin';
-        el.innerHTML = '<span class="dot"></span><span class="name"></span>';
-        m = new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat([t.lon, t.lat]).addTo(map);
-        towerMarkers.set(t.id, m);
-      }
-      m.setLngLat([t.lon, t.lat]);
-      const el = m.getElement();
-      el.querySelector('.name').textContent = t.name;
-      el.querySelector('.dot').style.background = 'rgb(' + t.color.slice(0, 3).join(',') + ')';
-      el.classList.toggle('selected', t.id === state.selectedId);
     }
   }
 
@@ -197,7 +218,8 @@
     const ll = azMarker.getLngLat();
     const az = Math.round(U.bearing(t.lat, t.lon, ll.lat, ll.lng)) % 360;
     state.azPreview = { id: t.id, azimuth: az };
-    setData('coverage', coverageFeatures());
+    setActive(t.id);
+    renderActive();
     setData('azline', lineFrom([t.lon, t.lat], [ll.lng, ll.lat]));
     azMarker.getElement().querySelector('.az-text').textContent = az + '°';
   }
@@ -207,7 +229,36 @@
     if (!t || !state.azPreview) return;
     send({ type: 'azimuth', id: t.id, azimuth: state.azPreview.azimuth });
     clearTimeout(azTimer);                  // если Python не ответил — вернём прежний вид
-    azTimer = setTimeout(() => { if (!azDragging && state.azPreview) { state.azPreview = null; renderCoverage(); } }, 3000);
+    azTimer = setTimeout(() => {
+      if (!azDragging && state.azPreview) { state.azPreview = null; activeId = null; renderCoverage(); }
+    }, 3000);
+  }
+
+  /* ---------------- перенос вышки мышью (режим «Навигация») ---------------- */
+  function startTowerDrag(t, e) {
+    state.towerDrag = { id: t.id, lat: t.lat, lon: t.lon, moved: false, x: e.point.x, y: e.point.y,
+      dLat: t.lat - e.lngLat.lat, dLon: t.lon - e.lngLat.lng };
+  }
+  function moveTowerDrag(e) {
+    const g = state.towerDrag;
+    if (!g.moved && Math.hypot(e.point.x - g.x, e.point.y - g.y) < 4) return;
+    if (!g.moved) { g.moved = true; setActive(g.id); if (map) map.getCanvas().style.cursor = 'grabbing'; }
+    g.lat = e.lngLat.lat + g.dLat;
+    g.lon = e.lngLat.lng + g.dLon;
+    renderActive();
+    moveDevicePreview('T' + g.id, g.lat, g.lon);              // кабели БС тянутся за вышкой
+    if (azMarker) { azMarker.remove(); azMarker = null; setData('azline', EMPTY); }
+  }
+  function endTowerDrag() {
+    const g = state.towerDrag;
+    if (map) map.getCanvas().style.cursor = '';
+    if (!g.moved) { state.towerDrag = null; return; }
+    g.done = true;                          // предпросмотр держим, пока Python не пришлёт пересчёт
+    send({ type: 'tower_move', id: g.id, lat: g.lat, lon: g.lon });
+    clearTimeout(dragTimer);                // Python пришлёт пересчитанную вышку; если нет — вернуть на место
+    dragTimer = setTimeout(() => {
+      if (state.towerDrag === g) { state.towerDrag = null; activeId = null; renderCoverage(); }
+    }, 4000);
   }
 
 
@@ -221,9 +272,20 @@
       const u = linkUtil(l.id);
       const col = (u !== null && l.state !== 'down') ? utilColor(u) : (l.state === 'warn' ? '#f5a524' : l.color);
       return { type: 'Feature', properties: { id: l.id, state: l.state, col, width: l.width,
-        sel: l.id === state.selLink ? 1 : 0 },
+        sel: l.id === state.selLink ? 1 : 0,
+        lbl: l.label + (u !== null ? ' · ' + Math.round(u * 100) + '%' : '') },
         geometry: { type: 'LineString', coordinates: [[l.a[1], l.a[0]], [l.b[1], l.b[0]]] } };
     }) };
+  }
+
+  /* Устройство тащат: двигаем концы его кабелей сразу (раньше кабель «прыгал» только после отпускания). */
+  function moveDevicePreview(id, lat, lon) {
+    let hit = false;
+    for (const l of state.net.links) {
+      if (l.a_dev === id) { l.a = [lat, lon]; hit = true; }
+      if (l.b_dev === id) { l.b = [lat, lon]; hit = true; }
+    }
+    if (hit) setData('netlinks', linkFeatures());
   }
 
   function renderNet() {
@@ -241,6 +303,7 @@
         el.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2" ' +
           'stroke-linecap="round" stroke-linejoin="round">' + (ROLE_ICONS[d.role] || '') + '</svg><span class="nm"></span>';
         m = new maplibregl.Marker({ element: el, draggable: canDrag() }).setLngLat([d.lon, d.lat]).addTo(map);
+        m.on('drag', () => { const ll = m.getLngLat(); moveDevicePreview(d.id, ll.lat, ll.lng); });
         m.on('dragend', () => { const ll = m.getLngLat(); send({ type: 'net_move', id: d.id, lat: ll.lat, lon: ll.lng }); });
         devMarkers.set(d.id, m);
       }
@@ -252,33 +315,10 @@
       el.classList.toggle('selected', d.id === state.selDevice);
       el.classList.toggle('unpowered', d.powered === false);
     }
-    const lids = new Set(state.net.links.map((l) => l.id));
-    for (const [id, m] of linkLabels) if (!lids.has(id)) { m.remove(); linkLabels.delete(id); }
-    for (const l of state.net.links) {
-      let m = linkLabels.get(l.id);
-      if (!m) {
-        const el = document.createElement('div');
-        el.className = 'link-lbl';
-        m = new maplibregl.Marker({ element: el }).addTo(map);
-        linkLabels.set(l.id, m);
-      }
-      m.setLngLat([(l.a[1] + l.b[1]) / 2, (l.a[0] + l.b[0]) / 2]);
-      const el = m.getElement();
-      const u = linkUtil(l.id);
-      el.textContent = l.label + (u !== null ? ' · ' + Math.round(u * 100) + '%' : '');
-      el.classList.toggle('bad', l.state === 'down');
-      el.classList.toggle('warn', l.state === 'warn');
-      el.classList.toggle('selected', l.id === state.selLink);
-    }
-    updateLinkLabelVisibility();
+    // подписи кабелей — слой карты (netlinks-label), а не DOM-маркер на каждый кабель:
+    // сотни маркеров MapLibre двигает на каждом кадре, отсюда и «лаги» при панораме и перетаскивании
     renderFlowDots(performance.now());
     renderArm();
-  }
-
-  function updateLinkLabelVisibility() {
-    if (!map) return;
-    const show = map.getZoom() >= 14.5;
-    for (const [id, m] of linkLabels) m.getElement().style.display = (show || id === state.selLink) ? '' : 'none';
   }
 
   function renderArm() {
@@ -440,12 +480,15 @@
   /* ---------------- слои карты (пересоздаются при смене подложки) ---------------- */
   function setupLayers() {
     if (map.getSource('coverage')) return;
-    for (const id of ['coverage', 'zones', 'draft', 'measure', 'azline', 'netlinks', 'flow', 'trfusers', 'trflines']) map.addSource(id, { type: 'geojson', data: EMPTY });
-    map.addLayer({ id: 'coverage-fill', type: 'fill', source: 'coverage',
-      paint: { 'fill-color': ['get', 'fill'], 'fill-opacity': 0.75 } });
-    map.addLayer({ id: 'coverage-outline', type: 'line', source: 'coverage',
-      paint: { 'line-color': ['get', 'stroke'], 'line-opacity': 0.85,
-        'line-width': ['case', ['==', ['get', 'sel'], 1], 3, 1.2] } });
+    for (const id of ['coverage', 'coverage-active', 'towers', 'zones', 'draft', 'measure', 'azline', 'netlinks',
+      'flow', 'trfusers', 'trflines']) map.addSource(id, { type: 'geojson', data: EMPTY });
+    for (const src of ['coverage', 'coverage-active']) {
+      map.addLayer({ id: src + '-fill', type: 'fill', source: src,
+        paint: { 'fill-color': ['get', 'fill'], 'fill-opacity': 0.75 } });
+      map.addLayer({ id: src + '-outline', type: 'line', source: src,
+        paint: { 'line-color': ['get', 'stroke'], 'line-opacity': 0.85,
+          'line-width': ['case', ['==', ['get', 'sel'], 1], 3, 1.2] } });
+    }
     try {
       map.addSource('openfreemap-buildings', { type: 'vector', url: 'https://tiles.openfreemap.org/planet' });
       map.addLayer({ id: '3d-buildings-extrusion', source: 'openfreemap-buildings', 'source-layer': 'building',
@@ -484,7 +527,40 @@
         'line-width': ['+', ['get', 'width'], ['case', ['==', ['get', 'sel'], 1], 3, 0]] } });
     map.addLayer({ id: 'flow-dots', type: 'circle', source: 'flow', paint: {
       'circle-radius': 3.2, 'circle-color': '#ffffff', 'circle-stroke-color': ['get', 'col'], 'circle-stroke-width': 1.5 } });
+    // вышки и подписи кабелей — слои карты (рисует GPU), а не DOM-маркеры
+    map.addLayer({ id: 'tower-dot', type: 'circle', source: 'towers', paint: {
+      'circle-radius': ['case', ['==', ['get', 'sel'], 1], 8, 6.5], 'circle-color': ['get', 'color'],
+      'circle-stroke-color': ['case', ['==', ['get', 'sel'], 1], '#3e8bff', '#ffffff'],
+      'circle-stroke-width': ['case', ['==', ['get', 'sel'], 1], 4, 2],
+      'circle-pitch-alignment': 'viewport' } });
+    const font = styleFont();
+    const labelPaint = () => ({ 'text-color': theme().text, 'text-halo-color': theme().halo, 'text-halo-width': 1.6 });
+    try {
+      map.addLayer({ id: 'tower-label', type: 'symbol', source: 'towers', layout: {
+        'text-field': ['get', 'name'], 'text-font': font, 'text-size': 11.5, 'text-anchor': 'left',
+        'text-offset': [1.0, 0], 'text-allow-overlap': true, 'text-pitch-alignment': 'viewport' },
+        paint: labelPaint() });
+      const lbl = (id, extra) => Object.assign({ id, type: 'symbol', source: 'netlinks', layout: {
+        'symbol-placement': 'line-center', 'text-field': ['get', 'lbl'], 'text-font': font, 'text-size': 10.5,
+        'text-allow-overlap': false, 'text-pitch-alignment': 'viewport' },
+        paint: Object.assign(labelPaint(), { 'text-color': ['match', ['get', 'state'], 'down', '#ff8a8e',
+          'warn', '#f5a524', theme().text] }) }, extra);
+      map.addLayer(lbl('netlinks-label', { minzoom: 14.5, filter: ['!=', ['get', 'sel'], 1] }));
+      map.addLayer(lbl('netlinks-label-sel', { filter: ['==', ['get', 'sel'], 1] }));
+    } catch (e) { console.warn('labels unavailable: ' + e); }
     renderCoverage(); renderZones(); renderMeasure(); renderDraft(); renderNet(); renderTraffic();
+  }
+
+  const THEME_TEXT = { dark: { text: '#e6eaf0', halo: 'rgba(16,20,26,0.9)' }, light: { text: '#1c2430', halo: 'rgba(255,255,255,0.95)' } };
+  const theme = () => THEME_TEXT[state.theme] || THEME_TEXT.dark;
+  function styleFont() {                    // шрифт из самой подложки: у каждого сервера свой набор glyphs
+    try {
+      for (const l of map.getStyle().layers || []) {
+        const f = l.layout && l.layout['text-font'];
+        if (Array.isArray(f) && f.length && f.every((x) => typeof x === 'string')) return [f[0]];
+      }
+    } catch (e) { /* стиль ещё не загружен */ }
+    return ['Noto Sans Regular'];
   }
 
   /* ---------------- режимы и взаимодействие ---------------- */
@@ -529,6 +605,7 @@
     const lat = e.lngLat.lat, lon = e.lngLat.lng;
     switch (state.mode) {
       case 'navigate': case 'select': {
+        if (state.towerDrag && state.towerDrag.moved) break;
         const t = deviceFromEvent(e) ? null : pickTower(e.point);
         if (t) { send({ type: 'select', id: t.id }); break; }
         const d = pickDevice(e.point, e);
@@ -566,7 +643,17 @@
     }
   }
 
-  function onDblClick() {
+  function onDblClick(e) {
+    if (state.mode === 'navigate' && e && e.point) {          // двойной клик по вышке/устройству — SNMP
+      const d = deviceFromEvent(e);
+      const t = d ? null : pickTower(e.point);
+      const dev = d || (t ? null : pickDevice(e.point, e));
+      if (t || dev) {
+        if (e.preventDefault) e.preventDefault();             // без приближения карты
+        send(t ? { type: 'snmp', tower: t.id } : { type: 'snmp', dev: dev.id });
+        return;
+      }
+    }
     if (!drawing() || state.rectShape) return;
     state.draft.pop();            // второй клик двойного клика добавил дубль вершины
     finishZone();
@@ -582,7 +669,18 @@
 
   /* ---------------- публичный API для Python ---------------- */
   const api = {
-    setTowers(list) { state.towers = list; state.azPreview = null; renderCoverage(); },
+    setTowers(list) {
+      for (const t of list) {               // rays: null — «без изменений», берём из кэша
+        const c = rayCache.get(t.id);
+        if (t.rays === null || t.rays === undefined) t.rays = c ? c.rays : [];
+        else rayCache.set(t.id, { rev: t.rev, rays: t.rays });
+      }
+      const ids = new Set(list.map((t) => t.id));
+      for (const id of [...rayCache.keys()]) if (!ids.has(id)) { rayCache.delete(id); ringCache.delete(id); }
+      state.towers = list; state.azPreview = null; state.towerDrag = null; activeId = null;
+      clearTimeout(dragTimer);
+      renderCoverage();
+    },
     selectTower(id) { state.selectedId = id; state.azPreview = null; renderCoverage(); },
     setZones(z) { state.zones = { algo: z.algo || null, forbidden: z.forbidden || [] }; renderZones(); },
     setMapMode,
@@ -607,6 +705,13 @@
       document.body.setAttribute('data-theme', theme);
       if (map && map.getLayer('3d-buildings-extrusion'))
         map.setPaintProperty('3d-buildings-extrusion', 'fill-extrusion-color', theme === 'dark' ? '#4a5160' : '#c5ccd6');
+      const c = THEME_TEXT[theme] || THEME_TEXT.dark;
+      for (const id of ['tower-label', 'netlinks-label', 'netlinks-label-sel']) {
+        if (!map || !map.getLayer(id)) continue;
+        map.setPaintProperty(id, 'text-halo-color', c.halo);
+        map.setPaintProperty(id, 'text-color', id === 'tower-label' ? c.text
+          : ['match', ['get', 'state'], 'down', '#ff8a8e', 'warn', '#f5a524', c.text]);
+      }
     },
     setBase(name) {
       if (!STYLES[name] || !map || state.base === name) return;
@@ -620,6 +725,7 @@
     setTraffic(t) { state.traffic = t; renderTraffic(); },
     clearTraffic() { state.traffic = null; renderTraffic(); },
     getState() { return state; },
+    project(lat, lon) { const p = map.project([lon, lat]); return [p.x, p.y]; },   // для проверок/отладки
   };
   window.api = api;
 
@@ -643,7 +749,19 @@
     if (!state.ready) { state.ready = true; send({ type: 'ready' }); }
   });
   map.on('error', (e) => { if (e && e.error) console.warn('map error: ' + e.error.message); });
-  map.on('zoom', () => { if (!azDragging) renderAzimuthHandle(); updateLinkLabelVisibility(); });
+  // окно Qt меняет размер (сплиттер, развёртывание) — подогнать холст, если ResizeObserver не сработал
+  if (window.addEventListener) window.addEventListener('resize', () => map.resize());
+  map.on('zoom', () => { if (!azDragging) renderAzimuthHandle(); });
+  map.on('mousedown', (e) => {              // перенос вышки: нажать на неё в режиме «Навигация» и тянуть
+    if (state.mode !== 'navigate' || deviceFromEvent(e) || (e.originalEvent && e.originalEvent.button)) return;
+    const tgt = e.originalEvent && e.originalEvent.target;
+    if (tgt && tgt.closest && tgt.closest('.az-handle')) return;
+    const t = pickTower(e.point);
+    if (!t) return;
+    if (e.preventDefault) e.preventDefault();                 // карту при этом не панорамируем
+    startTowerDrag(t, e);
+  });
+  map.on('mouseup', () => { if (state.towerDrag && !state.towerDrag.done) endTowerDrag(); });
   map.on('click', onClick);
   map.on('dblclick', onDblClick);
   map.on('contextmenu', (e) => { e.preventDefault(); undoLast(); });
@@ -652,6 +770,7 @@
   map.on('mousemove', (e) => {
     const now = Date.now();
     state.mouse = e.lngLat;
+    if (state.towerDrag && !state.towerDrag.done) moveTowerDrag(e);
     if (state.cableFrom) rubberBand();
     if (now - hudThrottle > 40) {
       hudThrottle = now;

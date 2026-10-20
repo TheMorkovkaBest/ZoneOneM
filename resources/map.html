@@ -32,18 +32,6 @@
   #map-error { display: none; position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
     background: var(--panel); color: var(--text); padding: 16px 20px; border-radius: 10px; z-index: 9;
     border: 1px solid var(--border); max-width: 60%; text-align: center; }
-  /* Точка привязки маркера = центр значка (подпись вынесена абсолютным позиционированием).
-     Раньше маркер центрировался по «значок + подпись», и значок вышки/устройства оказывался
-     на 20–40 px левее реальных координат: клик по значку не попадал в радиус выбора, кабель не тянулся.
-     position не задаём: у .maplibregl-marker уже absolute (relative сдвигал маркеры друг под друга). */
-  .tower-pin { width: 15px; height: 15px; pointer-events: none; }
-  .tower-pin .dot { position: absolute; inset: 0; box-sizing: border-box; border-radius: 50%; border: 2px solid #fff;
-    box-shadow: 0 0 4px #000; }
-  .tower-pin .name { position: absolute; left: 20px; top: 50%; transform: translateY(-50%);
-    background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px;
-    font-size: 11px; border: 1px solid var(--border); white-space: nowrap; }
-  .tower-pin.selected .dot { box-shadow: 0 0 0 4px rgba(62,139,255,0.7); }
-  .tower-pin.selected .name { border-color: #3e8bff; font-weight: 700; }
   .lbl { background: rgba(0,0,0,0.78); color: #ffd84a; padding: 2px 7px; border-radius: 4px; font-size: 12px;
     font-weight: 600; white-space: nowrap; pointer-events: none; }
   .lbl.total { background: #ffcc00; color: #000; }
@@ -55,6 +43,9 @@
     box-shadow: 0 0 6px rgba(0,0,0,0.6); }
   .az-handle .az-text { background: var(--pin-bg); color: var(--text); padding: 1px 6px; border-radius: 4px;
     font-size: 11px; font-weight: 700; border: 1px solid var(--border); pointer-events: none; }
+  /* Точка привязки маркера = центр значка (подпись вынесена вбок): иначе значок рисовался
+     в 20–40 px от реальных координат и клик по нему не попадал. position не задаём —
+     у .maplibregl-marker уже absolute. Вышки и подписи кабелей — слои карты, не DOM. */
   .net-dev { width: 30px; height: 30px; cursor: pointer; }
   .net-dev.movable { cursor: grab; }
   .net-dev svg { display: block; background: var(--c, #888); border: 2px solid #fff; border-radius: 7px; padding: 4px;
@@ -64,10 +55,6 @@
     border: 1px solid var(--border); white-space: nowrap; pointer-events: none; }
   .net-dev.selected svg { box-shadow: 0 0 0 4px rgba(62,139,255,0.8); }
   .net-dev.unpowered svg { background: #555; opacity: 0.7; border-color: #e5484d; }
-  .link-lbl { background: var(--pin-bg); color: var(--text); padding: 0 6px; border-radius: 4px; font-size: 10.5px;
-    border: 1px solid var(--border); white-space: nowrap; pointer-events: none; }
-  .link-lbl.warn { border-color: #f5a524; } .link-lbl.bad { border-color: #e5484d; color: #ff8a8e; }
-  .link-lbl.selected { border-color: #3e8bff; font-weight: 700; }
   .arm-ring { width: 40px; height: 40px; border-radius: 50%; border: 3px solid #3e8bff; box-shadow: 0 0 10px #3e8bff;
     pointer-events: none; }
   .pkt { font-size: 22px; pointer-events: none; filter: drop-shadow(0 0 4px #000); }

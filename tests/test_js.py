@@ -60,6 +60,7 @@ class TestJs(unittest.TestCase):
         self.assertEqual(c["netLinkFeatures"], 2)
         self.assertEqual(c["netMarkers"], 2)               # у башен собственных маркеров нет (рисуются как вышки)
         self.assertEqual(c["linkLabels"], 2)
+        self.assertEqual(c["linkLabelDom"], 0)              # подписи кабелей — слой карты, а не DOM-маркеры
         self.assertTrue(c["rubberBand"])
         self.assertEqual(c["cableMsg"], [["T1", "D1"]])
         self.assertFalse(c["dragInCable"])                 # в режиме «Кабель» клик не двигает устройство
@@ -79,11 +80,25 @@ class TestJs(unittest.TestCase):
         self.assertTrue(c["labelPct"])
         self.assertTrue(c["trafficCleared"])
 
+    def test_drag_and_snmp(self):
+        c = self.out["checks"]
+        self.assertTrue(c["liveCable"])                     # кабель следует за устройством во время перетаскивания
+        self.assertEqual(c["moveMsg"], ["D1"])
+        self.assertEqual(c["snmpMsg"], ["D2", "tower:1"])
+        self.assertEqual(c["snmpNoZoom"], 2)
+        self.assertEqual(c["raysFromCache"], 4)
+        self.assertTrue(c["towerDragPreview"])
+        self.assertTrue(c["towerCableFollows"])
+        self.assertEqual(c["towerMoveMsg"], ["tower_move:1:28.03"])   # без лишнего «select» после переноса
+        self.assertTrue(c["dragCleared"])
+        self.assertEqual(c["clickNoMove"], 0)
+
     def test_azimuth_handle(self):
         c = self.out["checks"]
         self.assertTrue(c["noHandleForOmni"])               # у круговой вышки азимут ни на что не влияет
         self.assertTrue(c["handleExists"])
         self.assertTrue(c["previewEast"])                   # сектор повернулся к востоку ещё до пересчёта
+        self.assertEqual(c["mainUntouched"], 4)              # в общем источнике — только неактивная вышка
         self.assertEqual(c["azMsg"], [[2, 90]])
         self.assertTrue(c["previewCleared"])
         self.assertTrue(c["handleHiddenInMeasure"])

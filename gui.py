@@ -20,7 +20,7 @@ import geo
 import theme as theming
 import netcatalog
 from buildings import BuildingData
-from calculations import THRESHOLDS, ZONE_LABELS_RU, link_analysis
+from calculations import FRONT_TO_BACK_DB, THRESHOLDS, ZONE_LABELS_RU, link_analysis
 from dialogs import (CalculatorDialog, CreateTypeDialog, EditTowerDialog, LinkProfileDialog,
                      QUALITY_COLORS)
 from net_ui import NetworkMixin
@@ -88,9 +88,10 @@ class CalcWorker(QThread):
     tower_done = pyqtSignal(object, object)      # Tower, job
     all_done = pyqtSignal(dict)
 
-    def __init__(self, jobs, building_data, use_buildings):
+    def __init__(self, jobs, building_data, use_buildings, fresnel=True, pattern=True):
         super().__init__()
         self.jobs, self.building_data, self.use_buildings = jobs, building_data, use_buildings
+        self.fresnel, self.pattern = fresnel, pattern
 
     def run(self):
         t0 = time.perf_counter()
@@ -103,7 +104,8 @@ class CalcWorker(QThread):
                 tower = Tower(job["name"], job["lat"], job["lon"], p["freq"], p["power"], p["height"], p["tilt"],
                               p["wall_loss"], job["color"], scale=job.get("scale", 1.0), building_data=bd,
                               azimuth=p["azimuth"], beamwidth=p["beamwidth"],
-                              type_name=job.get("type_name"), db_id=job.get("db_id"))
+                              type_name=job.get("type_name"), db_id=job.get("db_id"),
+                              fresnel=self.fresnel, pattern=self.pattern)
             except Exception as exc:              # одна битая вышка не должна останавливать очередь
                 errors.append(f"{job.get('name')}: {type(exc).__name__}: {exc}")
                 continue
@@ -193,8 +195,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._fetch_queue = []                 # точки (lat, lon), где нужны здания для вышек
         self._hover_point = None               # последняя точка под курсором для предзагрузки
         self._import_ids = {}                  # id вышки в импортируемом проекте -> новый id в БД
+        self._js_revs = {}                     # id вышки -> версия расчёта, уже переданная карте
         self._last_hover_time = 0.0
-        self._needs_recalc = False
         self._block_table = False
         self._probe_point = None
         self._probe_results = []
@@ -286,6 +288,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.act_recalc = self._act("Пересчитать всё", "refresh", self.recalc_all, shortcut="F5", tip="Пересчитать зоны всех вышек")
         self.act_net_auto = self._act("Авто-IP", "sliders", self.net_autoconfigure, tip="Раздать IP и построить маршруты")
         self.act_bom = self._act("Спецификация", "list", self.net_export_bom, tip="Спецификация оборудования и кабелей (CSV)")
+        self.act_snmp = self._act("SNMP", "activity", self.snmp_selected, shortcut="Ctrl+8",
+                                  tip="Опрос выбранной вышки или устройства по SNMP (или двойной клик по ней на карте)")
         self.act_load = self._act("Тест нагрузки", "zap", self.run_load_test, shortcut="Ctrl+L",
                                   tip="Абоненты, трафик и загрузка сети: запуск/остановка")
         self.act_load_clear = self._act("Сброс", "stop", self.clear_load_results, tip="Убрать результаты теста с карты")
@@ -359,6 +363,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         g.add_action(m["cable"], self._cable_menu)
         g.add_action(m["pdu"])
         g.add_action(self.act_net_auto)
+        g.add_action(self.act_snmp)
         g.add_action(self.act_bom)
         g = bar.add_group("Измерения")
         g.add_action(m["measure"])
@@ -419,6 +424,18 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.chk_buildings.setChecked(True)
         self.chk_buildings.toggled.connect(lambda _: self.recalc_all())
         lay.addWidget(self.chk_buildings)
+        self.chk_fresnel = QCheckBox("Дифракция в зоне Френеля (дома ниже антенны)")
+        self.chk_fresnel.setToolTip("Здания ниже антенны, попавшие в 1-ю зону Френеля трассы «вышка → абонент», "
+                                    "дают потери дифракции (ITU-R P.526, доминирующее препятствие)")
+        self.chk_fresnel.setChecked(self._setting_bool("model_fresnel", True))
+        self.chk_fresnel.toggled.connect(lambda v: self._model_option_changed("model_fresnel", v))
+        lay.addWidget(self.chk_fresnel)
+        self.chk_pattern = QCheckBox(f"Боковые и задний лепестки антенны (−{FRONT_TO_BACK_DB:.0f} дБ)")
+        self.chk_pattern.setToolTip("Диаграмма секторной антенны по 3GPP TR 36.814: плавный спад луча и "
+                                    "излучение назад/вбок, а не «ноль» вне сектора")
+        self.chk_pattern.setChecked(self._setting_bool("model_pattern", True))
+        self.chk_pattern.toggled.connect(lambda v: self._model_option_changed("model_pattern", v))
+        lay.addWidget(self.chk_pattern)
         lay.addStretch()
         tabs.addTab(radio, "Радио")
 
@@ -501,9 +518,17 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         split.addWidget(self.tower_table)
 
         tabs = QTabWidget()
+        tower_page = QWidget()
+        tl = QVBoxLayout(tower_page)
+        tl.setContentsMargins(0, 6, 0, 0)
         self.tower_info = QTextBrowser()
         self.tower_info.setPlaceholderText("Выберите вышку на карте или в таблице")
-        tabs.addTab(self.tower_info, "Вышка")
+        tl.addWidget(self.tower_info)
+        self.btn_tower_snmp = QPushButton("SNMP-опрос вышки…")
+        self.btn_tower_snmp.setToolTip("Таблицы агента SNMP базовой станции: интерфейсы, IP, соседи, радио")
+        self.btn_tower_snmp.clicked.connect(self.snmp_selected)
+        tl.addWidget(self.btn_tower_snmp)
+        tabs.addTab(tower_page, "Вышка")
 
         sig_page = QWidget()
         sl = QVBoxLayout(sig_page)
@@ -583,6 +608,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
 
     def _on_map_loaded(self, ok):
         self._map_ready = bool(ok)
+        self._js_revs = {}                         # страница новая — лучи нужно передать заново
         if not ok:
             self.statusBar().showMessage("Не удалось загрузить страницу карты")
             return
@@ -594,7 +620,18 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._js(f"api.setRectShape({str(self.chk_rect.isChecked()).lower()});")
 
     def _push_towers(self):
-        self._js(f"api.setTowers({json.dumps([t.to_js() for t in self.towers])});")
+        """Список вышек на карту. Лучи (основной объём данных) — только у вышек с новой версией расчёта."""
+        if not self._map_ready:
+            return
+        out, revs = [], {}
+        for t in self.towers:
+            d = t.to_js()
+            if self._js_revs.get(t.db_id) == t.rev:
+                d = dict(d, rays=None)                 # карта возьмёт лучи из своего кэша
+            revs[t.db_id] = t.rev
+            out.append(d)
+        self._js_revs = revs
+        self._js(f"api.setTowers({json.dumps(out)});")
         self._js(f"api.selectTower({json.dumps(self.selected_id)});")
 
     def _push_zones(self):
@@ -635,6 +672,10 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             self.net_move_device(ev["id"], ev["lat"], ev["lon"])
         elif t == "azimuth":
             self.set_tower_azimuth(ev["id"], ev["azimuth"])
+        elif t == "tower_move":
+            self.set_tower_position(ev["id"], ev["lat"], ev["lon"])
+        elif t == "snmp":
+            self.snmp_open(ev.get("dev") or (f"T{ev['tower']}" if ev.get("tower") is not None else None))
         elif t == "mode":
             if ev.get("mode") in self._mode_actions:
                 self._mode_actions[ev["mode"]].setChecked(True)
@@ -729,8 +770,19 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
 
     def _on_cache_loaded(self, n):
         self._update_buildings_label()
-        if self.towers and (n or self._needs_recalc):
-            self.recalc_all()                      # вышки из БД пересчитываем с учётом загруженных зданий
+        self._recalc_stale()
+
+    def _recalc_stale(self):
+        """Пересчитать только вышки, чьи сохранённые зоны устарели.
+
+        Раньше при каждом запуске пересчитывались все вышки (а потом обновлялась вся карта и сеть),
+        хотя в БД уже лежали зоны, посчитанные с теми же зданиями. Теперь — только если сменилась
+        модель/настройки или вышка ждала загрузки зданий.
+        """
+        flags = self._model_flags()
+        jobs = [self._job_from_tower(t) for t in self.towers if t.needs_recalc(*flags)]
+        if jobs:
+            self._enqueue(jobs)
 
     def _update_buildings_label(self):
         self.lbl_buildings.setText(f"Здания: {self.building_data.status}")
@@ -738,6 +790,17 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     # ------------------------------------------------------------------ #
     #  Типы вышек
     # ------------------------------------------------------------------ #
+    def _setting_bool(self, key, default):
+        v = self.settings.value(key, default)
+        return v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes")
+
+    def _model_option_changed(self, key, value):
+        self.settings.setValue(key, bool(value))
+        self.recalc_all()
+
+    def _model_flags(self):
+        return self.chk_buildings.isChecked(), self.chk_fresnel.isChecked(), self.chk_pattern.isChecked()
+
     def _update_type_summary(self, *_):
         d = self.tower_types.get(self.active_type_combo.currentText())
         if not d:
@@ -801,7 +864,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             return
         jobs, self._job_queue = self._job_queue, []
         self._calc_busy = True
-        self._worker = self._keep(CalcWorker(jobs, self.building_data, self.chk_buildings.isChecked()))
+        use_bd, fresnel, pattern = self._model_flags()
+        self._worker = self._keep(CalcWorker(jobs, self.building_data, use_bd, fresnel, pattern))
         self._worker.progress.connect(lambda s: self.statusBar().showMessage(s))
         self._worker.tower_done.connect(self._on_tower_done)
         self._worker.all_done.connect(self._on_calc_finished)
@@ -858,7 +922,6 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
 
     def _on_calc_finished(self, info):
         self._calc_busy = False
-        self._needs_recalc = False
         if getattr(self, "_pending_network", None) and not self._job_queue:
             self._apply_pending_network()
         self._refresh_all()
@@ -892,6 +955,18 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             return
         job = self._job_from_tower(t)
         job["params"]["azimuth"] = float(azimuth) % 360.0
+        self._enqueue([job])
+
+    def set_tower_position(self, tid, lat, lon):
+        """Вышку перетащили по карте: пересчитать зоны на новом месте (кабели БС поедут следом)."""
+        t = next((x for x in self.towers if x.db_id == tid), None)
+        if t is None:
+            return
+        if geo.haversine_m(t.lat, t.lon, lat, lon) < 0.3:
+            self._push_towers()
+            return
+        job = self._job_from_tower(t)
+        job["lat"], job["lon"] = float(lat), float(lon)
         self._enqueue([job])
 
     def recalc_all(self):
@@ -953,6 +1028,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         has = self._current_tower() is not None
         self.act_edit.setEnabled(has)
         self.act_delete.setEnabled(has)
+        self.btn_tower_snmp.setEnabled(has)
         self.act_recalc.setEnabled(bool(self.towers))
         self.btn_run_algo.setEnabled(self.zone_algo is not None)
 
@@ -974,7 +1050,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                 zone_rows.append((f"<span style='color:{cols[i]}'>■</span> {ZONE_LABELS_RU[name]} (≥ {thr} дБм)",
                                   f"{radii[i]:.3f} км · {t.areas[i]:.3f} км²"))
             calc = f"{t.calc_ms:.1f} мс" if t.calc_ms else "из БД"
-            bld = "учтены" if t.used_buildings else "не учтены"
+            bld = "учтены" if t.used_buildings else ("загружаются" if t.buildings_pending else "не учтены")
+            model = ", ".join(x for x, on in (("дифракция Френеля", t.fresnel), ("лепестки антенны", t.pattern)) if on)
             self.tower_info.setHtml(
                 f"<h3 style='margin:0 0 6px 0'>{t.name}</h3>"
                 + self._html_table([
@@ -985,7 +1062,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                     ("Наклон", f"{t.tilt:.1f}° (в модель не входит)"),
                     ("Потери на стену", f"{t.wall_loss:.1f} дБ"),
                     ("Азимут / луч", f"{t.azimuth:.0f}° / {sector}"),
-                    ("Расчёт", f"{calc}, здания {bld}"),
+                    ("Расчёт", f"{calc}, здания {bld}" + (f"; {model}" if model else "")),
                 ])
                 + "<p style='margin:8px 0 2px 0'><b>Зоны покрытия</b></p>" + self._html_table(zone_rows))
         self._render_measure()
@@ -1049,7 +1126,6 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.zone_algo = zones.get("algo")
         self.zone_forbidden = zones.get("forbidden", [])
         for row in self.db.load_all_towers():
-            self._needs_recalc |= not row["reach"]
             self.towers.append(Tower.from_db_row(row))        # зоны берутся из БД — мгновенно
         nums = [int(t.name.split("#")[-1]) for t in self.towers
                 if t.name.startswith("Вышка #") and t.name.split("#")[-1].isdigit()]
@@ -1316,10 +1392,12 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     def show_help(self):
         QMessageBox.information(self, "Горячие клавиши", (
             "Ctrl+1 — навигация / выбор вышки кликом\nCtrl+2 — ставить вышки\nCtrl+3 — линейка\n"
-            "Ctrl+4 — замер сигнала\nCtrl+5 — устройство, Ctrl+6 — кабель, Ctrl+7 — PDU (ping)\nCtrl+L — тест нагрузки\nEsc — вернуться к навигации\nDel — удалить выбранную вышку\n"
+            "Ctrl+4 — замер сигнала\nCtrl+5 — устройство, Ctrl+6 — кабель, Ctrl+7 — PDU (ping), Ctrl+8 — SNMP\nCtrl+L — тест нагрузки\nEsc — вернуться к навигации\nDel — удалить выбранную вышку\n"
             "F5 — пересчитать все вышки\nCtrl+G — перейти к координатам\nCtrl+K — калькулятор\n"
             "Ctrl+T — тема\n\nНа карте: Backspace / ПКМ — отменить последнюю точку, "
-            "Enter или двойной клик — завершить участок.\n\nАзимут секторной вышки: выберите её и перетащите синюю ручку на карте."))
+            "Enter или двойной клик — завершить участок.\n\nАзимут секторной вышки: выберите её и перетащите синюю ручку на карте.\n"
+            "Вышку и устройство можно перетащить мышью в режиме «Навигация».\n"
+            "Двойной клик по вышке/устройству — SNMP-опрос."))
 
     def show_about(self):
         QMessageBox.about(self, "О программе",
@@ -1328,6 +1406,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
 
     # ------------------------------------------------------------------ #
     def closeEvent(self, event):
+        self.net_flush_persist()
         self._job_queue.clear()
         self._fetch_queue.clear()
         self._hover_point = None

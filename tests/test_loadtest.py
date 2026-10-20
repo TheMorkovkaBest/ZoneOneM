@@ -57,8 +57,8 @@ class TestRadioPieces(unittest.TestCase):
 
     def test_sector_gives_no_signal_behind(self):
         t = tower(1, azimuth=0.0, beamwidth=60)
-        v = LT.rsrp_matrix([t], [LAT0 - 0.001], [LON0])[0, 0]
-        self.assertLessEqual(v, -150)
+        back, front = LT.rsrp_matrix([t], [LAT0 - 0.001, LAT0 + 0.001], [LON0, LON0])[:, 0]
+        self.assertLess(back, front - 15)                     # за спиной — только задний лепесток (−25 дБ)
 
     def test_waterfill(self):
         s, u = LT.waterfill(np.array([1.0, 2.0]), np.array([100.0, 100.0]))

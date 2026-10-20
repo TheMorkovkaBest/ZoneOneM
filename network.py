@@ -9,6 +9,7 @@
 import ipaddress
 import json
 import math
+import time
 from collections import deque
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
@@ -157,6 +158,7 @@ class Network:
         self._next_dev = 1
         self._next_link = 1
         self.partial_hops = []
+        self.boot_time = time.time()      # «включение» оборудования — от него считается sysUpTime в SNMP
 
     # ------------------------------------------------------------------ #
     #  Устройства
@@ -762,7 +764,8 @@ class Network:
             a, b = self.devices[l.a_dev], self.devices[l.b_dev]
             cable = CABLES[l.cable]
             width = 2.0 + max(0.0, math.log10(max(st.speed_mbps, 100.0) / 100.0)) * 1.2
-            links.append({"id": l.id, "a": [a.lat, a.lon], "b": [b.lat, b.lon], "state": st.state,
+            links.append({"id": l.id, "a": [a.lat, a.lon], "b": [b.lat, b.lon], "a_dev": l.a_dev, "b_dev": l.b_dev,
+                          "state": st.state,
                           "color": GROUP_COLORS[cable["group"]], "width": round(width, 2), "group": cable["group"],
                           "label": (f"{fmt_speed(st.speed_mbps)} · {st.length_m:.0f} м" if st.state != "down"
                                     else f"✕ {st.length_m:.0f} м"), "speed": st.speed_mbps})

@@ -147,13 +147,12 @@ class TestGuiSmoke(unittest.TestCase):
         self.place()
         t = self.app.towers[0]
         self.assertEqual(t.azimuth, 0.0)
-        self.assertEqual(t.reach[45, 3], 0.0)                 # на восток (индекс 45 = 90°) сигнала нет
+        self.assertLess(t.reach[45, 0], t.reach[0, 0])        # на восток (индекс 45 = 90°) — только боковой лепесток
         self.app.on_map_event({"type": "azimuth", "id": t.db_id, "azimuth": 90})
         t = self.app.towers[0]
         self.assertEqual(len(self.app.towers), 1)
         self.assertEqual(t.azimuth, 90.0)
-        self.assertGreater(t.reach[45, 3], 0.0)               # индекс 45 = 90°
-        self.assertEqual(t.reach[0, 3], 0.0)                  # на север сигнала больше нет
+        self.assertGreater(t.reach[45, 0], t.reach[0, 0])     # главный луч теперь на восток (индекс 45 = 90°)
         self.assertEqual(self.app.db.load_all_towers()[0]["azimuth"], 90.0)
         self.assertTrue(t.used_buildings)
         n = len(self.app.web_view.page().js)
@@ -669,3 +668,111 @@ class TestGuiRegressions(unittest.TestCase):
         link = next(iter(app.net.links.values()))
         second = f"T{app.towers[1].db_id}"                        # кабель был у второй вышки
         self.assertIn(second, (link.a_dev, link.b_dev))
+
+
+@unittest.skipIf(REAL_QT, "Настоящий PyQt6 установлен — смоук на заглушке не нужен")
+class TestGuiPerfAndSnmp(unittest.TestCase):
+    """Без лишних пересчётов при перезапуске, перенос вышки мышью, SNMP по двойному клику."""
+
+    def setUp(self):
+        import tower
+        import gui
+        self.gui = gui
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        tower.TowerDB.DEFAULT_PATH = os.path.join(self.tmp.name, "t.db")
+        gui.BASE_DIR = Path(self.tmp.name)
+        qt_stub.QSettings._store.clear()
+        qt_stub.QMessageBox.calls.clear()
+        self.app = self._new_app()
+
+    def _new_app(self):
+        app = self.gui.CellTower3DApp()
+        app.web_view.loadFinished.emit(True)
+        app.building_data._register_area(LAT0, LON0, 5000)
+        return app
+
+    def tearDown(self):
+        self.app.db.close()
+        self.tmp.cleanup()
+
+    def place(self, east=0.0):
+        self.app._mode_actions["place"].setChecked(True)
+        self.app.on_map_event({"type": "place", "lat": LAT0, "lon": LON0 + east / M_LON})
+
+    def test_restart_does_not_recalculate_fresh_towers(self):
+        self.place()
+        self.place(300)
+        self.app.db.close()
+        app2 = self._new_app()
+        calls = []
+        app2._enqueue = lambda jobs: calls.append(len(jobs))
+        app2._on_cache_loaded(0)
+        self.assertEqual(calls, [])                                    # зоны из БД актуальны — расчёта нет
+        app2.chk_pattern.on = False                                    # другая настройка модели — пересчёт
+        app2._on_cache_loaded(0)
+        self.assertEqual(calls, [2])
+        app2.db.close()
+
+    def test_rays_sent_only_when_changed(self):
+        self.place()
+        self.place(300)
+        js = self.app.web_view.page().js
+        self.app._push_towers()
+        last = next(j for j in reversed(js) if j.startswith("api.setTowers("))
+        self.assertEqual(last.count('"rays": null'), 2)                # ничего не менялось — лучи не пересылаются
+        self.app.on_map_event({"type": "tower_move", "id": self.app.towers[0].db_id,
+                               "lat": LAT0 + 0.001, "lon": LON0})
+        last = next(j for j in reversed(js) if j.startswith("api.setTowers("))
+        self.assertEqual(last.count('"rays": null'), 1)                # только перенесённая вышка
+
+    def test_tower_drag_moves_tower_and_its_cables(self):
+        app = self.app
+        self.place()
+        t = app.towers[0]
+        app.net_set_model("sw_l2_24poe", activate=True)
+        app.on_map_event({"type": "net_place", "lat": LAT0, "lon": LON0 + 150 / M_LON})
+        sw = next(d for d in app.net.devices if d.startswith("D"))
+        app.on_map_event({"type": "net_connect", "a": f"T{t.db_id}", "b": sw})
+        before = next(iter(app.net.status.values())).length_m
+        app.on_map_event({"type": "tower_move", "id": t.db_id, "lat": LAT0, "lon": LON0 - 200 / M_LON})
+        t2 = app.towers[0]
+        self.assertEqual(t2.db_id, t.db_id)
+        self.assertAlmostEqual(t2.lon, LON0 - 200 / M_LON)
+        self.assertEqual(app.db.load_all_towers()[0]["lon"], t2.lon)
+        self.assertAlmostEqual(app.net.devices[f"T{t.db_id}"].lon, t2.lon)
+        self.assertGreater(next(iter(app.net.status.values())).length_m, before + 200)   # кабель удлинился
+
+    def test_snmp_from_double_click(self):
+        app = self.app
+        self.place()
+        tid = app.towers[0].db_id
+        app.on_map_event({"type": "snmp", "tower": tid})
+        r = app._last_snmp
+        self.assertEqual(r.device_id, f"T{tid}")
+        self.assertIn("craft", r.manager)                             # нет ядра/NMS — локальное подключение
+        self.assertEqual(r.extra_title, "Радио БС")
+        self.assertTrue(any("ranFrequencyMHz" in n for _, n, _ in r.extra))
+        app.net_set_model("core_5gc", activate=True)
+        app.on_map_event({"type": "net_place", "lat": LAT0, "lon": LON0 + 200 / M_LON})
+        core = next(d for d in app.net.devices if d.startswith("D"))
+        app.on_map_event({"type": "net_connect", "a": f"T{tid}", "b": core})
+        app.net_autoconfigure()
+        app.on_map_event({"type": "snmp", "dev": f"T{tid}"})
+        self.assertEqual(app._last_snmp.transport, "network", app._last_snmp.status)
+        app.on_map_event({"type": "select", "id": None})
+        app._net_sel = None
+        n = len(qt_stub.QMessageBox.calls)
+        app.snmp_selected()                                           # ничего не выбрано — подсказка
+        self.assertEqual(len(qt_stub.QMessageBox.calls), n + 1)
+
+    def test_device_drag_saved_later_and_on_close(self):
+        app = self.app
+        app.net_set_model("sw_l2_24poe", activate=True)
+        app.on_map_event({"type": "net_place", "lat": LAT0, "lon": LON0})
+        d = next(iter(app.net.devices))
+        app.on_map_event({"type": "net_move", "id": d, "lat": LAT0 + 0.001, "lon": LON0})
+        self.assertTrue(app._persist_due)                             # запись в БД отложена (не на каждое движение)
+        app.closeEvent(type("E", (), {"accept": lambda s: None, "ignore": lambda s: None})())
+        app.db = __import__("tower").TowerDB()
+        saved = app.db.get_meta("network")["devices"][0]
+        self.assertAlmostEqual(saved["lat"], LAT0 + 0.001)

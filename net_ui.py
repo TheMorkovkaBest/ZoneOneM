@@ -6,17 +6,18 @@ import json
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
                              QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
                              QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QTableWidget,
-                             QTableWidgetItem, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
-                             QAbstractItemView, QHeaderView)
+                             QTableWidgetItem, QTabWidget, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                             QWidget, QAbstractItemView, QApplication, QHeaderView)
 
 import geo
 import loadtest
 import netcatalog as NC
+import snmp
 from dialogs import QUALITY_COLORS
 from network import Network, Link, fmt_speed
 
@@ -218,6 +219,101 @@ class PortChooserDialog(QDialog):
         self.forecast.setText(f"Прогноз: <b style='color:{color}'>{text}</b> — {speed}длина {st.length_m:.0f} м. {st.reason}")
 
 
+class SnmpDialog(QDialog):
+    """Окно SNMP-опроса: заголовок соединения и таблицы MIB (как в браузере MIB/системе мониторинга)."""
+
+    IF_HEAD = ("ifIndex", "ifDescr", "Тип", "Скорость", "MAC", "Admin", "Oper", "In (HC)", "Out (HC)",
+               "Ошибки In", "ifAlias")
+
+    def __init__(self, poll_fn, theme, parent=None):
+        super().__init__(parent)
+        self.poll_fn, self.theme = poll_fn, theme
+        self.setMinimumSize(900, 560)
+        lay = QVBoxLayout(self)
+        self.header = QLabel()
+        self.header.setTextFormat(Qt.TextFormat.RichText)
+        self.header.setWordWrap(True)
+        self.header.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self.header)
+        self.tabs = QTabWidget()
+        self.t_sys = self._table(("OID", "Объект", "Значение"))
+        self.t_if = self._table(self.IF_HEAD)
+        self.t_ip = self._table(("Адрес / сеть", "Маска / next-hop", "ifIndex / порт", "Тип"))
+        self.t_lldp = self._table(("Локальный порт", "lldpRemSysName", "lldpRemPortId", "lldpRemSysDesc",
+                                   "Адрес управления", "Линия"))
+        self.t_extra = self._table(("OID", "Объект", "Значение"))
+        self.raw = QPlainTextEdit()
+        self.raw.setReadOnly(True)
+        for w, title in ((self.t_sys, "Система"), (self.t_if, "Интерфейсы (ifTable)"), (self.t_ip, "IP и маршруты"),
+                         (self.t_lldp, "Соседи (LLDP)"), (self.t_extra, "Доп."), (self.raw, "snmpwalk")):
+            self.tabs.addTab(w, title)
+        lay.addWidget(self.tabs, stretch=1)
+        row = QHBoxLayout()
+        b_refresh = QPushButton("Обновить (snmpwalk)")
+        b_refresh.clicked.connect(self.refresh)
+        b_copy = QPushButton("Копировать вывод")
+        b_copy.clicked.connect(lambda: QApplication.clipboard().setText(self.result.walk_text()))
+        b_close = QPushButton("Закрыть")
+        b_close.clicked.connect(self.accept)
+        row.addWidget(b_refresh)
+        row.addWidget(b_copy)
+        row.addStretch(1)
+        row.addWidget(b_close)
+        lay.addLayout(row)
+        self.result = None
+        self.refresh()
+
+    @staticmethod
+    def _table(head):
+        t = QTableWidget(0, len(head))
+        t.setHorizontalHeaderLabels(list(head))
+        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        t.horizontalHeader().setStretchLastSection(True)
+        t.verticalHeader().setVisible(False)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setAlternatingRowColors(True)
+        return t
+
+    @staticmethod
+    def _fill(table, rows, colors=None):
+        table.setRowCount(len(rows))
+        for r, cells in enumerate(rows):
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(str(text))
+                if colors and colors[r]:
+                    item.setForeground(QColor(colors[r]))
+                table.setItem(r, c, item)
+
+    def refresh(self):
+        res = self.result = self.poll_fn()
+        self.setWindowTitle(f"SNMP: {res.name}")
+        ok_color = "#2ecc71" if res.reachable and res.transport == "network" else (
+            "#f5a524" if res.reachable else "#e5484d")
+        path = " → ".join(res.path) if res.path else "—"
+        self.header.setText(
+            f"<b style='font-size:14px'>{res.name}</b> &nbsp; <code>{res.command}</code><br>"
+            f"<span style='color:{ok_color}'><b>{res.status}</b></span><br>"
+            f"Менеджер: {res.manager} · SNMPv2c, community «{snmp.COMMUNITY}» · путь запроса: {path}"
+            + (f"<br>sysUpTime: {snmp.fmt_ticks(res.uptime_s).split(') ')[-1]}" if res.reachable else ""))
+        self._fill(self.t_sys, [(o, n.split("::")[-1], v) for o, n, v in res.system])
+        colors = ["#e5484d" if not r["ifOperStatus"].startswith("up") and r["ifAlias"] else
+                  ("#8a93a0" if not r["ifAlias"] else None) for r in res.interfaces]
+        self._fill(self.t_if, [(r["ifIndex"], r["ifDescr"], r["ifType"], r["speed_text"], r["ifPhysAddress"],
+                                r["ifAdminStatus"], r["ifOperStatus"], snmp.fmt_octets(r["ifHCInOctets"]),
+                                snmp.fmt_octets(r["ifHCOutOctets"]), r["ifInErrors"], r["ifAlias"])
+                               for r in res.interfaces], colors)
+        ip_rows = [(f"{a['addr']}/{a['prefix']}", a["mask"], f"{a['ifIndex']} ({a['port']})", "ipAdEntAddr")
+                   for a in res.ip_addrs]
+        ip_rows += [(r["dest"], r["next_hop"], r["port"] or "—", f"маршрут {r['proto']}") for r in res.routes]
+        self._fill(self.t_ip, ip_rows)
+        self._fill(self.t_lldp, [(n["local_port"], n["sys_name"], n["port_id"], n["sys_desc"], n["man_addr"] or "—",
+                                  n["cable"]) for n in res.neighbors])
+        self._fill(self.t_extra, [(o, n.split("::")[-1], v) for o, n, v in res.extra])
+        self.tabs.setTabText(4, res.extra_title or "Доп.")
+        self.tabs.setTabEnabled(4, bool(res.extra))
+        self.raw.setPlainText(res.walk_text())
+
+
 # --------------------------------------------------------------------------- #
 #  График нагрузки
 # --------------------------------------------------------------------------- #
@@ -324,7 +420,21 @@ class NetworkMixin:
         self._load_worker = None
 
     def net_persist(self):
+        self._persist_due = False
         self.db.set_meta("network", self.net.to_dict())
+
+    def _net_persist_later(self):
+        """Перетаскивание шлёт события подряд — сохраняем в БД один раз, через 0.4 с после последнего."""
+        self._persist_due = True
+        if getattr(self, "_persist_timer", None) is None:
+            self._persist_timer = QTimer(self)
+            self._persist_timer.setSingleShot(True)
+            self._persist_timer.timeout.connect(self.net_flush_persist)
+        self._persist_timer.start(400)
+
+    def net_flush_persist(self):
+        if getattr(self, "_persist_due", False):
+            self.net_persist()
 
     def net_load_from_db(self):
         data = self.db.get_meta("network")
@@ -338,6 +448,8 @@ class NetworkMixin:
         self.net.evaluate(self.building_data)
         if persist:
             self.net_persist()
+        else:
+            self._net_persist_later()
         self._push_net()
         self._render_net_panels()
         self.lbl_net.setText(self._net_summary_text())
@@ -514,7 +626,11 @@ class NetworkMixin:
         self.btn_net_del = QPushButton("Удалить")
         self.btn_net_del.setProperty("danger", True)
         self.btn_net_del.clicked.connect(self.net_delete_selected)
+        self.btn_net_snmp = QPushButton("SNMP…")
+        self.btn_net_snmp.setToolTip("Опросить выбранное устройство по SNMP")
+        self.btn_net_snmp.clicked.connect(self.snmp_selected)
         row.addWidget(self.btn_net_cfg)
+        row.addWidget(self.btn_net_snmp)
         row.addWidget(self.btn_net_del)
         tl.addLayout(row)
         split.addWidget(top)
@@ -631,7 +747,7 @@ class NetworkMixin:
         dev = self.net.devices.get(did)
         if dev and dev.tower_id is None:
             dev.lat, dev.lon = lat, lon
-            self.net_after_change()
+            self.net_after_change(persist=False)
 
     def net_select_device(self, did, switch_tab=True):
         self._net_sel = ("dev", did) if did in self.net.devices else None
@@ -768,6 +884,37 @@ class NetworkMixin:
         self.tabs.setCurrentWidget(self.net_page)
         self.statusBar().showMessage(("PDU доставлен" if res.ok else "PDU не доставлен") + f": {da} → {db}")
 
+    def snmp_selected(self):
+        """SNMP для выбранного сетевого устройства или вышки."""
+        did = None
+        if self._net_sel and self._net_sel[0] == "dev":
+            did = self._net_sel[1]
+        elif self.selected_id is not None:
+            did = f"T{self.selected_id}"
+        if did is None:
+            QMessageBox.information(self, "SNMP", "Выберите вышку или устройство на карте (или дважды кликните по ней).")
+            return
+        self.snmp_open(did)
+
+    def _current_link_util(self):
+        res = self._load_result
+        if res is None or not res.steps:
+            return None
+        step = res.steps[min(max(self.ld_slider.value(), 0), len(res.steps) - 1)]
+        return {lid: float(step.link_util[e]) for e, lid in enumerate(res.link_ids)}
+
+    def snmp_open(self, did):
+        if did is None or did not in self.net.devices:
+            return
+        self.net.evaluate(self.building_data)
+        dev = self.net.devices[did]
+        tower = next((t for t in self.towers if t.db_id == dev.tower_id), None) if dev.tower_id is not None else None
+        poll = lambda: snmp.poll(self.net, did, link_util=self._current_link_util(), tower=tower)
+        dlg = SnmpDialog(poll, self.th, self)
+        self._last_snmp = dlg.result
+        self.statusBar().showMessage(f"SNMP {dev.name}: {dlg.result.status}")
+        dlg.exec()
+
     def net_export_bom(self):
         rows, total = self.net.bom()
         if not rows:
@@ -810,6 +957,7 @@ class NetworkMixin:
         self.link_table.blockSignals(False)
         sel = self._net_sel
         self.btn_net_cfg.setEnabled(bool(sel and sel[0] == "dev"))
+        self.btn_net_snmp.setEnabled(bool(sel and sel[0] == "dev"))
         self.btn_net_del.setEnabled(bool(sel))
         if not sel:
             self.net_info.setHtml("")

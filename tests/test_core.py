@@ -104,10 +104,28 @@ class TestRadioModel(unittest.TestCase):
                 self.assertLess(abs(new - old(f, p, h, th)), cap / 4096 + 1e-6, (f, p, h, th))
 
     def test_zones_nested_and_sector(self):
-        r = C.compute_ray_reach(LAT0, LON0, 1800, 20, 30, 20, None, azimuth=90, beamwidth=65)
+        r = C.compute_ray_reach(LAT0, LON0, 1800, 20, 30, 20, None, azimuth=90, beamwidth=65, pattern=False)
         self.assertTrue(np.all(np.diff(r.reach, axis=1) >= 0))        # green<=exc<=good<=weak
         angles = r.angles[r.reach[:, 3] > 0]
         self.assertTrue(np.all(np.abs((angles - 90 + 540) % 360 - 180) <= 32.5))
+
+    def test_antenna_pattern_back_lobe(self):
+        r = C.compute_ray_reach(LAT0, LON0, 1800, 0.05, 30, 20, None, azimuth=90, beamwidth=65)
+        self.assertTrue(np.all(np.diff(r.reach, axis=1) >= 0))
+        self.assertLess(r.reach[45, 3], C.max_range_cap_m(1800, 30))
+        front, side, back = r.reach[45, 3], r.reach[0, 3], r.reach[135, 3]   # 90°, 0°, 270°
+        self.assertGreater(back, 0.0)                                  # задний лепесток: сигнал есть
+        self.assertLess(back, front / 3)                               # но на 25 дБ слабее
+        self.assertLessEqual(back, side + 1e-9)
+        # граница 3 дБ: на краю луча (±32.5°) бюджет меньше ровно на 3 дБ
+        self.assertAlmostEqual(C.pattern_attenuation_db(90 + 32.5, 90, 65), 3.0, places=6)
+        self.assertEqual(C.pattern_attenuation_db(270, 90, 65), C.FRONT_TO_BACK_DB)
+        self.assertEqual(C.pattern_attenuation_db(123, 0, 360), 0.0)  # круговая — без ослабления
+
+    def test_knife_edge(self):
+        self.assertAlmostEqual(float(C.knife_edge_db(0.0)), 6.0, delta=0.05)   # кромка на линии визирования
+        self.assertEqual(float(C.knife_edge_db(-1.0)), 0.0)                    # зона Френеля свободна
+        self.assertGreater(float(C.knife_edge_db(2.0)), 16.0)
 
     def test_quality_levels(self):
         self.assertEqual(C.quality_of(-50), "green")
@@ -171,12 +189,35 @@ class TestAttenuation(unittest.TestCase):
         south = 90
         self.assertAlmostEqual(with_b.reach[south, 3], free.reach[south, 3], places=3)
 
-    def test_low_building_ignored(self):
+    def test_low_building_ignored_without_fresnel(self):
         bd = BuildingData()
         bd.add_buildings([{"id": 1, "height": 4, "poly": rect(0, 80, 60, 20)}])
-        a = C.compute_ray_reach(LAT0, LON0, 1800, 10, 5, 20, None)
-        b = C.compute_ray_reach(LAT0, LON0, 1800, 10, 5, 20, bd)
+        a = C.compute_ray_reach(LAT0, LON0, 1800, 10, 5, 20, None, fresnel=False)
+        b = C.compute_ray_reach(LAT0, LON0, 1800, 10, 5, 20, bd, fresnel=False)
         np.testing.assert_allclose(a.reach, b.reach)
+
+    def test_low_building_in_fresnel_zone_shadows(self):
+        bd = BuildingData()
+        bd.add_buildings([{"id": 1, "height": 4, "poly": rect(0, 80, 60, 20)}])     # ниже антенны 5 м
+        free = C.compute_ray_reach(LAT0, LON0, 1800, 0.2, 5, 20, None)
+        b = C.compute_ray_reach(LAT0, LON0, 1800, 0.2, 5, 20, bd)
+        north, south = 0, 90
+        self.assertLess(free.reach[north, 2], C.max_range_cap_m(1800, 5))   # зона «средняя» не упирается в потолок
+        self.assertLess(b.reach[north, 2], free.reach[north, 2] - 5)   # тень дифракции за низким домом
+        self.assertGreater(b.reach[north, 2], 70.0)                    # до дома (70–90 м) сигнал доходит
+        self.assertAlmostEqual(b.reach[south, 2], free.reach[south, 2], places=3)
+        tw = Tower("t", LAT0, LON0, 1800, 0.2, 5, 0, 20, [1, 2, 3, 255], building_data=bd)
+        behind = C.link_analysis(tw, LAT0 + 130 / C.M_PER_DEG_LAT, LON0, bd)
+        self.assertGreater(behind["diffraction_db"], 3.0)
+        tw_off = Tower("t", LAT0, LON0, 1800, 0.2, 5, 0, 20, [1, 2, 3, 255], building_data=bd, fresnel=False)
+        self.assertEqual(C.link_analysis(tw_off, LAT0 + 130 / C.M_PER_DEG_LAT, LON0, bd)["diffraction_db"], 0.0)
+
+    def test_fresnel_clear_path_no_loss(self):
+        bd = BuildingData()
+        bd.add_buildings([{"id": 1, "height": 3, "poly": rect(0, 60, 30, 10)}])     # низкий сарай, макросота 35 м
+        a = C.compute_ray_reach(LAT0, LON0, 800, 40, 35, 15, None)
+        b = C.compute_ray_reach(LAT0, LON0, 800, 40, 35, 15, bd)
+        np.testing.assert_allclose(a.reach, b.reach)                   # зона Френеля высоко над крышей
 
     def test_own_building_ignored(self):
         bd = BuildingData()
@@ -199,12 +240,18 @@ class TestAttenuation(unittest.TestCase):
         for kw in (dict(freq=1800, power=10, height=5, wall_loss=20, azimuth=0, beamwidth=360),
                    dict(freq=800, power=40, height=12, wall_loss=15, azimuth=45, beamwidth=120),
                    dict(freq=2600, power=1, height=3, wall_loss=25, azimuth=200, beamwidth=360)):
-            tw = Tower("t", LAT0 + 3e-4, LON0 - 2e-4, tilt=0, color=[1, 2, 3, 255], building_data=bd, **kw)
+            tw = Tower("t", LAT0 + 3e-4, LON0 - 2e-4, tilt=0, color=[1, 2, 3, 255], building_data=bd,
+                       fresnel=False, pattern=False, **kw)                 # эталон — модель стен без дифракции
             np.testing.assert_allclose(tw.reach, reference_reach(tw, bd), atol=1e-6, err_msg=str(kw))
 
     def test_probe_matches_zone_boundary(self):
         bd = make_city()
-        tw = Tower("t", LAT0, LON0, 1800, 10, 5, 0, 20, [1, 2, 3, 255], building_data=bd)
+        self._probe_matches(Tower("t", LAT0, LON0, 1800, 10, 5, 0, 20, [1, 2, 3, 255], building_data=bd), bd)
+        sector = Tower("s", LAT0, LON0, 1800, 0.5, 12, 0, 20, [1, 2, 3, 255], building_data=bd,
+                       azimuth=60, beamwidth=65)                           # лепестки + дифракция
+        self._probe_matches(sector, bd)
+
+    def _probe_matches(self, tw, bd):
         checked = 0
         for i in range(0, 180, 7):
             for z, name in enumerate(C.ZONE_NAMES):
@@ -213,19 +260,24 @@ class TestAttenuation(unittest.TestCase):
                     continue   # у потолка дальности зонд (без потолка) и зона расходятся по построению
                 az = tw.angles[i]
                 for dist, expect_in in ((r - 0.5 * C.GRID_RES_M, True), (r + 2.5 * C.GRID_RES_M, False)):
-                    lat = LAT0 + math.cos(math.radians(az)) * dist / C.M_PER_DEG_LAT
-                    lon = LON0 + math.sin(math.radians(az)) * dist / M_LON
+                    lat = tw.lat + math.cos(math.radians(az)) * dist / C.M_PER_DEG_LAT
+                    lon = tw.lon + math.sin(math.radians(az)) * dist / M_LON
                     res = C.link_analysis(tw, lat, lon, bd)
                     ok = res["rssi_dbm"] >= C.THRESHOLDS[z][1]
                     self.assertEqual(ok, expect_in, (i, name, dist, res["rssi_dbm"]))
                     checked += 1
-        self.assertGreater(checked, 50)
+        self.assertGreater(checked, 30)
 
     def test_probe_out_of_sector(self):
-        tw = Tower("t", LAT0, LON0, 1800, 20, 30, 0, 20, [1, 2, 3, 255], azimuth=0, beamwidth=60)
+        tw = Tower("t", LAT0, LON0, 1800, 20, 30, 0, 20, [1, 2, 3, 255], azimuth=0, beamwidth=60, pattern=False)
         res = C.link_analysis(tw, LAT0 - 0.001, LON0)             # строго за спиной
         self.assertFalse(res["in_sector"])
         self.assertIsNone(res["rssi_dbm"])
+        tw = Tower("t", LAT0, LON0, 1800, 20, 30, 0, 20, [1, 2, 3, 255], azimuth=0, beamwidth=60)
+        back = C.link_analysis(tw, LAT0 - 0.001, LON0)
+        front = C.link_analysis(tw, LAT0 + 0.001, LON0)
+        self.assertFalse(back["in_sector"])
+        self.assertAlmostEqual(front["rssi_dbm"] - back["rssi_dbm"], C.FRONT_TO_BACK_DB, places=3)
 
     def test_legacy_ray_tracing_format(self):
         rr = C.ray_tracing(LAT0, LON0, 1800, 10, 5, 20)

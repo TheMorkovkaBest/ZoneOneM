@@ -4,7 +4,7 @@ import io
 import json
 import math
 
-from calculations import ZONE_NAMES, M_PER_DEG_LAT, is_in_sector
+from calculations import NUM_RAYS, ZONE_NAMES, M_PER_DEG_LAT, angle_offset, visible_rays
 
 CSV_COLUMNS = ["name", "type_name", "lat", "lon", "freq", "power", "height", "tilt",
                "wall_loss", "azimuth", "beamwidth", "r_green", "r_exc", "r_good", "r_weak"]
@@ -23,15 +23,15 @@ def towers_to_csv(towers):
 def _ring(t, z):
     m_lon = M_PER_DEG_LAT * math.cos(math.radians(t.lat))
     pts = []
-    for i, a in enumerate(t.angles):
-        if not is_in_sector(a, t.azimuth, t.beamwidth):
-            continue
+    show = visible_rays(t.angles, t.reach, t.azimuth, t.beamwidth)
+    idx = sorted((i for i in range(len(t.angles)) if show[i]), key=lambda i: angle_offset(t.angles[i], t.azimuth))
+    for i in idx:                                  # по порядку от левого края сектора к правому
         r = float(t.reach[i, z])
-        rad = math.radians(a)
+        rad = math.radians(t.angles[i])
         pts.append([t.lon + math.sin(rad) * r / m_lon, t.lat + math.cos(rad) * r / M_PER_DEG_LAT])
     if not pts:
         return None
-    if t.beamwidth < 360.0:
+    if t.beamwidth < 360.0 and len(idx) < NUM_RAYS:     # сектор без заднего лепестка — клин из центра
         pts = [[t.lon, t.lat]] + pts + [[t.lon, t.lat]]
     else:
         pts.append(pts[0])
