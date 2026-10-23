@@ -925,6 +925,13 @@ class NetworkMixin:
         if link is None:
             QMessageBox.warning(self, "Кабель", err)
             return
+        if hasattr(self, "push_undo"):
+            lid = link.id
+            def undo_link():
+                self.net.disconnect(lid)
+                self._net_sel = None
+                self.net_after_change()
+            self.push_undo(undo_link, f"Кабель «{da.name} ↔ {db.name}»")
         self._net_sel = ("link", link.id)
         self.net_after_change()
         self._js(f"api.selectLink({json.dumps(link.id)});")

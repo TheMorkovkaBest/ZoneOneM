@@ -89,12 +89,17 @@ class BuildingData:
     #  Загрузка
     # ------------------------------------------------------------------ #
     def is_covered(self, lat, lon, need_m=400.0):
-        """Есть ли уже загруженные данные, покрывающие круг радиусом need_m."""
+        """Есть ли уже загруженные данные, покрывающие область точки."""
         with self._lock:
+            if self._origin is not None and self._tiles:
+                cx, cy = self._to_cells(lat, lon)
+                tx, ty = int(math.floor(cx)) // TILE, int(math.floor(cy)) // TILE
+                if (ty, tx) in self._tiles:
+                    return True
             for c_lat, c_lon, r in self.loaded_centers:
                 dist = math.hypot((lat - c_lat) * M_PER_DEG_LAT,
                                   (lon - c_lon) * M_PER_DEG_LAT * math.cos(math.radians(lat)))
-                if dist + need_m <= r:
+                if dist <= r:
                     return True
         return False
 

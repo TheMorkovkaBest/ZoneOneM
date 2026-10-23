@@ -204,6 +204,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._measure_points = []
         self._icon_actions = []
         self._mode_actions = {}
+        self._undo_stack = []
+        self._is_undoing = False
 
         self.init_ui()
         self.apply_theme(self.theme_name)
@@ -216,6 +218,41 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     @property
     def th(self):
         return theming.THEMES[self.theme_name]
+
+    def push_undo(self, undo_fn, desc="Действие"):
+        """Поместить действие в стек отмены (Ctrl+Z / Cmd+Z)."""
+        if getattr(self, "_is_undoing", False):
+            return
+        self._undo_stack.append({"desc": desc, "undo": undo_fn})
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+        self._update_undo_state()
+
+    def undo(self):
+        """Отменить последнее действие (Ctrl+Z / Cmd+Z)."""
+        if not self._undo_stack:
+            self.statusBar().showMessage("Нечего отменять.")
+            return
+        item = self._undo_stack.pop()
+        self._is_undoing = True
+        try:
+            item["undo"]()
+            self.statusBar().showMessage(f"Отменено: {item['desc']}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка отмены: {e}")
+        finally:
+            self._is_undoing = False
+            self._update_undo_state()
+
+    def _update_undo_state(self):
+        if hasattr(self, "act_undo"):
+            if self._undo_stack:
+                last = self._undo_stack[-1]["desc"]
+                self.act_undo.setEnabled(True)
+                self.act_undo.setToolTip(f"<b>Отменить (Ctrl+Z)</b><br>{last}")
+            else:
+                self.act_undo.setEnabled(False)
+                self.act_undo.setToolTip("<b>Отменить (Ctrl+Z)</b><br>Нет действий для отмены")
 
     def _act(self, text, icon=None, slot=None, checkable=False, shortcut=None, tip=None):
         act = QAction(text, self)
@@ -320,6 +357,10 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                                   tip="<b>Редактировать вышку</b><br>Изменить название, параметры излучения и диаграмму направленности.")
         self.act_delete = self._act("Удалить", "trash", self.delete_selected_tower, shortcut="Del",
                                     tip="<b>Удалить вышку (Del)</b><br>Удалить выбранную базовую станцию и её кабели.")
+        self.act_undo = self._act("Отменить", "undo", self.undo, shortcut=QKeySequence.StandardKey.Undo,
+                                  tip="<b>Отменить (Ctrl+Z / Cmd+Z)</b><br>Отмена последнего действия: размещение, перемещение, удаление вышки, поворот азимута, параметры.")
+        self.act_undo.setEnabled(False)
+        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
         self.act_recalc = self._act("Пересчитать всё", "refresh", self.recalc_all, shortcut="F5",
                                     tip="<b>Пересчитать всё (F5)</b><br>Полный пересчёт зон покрытия всех вышек по зданиям.")
         self.act_antenna_catalog = self._act("Каталог антенн", "layers", self.open_antenna_catalog_dialog,
@@ -374,6 +415,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         m.addAction(self.act_clear_db)
         m.addSeparator()
         m.addAction(self.act_quit)
+        m_edit = mb.addMenu("Правка")
+        m_edit.addAction(self.act_undo)
+        m_edit.addSeparator()
+        m_edit.addAction(self.act_edit)
+        m_edit.addAction(self.act_delete)
         m = mb.addMenu("Инструменты")
         for name in ("navigate", "place", "measure", "probe"):
             m.addAction(self._mode_actions[name])
@@ -397,6 +443,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         m = self._mode_actions
         g = bar.add_group("Карта")
         g.add_action(m["navigate"])
+        g.add_action(self.act_undo)
         g.add_action(self.act_goto)
         g = bar.add_group("Радиосеть")
         g.add_action(m["place"])
@@ -923,15 +970,31 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     def _on_fetch_finished(self):
         self._fetch_busy = False
         self._start_fetch()
+        self._recalc_pending()
 
     def _recalc_pending(self):
         """Пересчитать вышки, которые ждали загрузки зданий в своём районе."""
         if not self.chk_buildings.isChecked():
             return
         queued = {j.get("db_id") for j in self._job_queue}
-        jobs = [self._job_from_tower(t) for t in self.towers
-                if t.buildings_pending and t.db_id not in queued
-                and self.building_data.is_covered(t.lat, t.lon, BUILDINGS_NEED_M)]
+        jobs = []
+        for t in self.towers:
+            if t.db_id in queued:
+                continue
+            if not (t.buildings_pending or not t.used_buildings):
+                continue
+            if not self.building_data.is_covered(t.lat, t.lon, BUILDINGS_NEED_M):
+                continue
+            mount = getattr(t, "mount", None) or {}
+            if mount.get("type") == "ground":
+                try:
+                    bld_h = float(self.building_data.heights_at([t.lat], [t.lon])[0])
+                    if bld_h > 0.0:
+                        t.mount = {"type": "building", "id": None, "offset": 3.0, "bld_h": bld_h}
+                        t.height = bld_h + 3.0
+                except Exception:
+                    pass
+            jobs.append(self._job_from_tower(t))
         if jobs:
             self._enqueue(jobs)
 
@@ -1067,6 +1130,9 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         job = self._job_from_type(self._next_name(), lat, lon, type_name, type_data)
         job["params"]["height"] = mount_h
         job["mount"] = mount
+        if self.chk_buildings.isChecked() and self.building_data:
+            if not self.building_data.is_covered(lat, lon, BUILDINGS_NEED_M):
+                self._request_buildings([(lat, lon)])
         self._enqueue([job])
 
     @staticmethod
@@ -1118,6 +1184,15 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             if job.get("src_id") is not None:
                 self._import_ids[job["src_id"]] = tower.db_id
             self._bump_counter(tower.name)
+            t_id = tower.db_id
+            t_name = tower.name
+            def undo_place():
+                self.db.delete_tower(t_id)
+                self.towers = [x for x in self.towers if x.db_id != t_id]
+                if self.selected_id == t_id:
+                    self.selected_id = None
+                self._refresh_all()
+            self.push_undo(undo_place, f"Размещение «{t_name}»")
 
     def _bump_counter(self, name):
         """Счётчик имён «Вышка #N» не должен выдавать уже занятые номера (импорт, алгоритм)."""
@@ -1185,6 +1260,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         if abs((azimuth - t.azimuth + 180.0) % 360.0 - 180.0) < 0.5:
             self._push_towers()                    # без изменений — сбросить предпросмотр на карте
             return
+        old_az = t.azimuth
+        t_name = t.name
+        def undo_az():
+            self.set_tower_azimuth(tid, old_az)
+        self.push_undo(undo_az, f"Поворот «{t_name}»")
         job = self._job_from_tower(t)
         job["params"]["azimuth"] = float(azimuth) % 360.0
         self._enqueue([job])
@@ -1198,6 +1278,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             self._push_towers()
             self._push_net()
             return
+        old_lat, old_lon = t.lat, t.lon
+        t_name = t.name
+        def undo_pos():
+            self.set_tower_position(tid, old_lat, old_lon)
+        self.push_undo(undo_pos, f"Перемещение «{t_name}»")
         t.lat, t.lon = float(lat), float(lon)
         self.db.update_tower(t.db_id, t.to_dict())
         self.net_after_towers_changed()
@@ -1514,6 +1599,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             "azimuth": float(self.ed_tower_azimuth.value()),
             "beamwidth": float(self.ed_tower_beamwidth.value()),
         }
+        old_job = self._job_from_tower(t)
+        t_name = t.name
+        def undo_panel():
+            self._enqueue([old_job])
+        self.push_undo(undo_panel, f"Свойства «{t_name}»")
         self._enqueue([{"action": "update", "name": name, "lat": lat, "lon": lon,
                         "type_name": type_name, "params": params, "mount": getattr(t, "mount", None),
                         "color": t.color, "scale": t.scale, "db_id": t.db_id}])
@@ -1548,6 +1638,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             self._sync_antenna_dropdown(preset_name)
             t = self._current_tower()
             if t is not None:
+                old_job = self._job_from_tower(t)
+                t_name = t.name
+                def undo_ant():
+                    self._enqueue([old_job])
+                self.push_undo(undo_ant, f"Антенна «{t_name}»")
                 p = t.params()
                 p["freq"] = a.freq_mhz
                 p["power"] = a.tx_power_w
@@ -1573,6 +1668,14 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             self.structures[s.id] = s
             structures.save_structure(self.db.conn, s)
             self.statusBar().showMessage(f"Создан каркас: «{s.name}» (высота {s.height:.0f} м).")
+            s_id = s.id
+            s_name = s.name
+            def undo_struct():
+                if s_id in self.structures:
+                    del self.structures[s_id]
+                    structures.delete_structure(self.db.conn, s_id)
+                    self._push_towers()
+            self.push_undo(undo_struct, f"Создание каркаса «{s_name}»")
             # Если рядом есть выбранная вышка — предлагаем/привязываем к каркасу
             t = self._current_tower()
             if t is not None and abs(t.lat - s.lat) < 0.0005 and abs(t.lon - s.lon) < 0.0005:
@@ -1606,6 +1709,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             parent=self
         )
         if dlg.exec():
+            old_job = self._job_from_tower(t)
+            t_name = t.name
+            def undo_mount():
+                self._enqueue([old_job])
+            self.push_undo(undo_mount, f"Монтаж «{t_name}»")
             t.mount = {
                 "type": dlg.result_mount_type,
                 "id": dlg.result_mount_id,
@@ -1634,6 +1742,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         if not d["name"]:
             QMessageBox.warning(self, "Ошибка", "Имя не может быть пустым.")
             return
+        old_job = self._job_from_tower(t)
+        t_name = t.name
+        def undo_edit():
+            self._enqueue([old_job])
+        self.push_undo(undo_edit, f"Редактирование «{t_name}»")
         self._enqueue([{"action": "update", "name": d["name"], "lat": d["lat"], "lon": d["lon"],
                         "type_name": d["type_name"], "params": {k: d[k] for k in PARAM_KEYS},
                         "color": d["color"], "scale": t.scale, "db_id": t.db_id}])
@@ -1645,6 +1758,33 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             return
         if QMessageBox.question(self, "Удаление", f"Удалить '{t.name}'?") != QMessageBox.StandardButton.Yes:
             return
+        t_data = t.to_dict()
+        t_mount = getattr(t, "mount", None)
+        t_name = t.name
+        t_db_id = t.db_id
+        cables_backup = [dict(c) for c in getattr(self.net, "cables", [])
+                         if c.get("from_id") == t.name or c.get("to_id") == t.name or
+                            c.get("from_dev") == f"T{t_db_id}" or c.get("to_dev") == f"T{t_db_id}"]
+
+        def undo_delete():
+            new_id = self.db.save_tower(t_data)
+            restored = Tower.from_dict(t_data)
+            restored.db_id = new_id
+            if t_mount is not None:
+                restored.mount = t_mount
+            self.towers.append(restored)
+            self.selected_id = new_id
+            for cb in cables_backup:
+                if cb.get("from_dev") == f"T{t_db_id}":
+                    cb["from_dev"] = f"T{new_id}"
+                if cb.get("to_dev") == f"T{t_db_id}":
+                    cb["to_dev"] = f"T{new_id}"
+                self.net.cables.append(cb)
+            self._refresh_all()
+            self._enqueue([self._job_from_tower(restored)])
+
+        self.push_undo(undo_delete, f"Удаление «{t_name}»")
+
         self.db.delete_tower(t.db_id)
         self.towers = [x for x in self.towers if x.db_id != t.db_id]
         self.selected_id = None
