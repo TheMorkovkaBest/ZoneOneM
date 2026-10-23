@@ -271,6 +271,11 @@ class TestSnmp(unittest.TestCase):
         self.assertTrue(r.ip_addrs and r.neighbors)
         self.assertEqual(r.extra_title, "Радио БС")
         self.assertIn("ifHCInOctets", r.walk_text())
+        self.assertIn("RX Power: 20 dbm", r.walk_text())
+        self.assertEqual(
+            r.format_template('RX Power: [string_substring(oid("1.3.6.1.4.1.64999.2.12.0"),0,13)] dbm'),
+            "RX Power: 20 dbm",
+        )
         # счётчики растут со временем, загрузка из теста нагрузки увеличивает трафик
         r2 = snmp.poll(net, "T2", tower=towers[1], now=time.time() + 3600)
         self.assertGreater(r2.interfaces[0]["ifHCInOctets"], up[0]["ifHCInOctets"] if up[0]["ifIndex"] == 1 else 0)

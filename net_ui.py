@@ -752,21 +752,21 @@ class NetworkMixin:
     def net_select_device(self, did, switch_tab=True):
         self._net_sel = ("dev", did) if did in self.net.devices else None
         self._js(f"api.selectDevice({json.dumps(did)});")
-        self._render_net_panels()
+        self._update_net_selection_ui()
         if switch_tab and self._net_sel:
             self.tabs.setCurrentWidget(self.net_page)
 
-    def net_select_link(self, lid):
+    def net_select_link(self, lid, from_table=False):
         self._net_sel = ("link", lid) if lid in self.net.links else None
         self._js(f"api.selectLink({json.dumps(lid)});")
-        self._render_net_panels()
+        self._update_net_selection_ui(sync_table=not from_table)
         if self._net_sel:
             self.tabs.setCurrentWidget(self.net_page)
 
     def net_on_tower_selected(self, tid):
         did = f"T{tid}" if tid is not None else None
         self._net_sel = ("dev", did) if did in self.net.devices else None
-        self._render_net_panels()
+        self._update_net_selection_ui()
 
     def net_connect(self, a, b):
         net = self.net
@@ -803,8 +803,10 @@ class NetworkMixin:
         if link is None:
             QMessageBox.warning(self, "Кабель", err)
             return
+        self._net_sel = ("link", link.id)
         self.net_after_change()
-        self.net_select_link(link.id)
+        self._js(f"api.selectLink({json.dumps(link.id)});")
+        self.tabs.setCurrentWidget(self.net_page)
         st = net.status[link.id]
         text, _ = STATE_TEXT[st.state]
         self.statusBar().showMessage(f"{NC.CABLES[cid]['name']}: {da.name}:{pa} ↔ {db.name}:{pb} — {text}"
@@ -938,24 +940,51 @@ class NetworkMixin:
     # ------------------------------ отрисовка панелей ------------------------------ #
     def _render_net_panels(self):
         net = self.net
+        self._block_link_table = True
         self.link_table.blockSignals(True)
-        self.link_table.setRowCount(len(net.links))
-        for r, (lid, l) in enumerate(net.links.items()):
-            st = net.status.get(lid)
-            c = NC.CABLES[l.cable]
-            cells = (c["name"], f"{net.devices[l.a_dev].name}:{l.a_port} ↔ {net.devices[l.b_dev].name}:{l.b_port}",
-                     f"{st.length_m:.0f} м" if st else "—",
-                     (fmt_speed(st.speed_mbps) if st and st.speed_mbps else "✕"))
-            for col, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                item.setData(Qt.ItemDataRole.UserRole, lid)
-                if st and st.state == "down":
-                    item.setForeground(QColor("#e5484d"))
-                elif st and st.state == "warn":
-                    item.setForeground(QColor("#f5a524"))
-                self.link_table.setItem(r, col, item)
-        self.link_table.blockSignals(False)
+        try:
+            self.link_table.setRowCount(len(net.links))
+            for r, (lid, l) in enumerate(net.links.items()):
+                st = net.status.get(lid)
+                c = NC.CABLES[l.cable]
+                cells = (c["name"], f"{net.devices[l.a_dev].name}:{l.a_port} ↔ {net.devices[l.b_dev].name}:{l.b_port}",
+                         f"{st.length_m:.0f} м" if st else "—",
+                         (fmt_speed(st.speed_mbps) if st and st.speed_mbps else "✕"))
+                for col, text in enumerate(cells):
+                    item = QTableWidgetItem(text)
+                    item.setData(Qt.ItemDataRole.UserRole, lid)
+                    if st and st.state == "down":
+                        item.setForeground(QColor("#e5484d"))
+                    elif st and st.state == "warn":
+                        item.setForeground(QColor("#f5a524"))
+                    self.link_table.setItem(r, col, item)
+        finally:
+            self.link_table.blockSignals(False)
+            self._block_link_table = False
+        self._update_net_selection_ui(sync_table=True)
+
+    def _update_net_selection_ui(self, sync_table=True):
+        net = self.net
         sel = self._net_sel
+        if sync_table:
+            self._block_link_table = True
+            self.link_table.blockSignals(True)
+            try:
+                if sel and sel[0] == "link":
+                    found = False
+                    for r in range(self.link_table.rowCount()):
+                        item = self.link_table.item(r, 0)
+                        if item and item.data(Qt.ItemDataRole.UserRole) == sel[1]:
+                            self.link_table.selectRow(r)
+                            found = True
+                            break
+                    if not found:
+                        self.link_table.clearSelection()
+                else:
+                    self.link_table.clearSelection()
+            finally:
+                self.link_table.blockSignals(False)
+                self._block_link_table = False
         self.btn_net_cfg.setEnabled(bool(sel and sel[0] == "dev"))
         self.btn_net_snmp.setEnabled(bool(sel and sel[0] == "dev"))
         self.btn_net_del.setEnabled(bool(sel))
@@ -969,11 +998,13 @@ class NetworkMixin:
             self.net_info.setHtml("")
 
     def _on_link_table(self):
+        if getattr(self, "_block_link_table", False):
+            return
         rows = self.link_table.selectionModel().selectedRows()
         if rows:
             item = self.link_table.item(rows[0].row(), 0)
             if item is not None:
-                self.net_select_link(item.data(Qt.ItemDataRole.UserRole))
+                self.net_select_link(item.data(Qt.ItemDataRole.UserRole), from_table=True)
 
     def _kv(self, rows):
         dim = self.th["dim"]

@@ -856,6 +856,10 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                 "params": t.params(), "color": list(t.color), "scale": t.scale, "db_id": t.db_id}
 
     def _enqueue(self, jobs):
+        upd_ids = {j.get("db_id") for j in jobs if j.get("action") == "update" and j.get("db_id") is not None}
+        if upd_ids:
+            self._job_queue = [j for j in self._job_queue
+                               if not (j.get("action") == "update" and j.get("db_id") in upd_ids)]
         self._job_queue.extend(jobs)
         self._start_next()
 
@@ -964,9 +968,12 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             return
         if geo.haversine_m(t.lat, t.lon, lat, lon) < 0.3:
             self._push_towers()
+            self._push_net()
             return
+        t.lat, t.lon = float(lat), float(lon)
+        self.db.update_tower(t.db_id, t.to_dict())
+        self.net_after_towers_changed()
         job = self._job_from_tower(t)
-        job["lat"], job["lon"] = float(lat), float(lon)
         self._enqueue([job])
 
     def recalc_all(self):

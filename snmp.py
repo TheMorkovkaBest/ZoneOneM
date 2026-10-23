@@ -15,9 +15,11 @@ IP-сети (тот же ping, что и в режиме PDU). Нет маршр
 """
 import hashlib
 import ipaddress
+import re
 import time
 from dataclasses import dataclass, field
 
+import geo
 import netcatalog as NC
 from network import fmt_speed
 
@@ -29,6 +31,7 @@ _OID = {
     "sysDescr": "1.3.6.1.2.1.1.1.0", "sysObjectID": "1.3.6.1.2.1.1.2.0", "sysUpTime": "1.3.6.1.2.1.1.3.0",
     "sysContact": "1.3.6.1.2.1.1.4.0", "sysName": "1.3.6.1.2.1.1.5.0", "sysLocation": "1.3.6.1.2.1.1.6.0",
     "sysServices": "1.3.6.1.2.1.1.7.0",
+    "rxPower": f"{ENTERPRISE}.2.12.0", "txPower": f"{ENTERPRISE}.2.13.0",
 }
 IF_COLUMNS = (("ifIndex", "1.3.6.1.2.1.2.2.1.1"), ("ifDescr", "1.3.6.1.2.1.2.2.1.2"), ("ifType", "1.3.6.1.2.1.2.2.1.3"),
               ("ifMtu", "1.3.6.1.2.1.2.2.1.4"), ("ifPhysAddress", "1.3.6.1.2.1.2.2.1.6"),
@@ -36,6 +39,47 @@ IF_COLUMNS = (("ifIndex", "1.3.6.1.2.1.2.2.1.1"), ("ifDescr", "1.3.6.1.2.1.2.2.1
               ("ifInErrors", "1.3.6.1.2.1.2.2.1.14"), ("ifHCInOctets", "1.3.6.1.2.1.31.1.1.1.6"),
               ("ifHCOutOctets", "1.3.6.1.2.1.31.1.1.1.10"), ("ifHighSpeed", "1.3.6.1.2.1.31.1.1.1.15"),
               ("ifAlias", "1.3.6.1.2.1.31.1.1.1.18"))
+
+_BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
+_TYPE_PREFIX_RE = re.compile(r"^(?:STRING|INTEGER|Gauge32|Counter64|OID|IpAddress):\s*")
+
+WALK_TEMPLATES = (
+    'Device: [string_substring(oid("1.3.6.1.2.1.1.5.0"),0,32)]',
+    'Model: [string_substring(oid("1.3.6.1.2.1.1.1.0"),0,64)]',
+    'Location: [string_substring(oid("1.3.6.1.2.1.1.6.0"),0,32)]',
+    'Uptime: [string_substring(oid("1.3.6.1.2.1.1.3.0"),0,13)]',
+    'RX Power: [string_substring(oid("1.3.6.1.4.1.64999.2.12.0"),0,13)] dbm',
+    'TX Power: [string_substring(oid("1.3.6.1.4.1.64999.2.13.0"),0,13)] dbm',
+)
+
+
+def _clean_snmp_val(val) -> str:
+    s = str(val)
+    if s.startswith("Timeticks:"):
+        return s.split(") ", 1)[-1] if ") " in s else s
+    s = _TYPE_PREFIX_RE.sub("", s)
+    return s
+
+
+def eval_snmp_expr(expr: str, oids: dict) -> str:
+    """Вычисляет выражение в стиле The Dude: oid("...") и string_substring(..., start, end)."""
+    def _oid(key: str) -> str:
+        return str(oids.get(str(key).lstrip("."), ""))
+
+    def _string_substring(val, start: int = 0, end: int = None) -> str:
+        s = str(val)
+        return s[int(start):] if end is None else s[int(start):int(end)]
+
+    try:
+        res = eval(expr, {"__builtins__": {}}, {"oid": _oid, "string_substring": _string_substring})
+        return "" if res is None else str(res)
+    except Exception:
+        return ""
+
+
+def format_snmp_template(template: str, oids: dict) -> str:
+    """Подставляет значения OID в шаблон вида 'RX Power: [string_substring(oid("1.3.6.1.2.1.1.3.0"),0,13)] dbm'."""
+    return _BRACKET_RE.sub(lambda m: eval_snmp_expr(m.group(1), oids), template)
 
 
 @dataclass
@@ -57,33 +101,85 @@ class SnmpResult:
     neighbors: list = field(default_factory=list)     # [dict] LLDP
     extra_title: str = ""
     extra: list = field(default_factory=list)         # [(oid, объект, значение)] — радио БС / PoE
+    oids: dict = field(default_factory=dict)          # {oid: чистое_значение} для шаблонов [oid("...")]
 
     @property
     def command(self):
         return f"snmpwalk -v2c -c {COMMUNITY} {self.ip or '<нет IP>'}"
 
+    def _build_oids(self):
+        oids = dict(self.oids)
+        for oid, _name, val in self.system:
+            oids.setdefault(oid, _clean_snmp_val(val))
+        for row in self.interfaces:
+            i = row["ifIndex"]
+            for col, oid in IF_COLUMNS:
+                oids.setdefault(f"{oid}.{i}", _clean_snmp_val(row[col]))
+        for r in self.ip_addrs:
+            oids.setdefault(f"1.3.6.1.2.1.4.20.1.1.{r['addr']}", str(r["addr"]))
+            oids.setdefault(f"1.3.6.1.2.1.4.20.1.2.{r['addr']}", str(r["ifIndex"]))
+            oids.setdefault(f"1.3.6.1.2.1.4.20.1.3.{r['addr']}", str(r["mask"]))
+        for r in self.routes:
+            oids.setdefault(f"1.3.6.1.2.1.4.24.4.1.4.{r['dest']}", str(r["next_hop"]))
+            oids.setdefault(f"1.3.6.1.2.1.4.24.4.1.7.{r['dest']}", str(r["proto"]))
+        for r in self.neighbors:
+            p = r["local_port"]
+            oids.setdefault(f"1.0.8802.1.1.2.1.4.1.1.9.{p}", str(r["sys_name"]))
+            oids.setdefault(f"1.0.8802.1.1.2.1.4.1.1.7.{p}", str(r["port_id"]))
+        for oid, _name, val in self.extra:
+            oids.setdefault(oid, _clean_snmp_val(val))
+        oids.setdefault(_OID["rxPower"], "20")
+        oids.setdefault(_OID["txPower"], "20")
+        return oids
+
+    def format_template(self, template: str) -> str:
+        return format_snmp_template(template, self._build_oids())
+
     def walk_text(self):
-        """Вывод в стиле net-snmp (snmpwalk), чтобы можно было скопировать."""
+        """Преобразованный вывод SNMP WALK по шаблонам вида [string_substring(oid("..."),0,13)]."""
         out = [f"$ {self.command}"]
         if not self.reachable:
             out.append(f"Timeout: No Response from {self.ip or self.name}.")
             return "\n".join(out)
-        for oid, name, val in self.system:
-            out.append(f"{name} ({oid}) = {val}")
+        oids = self._build_oids()
+        for tpl in WALK_TEMPLATES:
+            out.append(format_snmp_template(tpl, oids))
         for row in self.interfaces:
             i = row["ifIndex"]
-            for col, oid in IF_COLUMNS:
-                out.append(f"IF-MIB::{col}.{i} ({oid}.{i}) = {row[col]}")
+            tpl = (
+                f'Interface [string_substring(oid("1.3.6.1.2.1.2.2.1.2.{i}"),0,16)]: '
+                f'[string_substring(oid("1.3.6.1.2.1.2.2.1.8.{i}"),0,16)] · '
+                f'Speed: [string_substring(oid("1.3.6.1.2.1.31.1.1.1.15.{i}"),0,8)] Mbps · '
+                f'ifHCInOctets: [string_substring(oid("1.3.6.1.2.1.31.1.1.1.6.{i}"),0,20)] · '
+                f'ifHCOutOctets: [string_substring(oid("1.3.6.1.2.1.31.1.1.1.10.{i}"),0,20)]'
+            )
+            out.append(format_snmp_template(tpl, oids))
         for r in self.ip_addrs:
-            out.append(f"IP-MIB::ipAdEntAddr.{r['addr']} = IpAddress: {r['addr']}  ifIndex {r['ifIndex']}, "
-                       f"mask {r['mask']}")
+            a = r["addr"]
+            tpl = (
+                f'IP Address: [string_substring(oid("1.3.6.1.2.1.4.20.1.1.{a}"),0,16)] / '
+                f'[string_substring(oid("1.3.6.1.2.1.4.20.1.3.{a}"),0,16)] '
+                f'(ifIndex [oid("1.3.6.1.2.1.4.20.1.2.{a}")])'
+            )
+            out.append(format_snmp_template(tpl, oids))
         for r in self.routes:
-            out.append(f"IP-FORWARD-MIB::ipCidrRouteNextHop.{r['dest']} = IpAddress: {r['next_hop']} ({r['proto']})")
+            d = r["dest"]
+            tpl = (
+                f'Route {d}: nextHop [string_substring(oid("1.3.6.1.2.1.4.24.4.1.4.{d}"),0,16)] '
+                f'([string_substring(oid("1.3.6.1.2.1.4.24.4.1.7.{d}"),0,16)])'
+            )
+            out.append(format_snmp_template(tpl, oids))
         for r in self.neighbors:
-            out.append(f"LLDP-MIB::lldpRemSysName.{r['local_port']} = STRING: {r['sys_name']}  "
-                       f"порт {r['port_id']}, {r['sys_desc']}")
-        for oid, name, val in self.extra:
-            out.append(f"{name} ({oid}) = {val}")
+            p = r["local_port"]
+            tpl = (
+                f'LLDP {p}: [string_substring(oid("1.0.8802.1.1.2.1.4.1.1.9.{p}"),0,32)] '
+                f'port [string_substring(oid("1.0.8802.1.1.2.1.4.1.1.7.{p}"),0,16)]'
+            )
+            out.append(format_snmp_template(tpl, oids))
+        for oid, name, _val in self.extra:
+            short = name.split("::")[-1]
+            tpl = f'{short}: [string_substring(oid("{oid}"),0,32)]'
+            out.append(format_snmp_template(tpl, oids))
         return "\n".join(out)
 
 
@@ -174,6 +270,12 @@ def poll(net, dev_id, link_util=None, tower=None, now=None):
     elif dev.spec.get("poe_budget_w"):
         res.extra_title = "PoE"
         res.extra = _poe_rows(net, dev)
+    rx_dbm = "20" if dev.role in ("tower", "radio") else f"{-4.5 + (_h('rx', dev.id) % 30) / 10.0:.1f}"
+    tx_dbm = f"{geo.w_to_dbm(tower.power):.1f}" if tower is not None else (
+        "20" if dev.role == "radio" else f"{-1.5 + (_h('tx', dev.id) % 25) / 10.0:.1f}")
+    res.oids[_OID["rxPower"]] = rx_dbm
+    res.oids[_OID["txPower"]] = tx_dbm
+    res.oids = res._build_oids()
     return res
 
 
@@ -244,7 +346,8 @@ def _radio_rows(dev, tower):
     rows = [(f"{base}.1.0", "ZONEM-RAN::ranTechnology.0", f"STRING: {r.get('tech', 'LTE')}"),
             (f"{base}.2.0", "ZONEM-RAN::ranBandwidthMHz.0", f"Gauge32: {r.get('bw_mhz', 0):g}"),
             (f"{base}.3.0", "ZONEM-RAN::ranMimoLayers.0", f"INTEGER: {r.get('layers', 0)}"),
-            (f"{base}.4.0", "ZONEM-RAN::ranMaxActiveUsers.0", f"INTEGER: {r.get('max_users', 0)}")]
+            (f"{base}.4.0", "ZONEM-RAN::ranMaxActiveUsers.0", f"INTEGER: {r.get('max_users', 0)}"),
+            (f"{base}.12.0", "ZONEM-RAN::ranRxPowerDbm.0", "STRING: 20")]
     if tower is not None:
         rows += [(f"{base}.5.0", "ZONEM-RAN::ranFrequencyMHz.0", f"Gauge32: {tower.freq:g}"),
                  (f"{base}.6.0", "ZONEM-RAN::ranTxPowerW.0", f"STRING: {tower.power:g}"),
@@ -252,7 +355,8 @@ def _radio_rows(dev, tower):
                  (f"{base}.8.0", "ZONEM-RAN::ranAntennaHeightM.0", f"STRING: {tower.height:g}"),
                  (f"{base}.9.0", "ZONEM-RAN::ranAzimuthDeg.0", f"INTEGER: {int(round(tower.azimuth))}"),
                  (f"{base}.10.0", "ZONEM-RAN::ranBeamwidthDeg.0", f"INTEGER: {int(round(tower.beamwidth))}"),
-                 (f"{base}.11.0", "ZONEM-RAN::ranCellRadiusWeakM.0", f"Gauge32: {int(tower.r_weak * 1000)}")]
+                 (f"{base}.11.0", "ZONEM-RAN::ranCellRadiusWeakM.0", f"Gauge32: {int(tower.r_weak * 1000)}"),
+                 (f"{base}.13.0", "ZONEM-RAN::ranTxPowerDbm.0", f"STRING: {geo.w_to_dbm(tower.power):.1f}")]
     return rows
 
 

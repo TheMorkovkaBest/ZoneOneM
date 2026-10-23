@@ -127,12 +127,105 @@
   }
 
   /* ---------------- отрисовка ---------------- */
-  function setData(id, data) { const s = map && map.getSource(id); if (s) s.setData(data); }
+  let lblCanvas = null, lblCtx = null, deckKey = '';
+  const srcTimers = new Map(), srcLast = new Map();
+
+  function setData(id, data, fast) {
+    const s = map && map.getSource(id);
+    if (!s) return;
+    if (!fast) {
+      const t = srcTimers.get(id); if (t) { clearTimeout(t); srcTimers.delete(id); }
+      srcLast.delete(id);
+      s.setData(data);
+      drawLabels();
+      return;
+    }
+    const now = Date.now(), last = srcLast.get(id) || 0;
+    if (now - last >= 28) {
+      const t = srcTimers.get(id); if (t) { clearTimeout(t); srcTimers.delete(id); }
+      srcLast.set(id, now);
+      s.setData(data);
+      drawLabels();
+    } else {
+      const prev = srcTimers.get(id); if (prev) clearTimeout(prev);
+      srcTimers.set(id, setTimeout(() => {
+        srcTimers.delete(id);
+        srcLast.set(id, Date.now());
+        const s2 = map && map.getSource(id);
+        if (s2) s2.setData(data);
+        drawLabels();
+      }, 28 - (now - last)));
+    }
+  }
+
+  function ensureLabelCanvas() {
+    if (lblCanvas || !map || typeof document === 'undefined') return;
+    const c = document.createElement('canvas');
+    if (!c || typeof c.getContext !== 'function') return;
+    c.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:2;';
+    const parent = document.getElementById('map');
+    if (parent && parent.appendChild) parent.appendChild(c);
+    lblCanvas = c;
+    lblCtx = c.getContext('2d');
+  }
+
+  function drawLabels() {
+    ensureLabelCanvas();
+    if (!lblCtx || !map) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = lblCanvas.clientWidth || window.innerWidth || 0;
+    const h = lblCanvas.clientHeight || window.innerHeight || 0;
+    if (!w || !h) return;
+    if (lblCanvas.width !== Math.round(w * dpr) || lblCanvas.height !== Math.round(h * dpr)) {
+      lblCanvas.width = Math.round(w * dpr);
+      lblCanvas.height = Math.round(h * dpr);
+    }
+    const ctx = lblCtx;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const th = theme();
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = 3.2;
+    ctx.strokeStyle = th.halo;
+    const zoom = map.getZoom ? map.getZoom() : 15;
+    if (state.net && state.net.links && state.net.links.length) {
+      ctx.font = '600 10.5px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      for (const l of state.net.links) {
+        const isSel = l.id === state.selLink;
+        if (!isSel && zoom < 14.2) continue;
+        const a = devPos(l.a_dev, l.a), b = devPos(l.b_dev, l.b);
+        const p = map.project([(a[1] + b[1]) / 2, (a[0] + b[0]) / 2]);
+        if (p.x < -80 || p.x > w + 80 || p.y < -40 || p.y > h + 40) continue;
+        const u = linkUtil(l.id);
+        const txt = String(l.label || '') + (u !== null ? ' · ' + Math.round(u * 100) + '%' : '');
+        if (!txt) continue;
+        ctx.fillStyle = l.state === 'down' ? '#ff8a8e' : (l.state === 'warn' ? '#f5a524' : th.text);
+        ctx.strokeText(txt, p.x, p.y - 7);
+        ctx.fillText(txt, p.x, p.y - 7);
+      }
+    }
+    if (state.towers && state.towers.length) {
+      ctx.font = '600 11.5px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = th.text;
+      for (const t0 of state.towers) {
+        const t = previewOf(t0);
+        const p = map.project([t.lon, t.lat]);
+        if (p.x < -100 || p.x > w + 100 || p.y < -40 || p.y > h + 40) continue;
+        ctx.strokeText(t.name, p.x + 11, p.y);
+        ctx.fillText(t.name, p.x + 11, p.y);
+      }
+    }
+  }
 
   function renderCoverage() {
     setData('coverage', coverageFeatures());
     setData('coverage-active', activeId === null ? EMPTY : coverageFeatures(activeId));
     setData('towers', towerPoints());
+    setData('netlinks', linkFeatures());
     renderDeck(); renderAzimuthHandle();
   }
   /* Во время поворота/переноса меняется одна вышка: обновляем только её источник и точки,
@@ -143,8 +236,9 @@
     setData('coverage', coverageFeatures());
   }
   function renderActive() {
-    setData('coverage-active', activeId === null ? EMPTY : coverageFeatures(activeId));
-    setData('towers', towerPoints());
+    setData('coverage-active', activeId === null ? EMPTY : coverageFeatures(activeId), true);
+    setData('towers', towerPoints(), true);
+    renderDeck();
   }
   function renderZones() { setData('zones', zoneFeatures()); }
   function renderDraft() { setData('draft', lineAndPoints(state.draft, true)); }
@@ -252,8 +346,9 @@
   function endTowerDrag() {
     const g = state.towerDrag;
     if (map) map.getCanvas().style.cursor = '';
-    if (!g.moved) { state.towerDrag = null; return; }
+    if (!g || !g.moved) { state.towerDrag = null; return; }
     g.done = true;                          // предпросмотр держим, пока Python не пришлёт пересчёт
+    g.justEnded = true;
     send({ type: 'tower_move', id: g.id, lat: g.lat, lon: g.lon });
     clearTimeout(dragTimer);                // Python пришлёт пересчитанную вышку; если нет — вернуть на место
     dragTimer = setTimeout(() => {
@@ -267,25 +362,42 @@
   const linkUtil = (id) => (state.traffic && state.traffic.linkUtil && state.traffic.linkUtil[id] !== undefined)
     ? state.traffic.linkUtil[id] : null;
 
+  function devPos(devId, fallback) {
+    if (typeof devId === 'string' && devId.startsWith('T')) {
+      const tid = Number(devId.slice(1));
+      const t0 = state.towers.find((x) => x.id === tid);
+      if (t0) {
+        const t = previewOf(t0);
+        return [t.lat, t.lon];
+      }
+    }
+    const d = state.net.devices.find((x) => x.id === devId);
+    if (d) return [d.lat, d.lon];
+    return fallback;
+  }
+
   function linkFeatures() {
     return { type: 'FeatureCollection', features: state.net.links.map((l) => {
+      const a = devPos(l.a_dev, l.a), b = devPos(l.b_dev, l.b);
       const u = linkUtil(l.id);
       const col = (u !== null && l.state !== 'down') ? utilColor(u) : (l.state === 'warn' ? '#f5a524' : l.color);
       return { type: 'Feature', properties: { id: l.id, state: l.state, col, width: l.width,
         sel: l.id === state.selLink ? 1 : 0,
         lbl: l.label + (u !== null ? ' · ' + Math.round(u * 100) + '%' : '') },
-        geometry: { type: 'LineString', coordinates: [[l.a[1], l.a[0]], [l.b[1], l.b[0]]] } };
+        geometry: { type: 'LineString', coordinates: [[a[1], a[0]], [b[1], b[0]]] } };
     }) };
   }
 
   /* Устройство тащат: двигаем концы его кабелей сразу (раньше кабель «прыгал» только после отпускания). */
   function moveDevicePreview(id, lat, lon) {
+    const dev = state.net.devices.find((x) => x.id === id);
+    if (dev) { dev.lat = lat; dev.lon = lon; }
     let hit = false;
     for (const l of state.net.links) {
       if (l.a_dev === id) { l.a = [lat, lon]; hit = true; }
       if (l.b_dev === id) { l.b = [lat, lon]; hit = true; }
     }
-    if (hit) setData('netlinks', linkFeatures());
+    if (hit) setData('netlinks', linkFeatures(), true);
   }
 
   function renderNet() {
@@ -315,10 +427,10 @@
       el.classList.toggle('selected', d.id === state.selDevice);
       el.classList.toggle('unpowered', d.powered === false);
     }
-    // подписи кабелей — слой карты (netlinks-label), а не DOM-маркер на каждый кабель:
-    // сотни маркеров MapLibre двигает на каждом кадре, отсюда и «лаги» при панораме и перетаскивании
+    // подписи кабелей и вышек рисуются на одном 2D-холсте поверх карты, без DOM-маркеров и без symbol-воркеров
     renderFlowDots(performance.now());
     renderArm();
+    drawLabels();
   }
 
   function renderArm() {
@@ -329,7 +441,8 @@
       el.className = 'arm-ring';
       armMarker = new maplibregl.Marker({ element: el }).addTo(map);
     }
-    armMarker.setLngLat([d.lon, d.lat]);
+    const pos = devPos(d.id, [d.lat, d.lon]);
+    armMarker.setLngLat([pos[1], pos[0]]);
   }
 
   /* Устройства перетаскиваются только в режиме навигации: в режимах «Кабель»/PDU малейшее
@@ -355,7 +468,8 @@
     if (direct) return direct;
     let best = null, bestD = 26;
     for (const d of state.net.devices) {
-      const p = map.project([d.lon, d.lat]);
+      const pos = devPos(d.id, [d.lat, d.lon]);
+      const p = map.project([pos[1], pos[0]]);
       const dist = Math.hypot(p.x - point.x, p.y - point.y);
       if (dist < bestD) { bestD = dist; best = d; }
     }
@@ -369,7 +483,8 @@
   function pickLink(point) {
     let best = null, bestD = 9;
     for (const l of state.net.links) {
-      const d = segDist(point, map.project([l.a[1], l.a[0]]), map.project([l.b[1], l.b[0]]));
+      const a = devPos(l.a_dev, l.a), b = devPos(l.b_dev, l.b);
+      const d = segDist(point, map.project([a[1], a[0]]), map.project([b[1], b[0]]));
       if (d < bestD) { bestD = d; best = l; }
     }
     return best;
@@ -393,14 +508,15 @@
       for (const l of state.net.links) {
         const u = linkUtil(l.id);
         if (u === null || u <= 0.01 || l.state === 'down') continue;
+        const a = devPos(l.a_dev, l.a), b = devPos(l.b_dev, l.b);
         const n = 1 + Math.round(u * 5), period = 2600 - u * 1700;
         for (let k = 0; k < n; k++) {
           const f = ((now / period) + k / n) % 1;
           const g = 1 - (((now / period) * 0.8 + (k + 0.5) / n) % 1);
           feats.push({ type: 'Feature', properties: { col: utilColor(u) }, geometry: { type: 'Point',
-            coordinates: [l.a[1] + (l.b[1] - l.a[1]) * f, l.a[0] + (l.b[0] - l.a[0]) * f] } });
+            coordinates: [a[1] + (b[1] - a[1]) * f, a[0] + (b[0] - a[0]) * f] } });
           if (k % 2 === 0) feats.push({ type: 'Feature', properties: { col: utilColor(u) }, geometry: { type: 'Point',
-            coordinates: [l.a[1] + (l.b[1] - l.a[1]) * g, l.a[0] + (l.b[0] - l.a[0]) * g] } });
+            coordinates: [a[1] + (b[1] - a[1]) * g, a[0] + (b[0] - a[0]) * g] } });
         }
       }
     }
@@ -456,14 +572,19 @@
   function rubberBand() {
     const d = state.cableFrom && state.net.devices.find((x) => x.id === state.cableFrom);
     if (!d || !state.mouse) { renderDraft(); return; }
-    setData('draft', lineFrom([d.lon, d.lat], [state.mouse.lng, state.mouse.lat]));
+    const pos = devPos(d.id, [d.lat, d.lon]);
+    setData('draft', lineFrom([pos[1], pos[0]], [state.mouse.lng, state.mouse.lat]), true);
   }
 
   function renderDeck() {
     if (!deckOverlay || typeof deck === 'undefined') return;
+    const list = state.towers.map(previewOf);
+    const key = list.map((t) => t.id + ':' + t.lat + ':' + t.lon + ':' + t.height + ':' + t.tilt + ':' + t.scale).join('|');
+    if (key === deckKey) return;
+    deckKey = key;
     const layers = [];
-    const plain = state.towers.filter((t) => !t.model_b64);
-    const models = state.towers.filter((t) => t.model_b64);
+    const plain = list.filter((t) => !t.model_b64);
+    const models = list.filter((t) => t.model_b64);
     if (plain.length) layers.push(new deck.ColumnLayer({
       id: 'tower-columns-default', data: plain, getPosition: (d) => [d.lon, d.lat],
       getElevation: (d) => d.height, radius: 4, extruded: true, pickable: false,
@@ -480,8 +601,8 @@
   /* ---------------- слои карты (пересоздаются при смене подложки) ---------------- */
   function setupLayers() {
     if (map.getSource('coverage')) return;
-    for (const id of ['coverage', 'coverage-active', 'towers', 'zones', 'draft', 'measure', 'azline', 'netlinks',
-      'flow', 'trfusers', 'trflines']) map.addSource(id, { type: 'geojson', data: EMPTY });
+    for (const id of ['coverage', 'coverage-active', 'towers', 'zones', 'draft', 'measure', 'azline',
+      'netlinks', 'flow', 'trfusers', 'trflines']) map.addSource(id, { type: 'geojson', data: EMPTY });
     for (const src of ['coverage', 'coverage-active']) {
       map.addLayer({ id: src + '-fill', type: 'fill', source: src,
         paint: { 'fill-color': ['get', 'fill'], 'fill-opacity': 0.75 } });
@@ -492,7 +613,7 @@
     try {
       map.addSource('openfreemap-buildings', { type: 'vector', url: 'https://tiles.openfreemap.org/planet' });
       map.addLayer({ id: '3d-buildings-extrusion', source: 'openfreemap-buildings', 'source-layer': 'building',
-        type: 'fill-extrusion', minzoom: 13, paint: {
+        type: 'fill-extrusion', minzoom: 15.5, paint: {
           'fill-extrusion-color': state.theme === 'dark' ? '#4a5160' : '#c5ccd6',
           'fill-extrusion-height': ['*', ['coalesce', ['get', 'render_height'], ['get', 'height'], 15], 1.2],
           'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], ['get', 'min_height'], 0],
@@ -527,47 +648,24 @@
         'line-width': ['+', ['get', 'width'], ['case', ['==', ['get', 'sel'], 1], 3, 0]] } });
     map.addLayer({ id: 'flow-dots', type: 'circle', source: 'flow', paint: {
       'circle-radius': 3.2, 'circle-color': '#ffffff', 'circle-stroke-color': ['get', 'col'], 'circle-stroke-width': 1.5 } });
-    // вышки и подписи кабелей — слои карты (рисует GPU), а не DOM-маркеры
     map.addLayer({ id: 'tower-dot', type: 'circle', source: 'towers', paint: {
       'circle-radius': ['case', ['==', ['get', 'sel'], 1], 8, 6.5], 'circle-color': ['get', 'color'],
       'circle-stroke-color': ['case', ['==', ['get', 'sel'], 1], '#3e8bff', '#ffffff'],
       'circle-stroke-width': ['case', ['==', ['get', 'sel'], 1], 4, 2],
       'circle-pitch-alignment': 'viewport' } });
-    const font = styleFont();
-    const labelPaint = () => ({ 'text-color': theme().text, 'text-halo-color': theme().halo, 'text-halo-width': 1.6 });
-    try {
-      map.addLayer({ id: 'tower-label', type: 'symbol', source: 'towers', layout: {
-        'text-field': ['get', 'name'], 'text-font': font, 'text-size': 11.5, 'text-anchor': 'left',
-        'text-offset': [1.0, 0], 'text-allow-overlap': true, 'text-pitch-alignment': 'viewport' },
-        paint: labelPaint() });
-      const lbl = (id, extra) => Object.assign({ id, type: 'symbol', source: 'netlinks', layout: {
-        'symbol-placement': 'line-center', 'text-field': ['get', 'lbl'], 'text-font': font, 'text-size': 10.5,
-        'text-allow-overlap': false, 'text-pitch-alignment': 'viewport' },
-        paint: Object.assign(labelPaint(), { 'text-color': ['match', ['get', 'state'], 'down', '#ff8a8e',
-          'warn', '#f5a524', theme().text] }) }, extra);
-      map.addLayer(lbl('netlinks-label', { minzoom: 14.5, filter: ['!=', ['get', 'sel'], 1] }));
-      map.addLayer(lbl('netlinks-label-sel', { filter: ['==', ['get', 'sel'], 1] }));
-    } catch (e) { console.warn('labels unavailable: ' + e); }
+    deckKey = '';
     renderCoverage(); renderZones(); renderMeasure(); renderDraft(); renderNet(); renderTraffic();
   }
 
   const THEME_TEXT = { dark: { text: '#e6eaf0', halo: 'rgba(16,20,26,0.9)' }, light: { text: '#1c2430', halo: 'rgba(255,255,255,0.95)' } };
   const theme = () => THEME_TEXT[state.theme] || THEME_TEXT.dark;
-  function styleFont() {                    // шрифт из самой подложки: у каждого сервера свой набор glyphs
-    try {
-      for (const l of map.getStyle().layers || []) {
-        const f = l.layout && l.layout['text-font'];
-        if (Array.isArray(f) && f.length && f.every((x) => typeof x === 'string')) return [f[0]];
-      }
-    } catch (e) { /* стиль ещё не загружен */ }
-    return ['Noto Sans Regular'];
-  }
 
   /* ---------------- режимы и взаимодействие ---------------- */
   function drawing() { return state.mode === 'zone_algo' || state.mode === 'zone_forbidden'; }
 
   function setMapMode(mode) {
     if (drawing() && state.mode !== mode) { state.draft = []; renderDraft(); }
+    if (state.towerDrag && !state.towerDrag.done) { state.towerDrag = null; activeId = null; }
     state.mode = mode;
     state.cableFrom = null; renderArm(); renderDraft(); updateDraggable();
     const ind = $('mode-indicator');
@@ -581,11 +679,12 @@
   }
 
   function pickTower(point) {
-    let best = null, bestD = 28;
-    for (const t of state.towers) {
+    let best = null, bestD = 18;
+    for (const t0 of state.towers) {
+      const t = previewOf(t0);
       const p = map.project([t.lon, t.lat]);
       const d = Math.hypot(p.x - point.x, p.y - point.y);
-      if (d < bestD) { bestD = d; best = t; }
+      if (d < bestD) { bestD = d; best = t0; }
     }
     return best;
   }
@@ -605,13 +704,13 @@
     const lat = e.lngLat.lat, lon = e.lngLat.lng;
     switch (state.mode) {
       case 'navigate': case 'select': {
-        if (state.towerDrag && state.towerDrag.moved) break;
+        if (state.towerDrag && state.towerDrag.justEnded) { state.towerDrag.justEnded = false; break; }
         const t = deviceFromEvent(e) ? null : pickTower(e.point);
         if (t) { send({ type: 'select', id: t.id }); break; }
         const d = pickDevice(e.point, e);
         if (d) { state.selDevice = d.id; state.selLink = null; renderNet(); send({ type: 'net_select', id: d.id }); break; }
         const l = pickLink(e.point);
-        if (l) { state.selLink = l.id; state.selDevice = null; renderNet(); renderCoverage(); send({ type: 'net_link_select', id: l.id }); break; }
+        if (l) { state.selLink = l.id; state.selDevice = null; renderNet(); send({ type: 'net_link_select', id: l.id }); break; }
         if (state.mode === 'select') send({ type: 'select', id: null });
         break;
       }
@@ -645,6 +744,7 @@
 
   function onDblClick(e) {
     if (state.mode === 'navigate' && e && e.point) {          // двойной клик по вышке/устройству — SNMP
+      if (state.towerDrag && !state.towerDrag.moved) state.towerDrag = null;
       const d = deviceFromEvent(e);
       const t = d ? null : pickTower(e.point);
       const dev = d || (t ? null : pickDevice(e.point, e));
@@ -681,7 +781,10 @@
       clearTimeout(dragTimer);
       renderCoverage();
     },
-    selectTower(id) { state.selectedId = id; state.azPreview = null; renderCoverage(); },
+    selectTower(id) {
+      if (state.selectedId === id && state.azPreview === null) return;
+      state.selectedId = id; state.azPreview = null; renderCoverage();
+    },
     setZones(z) { state.zones = { algo: z.algo || null, forbidden: z.forbidden || [] }; renderZones(); },
     setMapMode,
     setRectShape(v) { state.rectShape = !!v; state.draft = []; renderDraft(); },
@@ -705,13 +808,7 @@
       document.body.setAttribute('data-theme', theme);
       if (map && map.getLayer('3d-buildings-extrusion'))
         map.setPaintProperty('3d-buildings-extrusion', 'fill-extrusion-color', theme === 'dark' ? '#4a5160' : '#c5ccd6');
-      const c = THEME_TEXT[theme] || THEME_TEXT.dark;
-      for (const id of ['tower-label', 'netlinks-label', 'netlinks-label-sel']) {
-        if (!map || !map.getLayer(id)) continue;
-        map.setPaintProperty(id, 'text-halo-color', c.halo);
-        map.setPaintProperty(id, 'text-color', id === 'tower-label' ? c.text
-          : ['match', ['get', 'state'], 'down', '#ff8a8e', 'warn', '#f5a524', c.text]);
-      }
+      drawLabels();
     },
     setBase(name) {
       if (!STYLES[name] || !map || state.base === name) return;
@@ -742,15 +839,21 @@
   map.on('style.load', () => {
     setupLayers();
     if (!deckOverlay && typeof deck !== 'undefined') {
-      deckOverlay = new deck.MapboxOverlay({ interleaved: true, layers: [] });
+      deckOverlay = new deck.MapboxOverlay({ interleaved: false, layers: [] });
       map.addControl(deckOverlay);
     }
+    deckKey = '';
     renderDeck();
+    drawLabels();
     if (!state.ready) { state.ready = true; send({ type: 'ready' }); }
   });
+  map.on('render', drawLabels);
   map.on('error', (e) => { if (e && e.error) console.warn('map error: ' + e.error.message); });
   // окно Qt меняет размер (сплиттер, развёртывание) — подогнать холст, если ResizeObserver не сработал
-  if (window.addEventListener) window.addEventListener('resize', () => map.resize());
+  if (window.addEventListener) {
+    window.addEventListener('resize', () => { map.resize(); drawLabels(); });
+    window.addEventListener('mouseup', () => { if (state.towerDrag && !state.towerDrag.done) endTowerDrag(); });
+  }
   map.on('zoom', () => { if (!azDragging) renderAzimuthHandle(); });
   map.on('mousedown', (e) => {              // перенос вышки: нажать на неё в режиме «Навигация» и тянуть
     if (state.mode !== 'navigate' || deviceFromEvent(e) || (e.originalEvent && e.originalEvent.button)) return;
@@ -770,7 +873,13 @@
   map.on('mousemove', (e) => {
     const now = Date.now();
     state.mouse = e.lngLat;
-    if (state.towerDrag && !state.towerDrag.done) moveTowerDrag(e);
+    if (state.towerDrag && !state.towerDrag.done) {
+      if (e.originalEvent && e.originalEvent.buttons !== undefined && (e.originalEvent.buttons & 1) === 0) {
+        endTowerDrag();
+      } else {
+        moveTowerDrag(e);
+      }
+    }
     if (state.cableFrom) rubberBand();
     if (now - hudThrottle > 40) {
       hudThrottle = now;
