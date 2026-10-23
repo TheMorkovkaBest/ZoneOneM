@@ -102,10 +102,15 @@ class SnmpResult:
     extra_title: str = ""
     extra: list = field(default_factory=list)         # [(oid, объект, значение)] — радио БС / PoE
     oids: dict = field(default_factory=dict)          # {oid: чистое_значение} для шаблонов [oid("...")]
+    custom_command: str = ""
 
     @property
     def command(self):
-        return f"snmpwalk -v2c -c {COMMUNITY} {self.ip or '<нет IP>'}"
+        return self.custom_command or f"snmpwalk -v2c -c {COMMUNITY} {self.ip or '<нет IP>'}"
+
+    @command.setter
+    def command(self, val):
+        self.custom_command = val
 
     def _build_oids(self):
         oids = dict(self.oids)
@@ -217,26 +222,45 @@ def _boot_time(net, dev_id):
     return getattr(net, "boot_time", time.time()) - 86400.0 * (1 + _h("boot", dev_id) % 40) - _h("s", dev_id) % 86400
 
 
-def poll(net, dev_id, link_util=None, tower=None, now=None):
+def poll(net, dev_id, link_util=None, tower=None, now=None, target_ip=None, port=None, community=None, version=None):
     """snmpwalk по устройству dev_id. link_util — {link_id: загрузка 0..1} (из теста нагрузки) или None."""
     dev = net.devices[dev_id]
+    cfg = dev.snmp_params() if hasattr(dev, "snmp_params") else {}
+    comm = community if community is not None else cfg.get("community", COMMUNITY)
+    snmp_port = int(port if port is not None else cfg.get("port", 161))
+    ver = version if version is not None else cfg.get("version", "v2c")
+    enabled = cfg.get("enabled", True)
     now = time.time() if now is None else now
     if not net.status and net.links:
         net.evaluate()
-    res = SnmpResult(dev_id, dev.name, ip=_first_ip(dev))
+    target = target_ip or _first_ip(dev)
+    res = SnmpResult(dev_id, dev.name, ip=target)
+    res.command = f"snmpwalk -{ver} -c {comm} {target}:{snmp_port} 1.3.6.1"
+    if not enabled:
+        res.reachable = False
+        res.status = f"Агент SNMP выключен в настройках устройства {dev.name}"
+        return res
+    if comm != cfg.get("community", COMMUNITY):
+        res.reachable = False
+        res.status = f"Timeout: No Response from {target} (Authentication failure: неверный community «{comm}»)"
+        return res
     _connect(net, dev, res)
     if not res.reachable:
         return res
     res.uptime_s = max(now - _boot_time(net, dev_id), 1.0)
     spec = dev.spec
     model_idx = list(NC.MODELS).index(dev.model) + 1
+    sys_descr = cfg.get("sys_descr") or f"{spec['name']} — {spec['example']}"
+    sys_contact = cfg.get("sys_contact") or "noc@zonem.local"
+    sys_name = cfg.get("sys_name") or dev.name
+    sys_location = cfg.get("sys_location") or f"{dev.lat:.6f}, {dev.lon:.6f}"
     res.system = [
-        (_OID["sysDescr"], "SNMPv2-MIB::sysDescr.0", f"STRING: {spec['name']} — {spec['example']}"),
+        (_OID["sysDescr"], "SNMPv2-MIB::sysDescr.0", f"STRING: {sys_descr}"),
         (_OID["sysObjectID"], "SNMPv2-MIB::sysObjectID.0", f"OID: {ENTERPRISE}.1.{model_idx}"),
         (_OID["sysUpTime"], "DISMAN-EVENT-MIB::sysUpTimeInstance", fmt_ticks(res.uptime_s)),
-        (_OID["sysContact"], "SNMPv2-MIB::sysContact.0", "STRING: noc@zonem.local"),
-        (_OID["sysName"], "SNMPv2-MIB::sysName.0", f"STRING: {dev.name}"),
-        (_OID["sysLocation"], "SNMPv2-MIB::sysLocation.0", f"STRING: {dev.lat:.6f}, {dev.lon:.6f}"),
+        (_OID["sysContact"], "SNMPv2-MIB::sysContact.0", f"STRING: {sys_contact}"),
+        (_OID["sysName"], "SNMPv2-MIB::sysName.0", f"STRING: {sys_name}"),
+        (_OID["sysLocation"], "SNMPv2-MIB::sysLocation.0", f"STRING: {sys_location}"),
         (_OID["sysServices"], "SNMPv2-MIB::sysServices.0",
          f"INTEGER: {78 if dev.role in NC.L3_ROLES or dev.role == 'core' else 6}"),
     ]

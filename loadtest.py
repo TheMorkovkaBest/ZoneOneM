@@ -304,17 +304,31 @@ def place_users(cfg, towers, bd, rng):
         lon_min = min(t.lon - max(t.r_weak, 0.05) * 1000 / k for t in towers)
         lon_max = max(t.lon + max(t.r_weak, 0.05) * 1000 / k for t in towers)
     n = cfg.n_users
-    centers = np.column_stack([rng.uniform(lat_min, lat_max, 3), rng.uniform(lon_min, lon_max, 3)])
+    t_centers = []
+    for t in towers:
+        rad = max(getattr(t, "r_weak", 0.5) * 1000.0 * 0.45, 120.0)
+        az_rad = math.radians(getattr(t, "azimuth", 0.0))
+        d_lat = (rad * math.cos(az_rad)) / M_PER_DEG_LAT if getattr(t, "beamwidth", 360) < 360 else 0.0
+        d_lon = (rad * math.sin(az_rad)) / (M_PER_DEG_LAT * math.cos(math.radians(t.lat))) if getattr(t, "beamwidth", 360) < 360 else 0.0
+        t_centers.append([t.lat + d_lat, t.lon + d_lon, rad])
     want_in = int(round(n * cfg.indoor_share)) if bd is not None else 0
 
     def batch(cand_n):
-        n_hot = int(cand_n * cfg.hotspot_share) if cfg.hotspots else 0
-        la = rng.uniform(lat_min, lat_max, cand_n - n_hot)
-        lo = rng.uniform(lon_min, lon_max, cand_n - n_hot)
-        if n_hot:
-            pick = rng.integers(0, 3, n_hot)
-            la = np.concatenate([la, centers[pick, 0] + rng.normal(0, (lat_max - lat_min) * 0.10, n_hot)])
-            lo = np.concatenate([lo, centers[pick, 1] + rng.normal(0, (lon_max - lon_min) * 0.10, n_hot)])
+        per_t = max(2, int((cand_n * 0.75) // max(len(t_centers), 1)))
+        las, los = [], []
+        for clat, clon, rad in t_centers:
+            d_r = rng.exponential(rad * 0.45, per_t)
+            d_ang = rng.uniform(0, 2 * math.pi, per_t)
+            d_la = (d_r * np.cos(d_ang)) / M_PER_DEG_LAT
+            d_lo = (d_r * np.sin(d_ang)) / (M_PER_DEG_LAT * math.cos(math.radians(clat)))
+            las.append(clat + d_la)
+            los.append(clon + d_lo)
+        rem = cand_n - sum(len(x) for x in las)
+        if rem > 0:
+            las.append(rng.uniform(lat_min, lat_max, rem))
+            los.append(rng.uniform(lon_min, lon_max, rem))
+        la = np.concatenate(las)
+        lo = np.concatenate(los)
         ok = (la >= lat_min) & (la <= lat_max) & (lo >= lon_min) & (lo <= lon_max)
         if cfg.area and len(cfg.area) >= 3:
             ok &= geo.points_in_polygon(la, lo, cfg.area)

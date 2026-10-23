@@ -7,11 +7,11 @@ from PyQt6.QtCore import QSettings, QSize, QThread, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
 from PyQt6.QtWebEngineCore import QWebEnginePage
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog,
-                             QHeaderView, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-                             QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
-                             QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser, QToolBar,
-                             QToolButton, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+                             QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+                             QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+                             QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+                             QTextBrowser, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 import auto_placement
 import coverage
@@ -105,7 +105,8 @@ class CalcWorker(QThread):
                               p["wall_loss"], job["color"], scale=job.get("scale", 1.0), building_data=bd,
                               azimuth=p["azimuth"], beamwidth=p["beamwidth"],
                               type_name=job.get("type_name"), db_id=job.get("db_id"),
-                              fresnel=self.fresnel, pattern=self.pattern)
+                              fresnel=self.fresnel, pattern=self.pattern,
+                              mount=job.get("mount"))
             except Exception as exc:              # одна битая вышка не должна останавливать очередь
                 errors.append(f"{job.get('name')}: {type(exc).__name__}: {exc}")
                 continue
@@ -247,7 +248,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([290, 900, 360])
+        splitter.setSizes([280, 800, 420])
         splitter.setCollapsible(1, False)
         self.setCentralWidget(splitter)
 
@@ -268,35 +269,81 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     def _build_actions(self):
         grp = QActionGroup(self)
         grp.setExclusive(True)
-        defs = [("navigate", "Навигация", "navigate", "Ctrl+1", "Перемещение по карте и выбор вышки кликом"),
-                ("place", "Поставить вышку", "tower", "Ctrl+2", "Клик по карте ставит вышку выбранного типа"),
-                ("measure", "Линейка", "ruler", "Ctrl+3", "Расстояние и азимут между точками"),
-                ("probe", "Замер сигнала", "probe", "Ctrl+4", "Уровень сигнала в точке и профиль трассы"),
-                ("zone_algo", "Участок алгоритма", "polygon", None, "Нарисовать участок для автоматической расстановки"),
-                ("zone_forbidden", "Запретная зона", "ban", None, "Нарисовать зону, где вышки ставить нельзя"),
-                ("device", "Устройство", "server", "Ctrl+5", "Поставить сетевое устройство (тип — стрелка рядом или палитра «Сеть»)"),
-                ("cable", "Кабель", "link", "Ctrl+6", "Соединить два устройства (тип — стрелка рядом или палитра «Сеть»)"),
-                ("pdu", "PDU (ping)", "send", "Ctrl+7", "Послать пакет от устройства к устройству и увидеть путь")]
+        defs = [
+            ("navigate", "Навигация", "navigate", "Ctrl+1",
+             "<b>Навигация (Ctrl+1)</b><br>"
+             "Перемещение и панорамирование карты.<br>"
+             "• <i>Клик:</i> выделить вышку или устройство<br>"
+             "• <i>Зажать ЛКМ:</i> перетащить вышку с расчётом на лету<br>"
+             "• <i>Синяя ручка:</i> вращение азимута сектора"),
+            ("place", "Поставить вышку", "tower", "Ctrl+2",
+             "<b>Поставить вышку (Ctrl+2)</b><br>"
+             "Размещение антенны выбранного типа на местности.<br>"
+             "• <i>Клик на здание:</i> монтаж на крышу (высота крыши + 3 м)<br>"
+             "• <i>Клик на землю:</i> стандартная опора (30 м)<br>"
+             "• <i>Клик у каркаса:</i> крепление к конструкции"),
+            ("measure", "Линейка", "ruler", "Ctrl+3",
+             "<b>Линейка (Ctrl+3)</b><br>"
+             "Измерение расстояний и азимутов между точками.<br>"
+             "• <i>ЛКМ:</i> добавить точку трассы<br>"
+             "• <i>ПКМ:</i> отменить последнюю точку"),
+            ("probe", "Замер сигнала", "probe", "Ctrl+4",
+             "<b>Замер сигнала (Ctrl+4)</b><br>"
+             "Анализ мощности принимаемого сигнала (дБм), доминирующих вышек "
+             "и потерь на препятствиях в выбранной точке карты."),
+            ("zone_algo", "Участок алгоритма", "polygon", None,
+             "<b>Участок алгоритма</b><br>"
+             "Рисование полигона для автоматической расстановки вышек.<br>"
+             "• <i>ЛКМ:</i> вершины полигона<br>"
+             "• <i>Двойной клик / Enter:</i> завершить контур"),
+            ("zone_forbidden", "Запретная зона", "ban", None,
+             "<b>Запретная зона</b><br>"
+             "Рисование зоны, где запрещено размещать базовые станции."),
+            ("device", "Устройство", "server", "Ctrl+5",
+             "<b>Сетевое устройство (Ctrl+5)</b><br>"
+             "Установка сетевого оборудования (CORE, L2/L3 коммутаторы, маршрутизаторы).<br>"
+             "Тип выбирается стрелкой рядом или во вкладке «Сеть»."),
+            ("cable", "Кабель", "link", "Ctrl+6",
+             "<b>Прокладка кабеля (Ctrl+6)</b><br>"
+             "Соединение двух устройств или вышки кабелем.<br>"
+             "• <i>1-й клик:</i> выбрать начальный узел<br>"
+             "• <i>2-й клик:</i> выбрать целевой узел<br>"
+             "• <i>ПКМ / Esc:</i> отменить")
+        ]
         for name, text, icon, sc, tip in defs:
             act = self._act(text, icon, checkable=True, shortcut=sc, tip=tip)
             act.toggled.connect(lambda checked, n=name: checked and self.set_mode(n))
             grp.addAction(act)
             self._mode_actions[name] = act
 
-        self.act_edit = self._act("Редактировать", "edit", self.edit_selected_tower, tip="Изменить выбранную вышку")
-        self.act_delete = self._act("Удалить", "trash", self.delete_selected_tower, shortcut="Del", tip="Удалить выбранную вышку")
-        self.act_recalc = self._act("Пересчитать всё", "refresh", self.recalc_all, shortcut="F5", tip="Пересчитать зоны всех вышек")
-        self.act_net_auto = self._act("Авто-IP", "sliders", self.net_autoconfigure, tip="Раздать IP и построить маршруты")
-        self.act_bom = self._act("Спецификация", "list", self.net_export_bom, tip="Спецификация оборудования и кабелей (CSV)")
+        self.act_edit = self._act("Редактировать", "edit", self.edit_selected_tower,
+                                  tip="<b>Редактировать вышку</b><br>Изменить название, параметры излучения и диаграмму направленности.")
+        self.act_delete = self._act("Удалить", "trash", self.delete_selected_tower, shortcut="Del",
+                                    tip="<b>Удалить вышку (Del)</b><br>Удалить выбранную базовую станцию и её кабели.")
+        self.act_recalc = self._act("Пересчитать всё", "refresh", self.recalc_all, shortcut="F5",
+                                    tip="<b>Пересчитать всё (F5)</b><br>Полный пересчёт зон покрытия всех вышек по зданиям.")
+        self.act_antenna_catalog = self._act("Каталог антенн", "layers", self.open_antenna_catalog_dialog,
+                                             tip="<b>Каталог антенн</b><br>База данных серийных антенн (Huawei, Kathrein, Ericsson, CommScope...).<br>Выбор усиления, частот и мощности.")
+        self.act_create_structure = self._act("Каркас вышки", "structure", self.open_create_structure_dialog,
+                                              tip="<b>Каркас вышки</b><br>Создание опорной конструкции (решётчатой башни, мачты, столба).<br>Позволяет размещать несколько секторов на одной опоре.")
+        self.act_net_auto = self._act("Авто-IP", "sliders", self.net_autoconfigure,
+                                      tip="<b>Авто-IP</b><br>Автоматическое назначение IP-адресов подсетей (/30, /24) и построение таблиц маршрутизации.")
+        self.act_bom = self._act("Спецификация", "list", self.net_export_bom,
+                                 tip="<b>Спецификация оборудования (BOM)</b><br>Формирование сметы оборудования, трансиверов и длин кабелей (CSV).")
         self.act_snmp = self._act("SNMP", "activity", self.snmp_selected, shortcut="Ctrl+8",
-                                  tip="Опрос выбранной вышки или устройства по SNMP (или двойной клик по ней на карте)")
+                                  tip="<b>SNMP-опрос (Ctrl+8)</b><br>Опрос параметров агента SNMP базовой станции или коммутатора.")
         self.act_load = self._act("Тест нагрузки", "zap", self.run_load_test, shortcut="Ctrl+L",
-                                  tip="Абоненты, трафик и загрузка сети: запуск/остановка")
-        self.act_load_clear = self._act("Сброс", "stop", self.clear_load_results, tip="Убрать результаты теста с карты")
-        self.act_goto = self._act("Координаты…", "goto", self.goto_coords, shortcut="Ctrl+G", tip="Перейти к координатам")
-        self.act_calc = self._act("Калькулятор", "calc", self.show_calculator, shortcut="Ctrl+K", tip="Радиокалькулятор")
-        self.act_theme = self._act("Сменить тему", "moon", self.toggle_theme, shortcut="Ctrl+T")
-        self.act_import = self._act("Импорт проекта…", "upload", self.import_project, tip="Загрузить проект (JSON)")
+                                  tip="<b>Тест нагрузки (Ctrl+L)</b><br>Моделирование абонентов, загрузка радиоканалов и анимация движения пакетов.")
+        self.act_load_clear = self._act("Сброс", "stop", self.clear_load_results,
+                                        tip="<b>Сброс теста</b><br>Очистить карту от абонентов и линий нагрузки.")
+        self.act_goto = self._act("Координаты…", "goto", self.goto_coords, shortcut="Ctrl+G",
+                                  tip="<b>Координаты (Ctrl+G)</b><br>Быстрый центрированный переход к точке (широта, долгота).")
+        self.act_calc = self._act("Калькулятор", "calc", self.show_calculator, shortcut="Ctrl+K",
+                                  tip="<b>Радиокалькулятор (Ctrl+K)</b><br>Бюджет линии связи, зона Френеля и тепловой шум.")
+        self.act_theme = self._act("Сменить тему", "moon", self.toggle_theme, shortcut="Ctrl+T",
+                                   tip="<b>Сменить тему (Ctrl+T)</b><br>Переключение тёмного и светлого оформления.")
+        self.act_import = self._act("Импорт проекта…", "upload", self.import_project,
+                                    tip="<b>Импорт проекта</b><br>Загрузка сохранённой радиосети из JSON.")
         self.act_exp_json = self._act("Проект (JSON)…", None, self.export_project)
         self.act_exp_csv = self._act("Таблица вышек (CSV)…", None, self.export_csv)
         self.act_exp_geo = self._act("Покрытие (GeoJSON для QGIS)…", None, self.export_geojson)
@@ -353,6 +400,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         g.add_action(self.act_goto)
         g = bar.add_group("Радиосеть")
         g.add_action(m["place"])
+        g.add_action(self.act_create_structure)
+        g.add_action(self.act_antenna_catalog)
         g.add_action(self.act_edit)
         g.add_action(self.act_delete)
         g.add_action(self.act_recalc)
@@ -361,7 +410,6 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._cable_menu = self.build_cable_menu()
         g.add_action(m["device"], self._device_menu)
         g.add_action(m["cable"], self._cable_menu)
-        g.add_action(m["pdu"])
         g.add_action(self.act_net_auto)
         g.add_action(self.act_snmp)
         g.add_action(self.act_bom)
@@ -376,11 +424,10 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         g = bar.add_group("Файл и вид")
         g.add_action(self.act_import)
         exp_btn = QToolButton()
-        exp_btn.setText("Экспорт")
-        exp_btn.setToolTip("Экспорт данных")
+        exp_btn.setToolTip("<h3>Экспорт проекта и данных</h3>• Проект в JSON<br>• Таблица вышек в CSV<br>• Покрытие в GeoJSON (QGIS)<br>• Снимок карты PNG")
         exp_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        exp_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        exp_btn.setIconSize(QSize(26, 26))
+        exp_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        exp_btn.setIconSize(QSize(24, 24))
         exp_btn.setProperty("ribbon", True)
         exp_btn.setAutoRaise(True)
         menu = QMenu(exp_btn)
@@ -417,9 +464,26 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.type_summary.setProperty("role", "dim")
         self.type_summary.setWordWrap(True)
         lay.addWidget(self.type_summary)
-        btn_new = QPushButton("Новый тип…")
+
+        # Кнопки управления типами: Каталог (полная ширина), ниже Новый тип и Удалить
+        btn_catalog = QPushButton("📖 Каталог антенн…")
+        btn_catalog.setToolTip("Выбрать промышленную модель антенны из базы мировых производителей")
+        btn_catalog.clicked.connect(self.open_antenna_catalog_dialog)
+        lay.addWidget(btn_catalog)
+
+        h_types_btn = QHBoxLayout()
+        h_types_btn.setSpacing(6)
+        btn_new = QPushButton("+ Новый тип…")
+        btn_new.setToolTip("Создать собственный профиль вышки с нуля")
         btn_new.clicked.connect(self.show_add_tower_dialog)
-        lay.addWidget(btn_new)
+        h_types_btn.addWidget(btn_new)
+
+        self.btn_del_type = QPushButton("Удалить тип")
+        self.btn_del_type.setToolTip("Удалить выбранный пользовательский тип вышки")
+        self.btn_del_type.clicked.connect(self.delete_current_tower_type)
+        h_types_btn.addWidget(self.btn_del_type)
+
+        lay.addLayout(h_types_btn)
         self.chk_buildings = QCheckBox("Учитывать затухание в зданиях")
         self.chk_buildings.setChecked(True)
         self.chk_buildings.toggled.connect(lambda _: self.recalc_all())
@@ -520,10 +584,118 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         tabs = QTabWidget()
         tower_page = QWidget()
         tl = QVBoxLayout(tower_page)
-        tl.setContentsMargins(0, 6, 0, 0)
+        tl.setContentsMargins(0, 4, 0, 0)
+        tl.setSpacing(4)
+
+        # Редактор характеристик вышки прямо на правой панели
+        scroll_ed = QScrollArea()
+        scroll_ed.setWidgetResizable(True)
+        scroll_ed.setFrameShape(QScrollArea.Shape.NoFrame)
+        ed_widget = QWidget()
+        el = QVBoxLayout(ed_widget)
+        el.setContentsMargins(0, 0, 4, 0)
+        el.setSpacing(4)
+
+        f_prop = QFormLayout()
+        f_prop.setSpacing(3)
+        self.ed_tower_name = QLineEdit()
+        self.ed_tower_name.setPlaceholderText("Имя вышки")
+        f_prop.addRow("Имя:", self.ed_tower_name)
+
+        self.ed_tower_type = QComboBox()
+        self.ed_tower_type.currentIndexChanged.connect(self._on_tower_panel_type_changed)
+        f_prop.addRow("Тип / профиль:", self.ed_tower_type)
+
+        self.ed_tower_coords = QLineEdit()
+        self.ed_tower_coords.setPlaceholderText("lat, lon")
+        f_prop.addRow("Координаты:", self.ed_tower_coords)
+
+        # Статус монтажа и кнопки оснащения антенны
+        h_mount_btn = QHBoxLayout()
+        h_mount_btn.setSpacing(6)
+        self.lbl_mount_status = QLabel("—")
+        self.lbl_mount_status.setStyleSheet("color: #3e8bff; font-weight: 600; font-size: 11px;")
+        self.btn_tower_mount = QPushButton("🏢/🗼 Монтаж…")
+        self.btn_tower_mount.setToolTip("Прикрепить антенну к зданию или каркасу вышки")
+        self.btn_tower_mount.clicked.connect(self.open_mount_manager_dialog)
+        h_mount_btn.addWidget(self.lbl_mount_status, stretch=1)
+        h_mount_btn.addWidget(self.btn_tower_mount)
+        f_prop.addRow("Крепление:", h_mount_btn)
+
+        # Выпадающий список моделей из каталога антенн
+        h_cat = QHBoxLayout()
+        h_cat.setSpacing(4)
+        self.cmb_tower_antenna_model = QComboBox()
+        self.cmb_tower_antenna_model.setToolTip("Выбрать реальную заводскую модель антенны из каталога (Huawei, Kathrein, Ericsson, CommScope...)")
+        self.cmb_tower_antenna_model.currentIndexChanged.connect(self._on_antenna_model_selected)
+        btn_open_catalog = QPushButton("🔍")
+        btn_open_catalog.setToolTip("Открыть полный каталог антенн с фильтрами и характеристиками")
+        btn_open_catalog.setFixedWidth(30)
+        btn_open_catalog.clicked.connect(self.open_antenna_catalog_dialog)
+        h_cat.addWidget(self.cmb_tower_antenna_model, stretch=1)
+        h_cat.addWidget(btn_open_catalog)
+        f_prop.addRow("Каталог вышек:", h_cat)
+        self._populate_antenna_dropdown()
+
+        self.ed_tower_height = QDoubleSpinBox()
+        self.ed_tower_height.setRange(0.0, 300.0)
+        self.ed_tower_height.setSuffix(" м")
+        f_prop.addRow("Высота:", self.ed_tower_height)
+
+        self.ed_tower_freq = QDoubleSpinBox()
+        self.ed_tower_freq.setRange(100.0, 60000.0)
+        self.ed_tower_freq.setSuffix(" МГц")
+        f_prop.addRow("Частота:", self.ed_tower_freq)
+
+        self.ed_tower_power = QDoubleSpinBox()
+        self.ed_tower_power.setRange(0.1, 500.0)
+        self.ed_tower_power.setSuffix(" Вт")
+        self.ed_tower_power.valueChanged.connect(self._update_tower_panel_eirp)
+        f_prop.addRow("Мощность:", self.ed_tower_power)
+
+        self.lbl_tower_eirp = QLabel("—")
+        self.lbl_tower_eirp.setProperty("role", "dim")
+        f_prop.addRow("EIRP:", self.lbl_tower_eirp)
+
+        self.ed_tower_tilt = QDoubleSpinBox()
+        self.ed_tower_tilt.setRange(-30.0, 90.0)
+        self.ed_tower_tilt.setSuffix(" °")
+        f_prop.addRow("Наклон:", self.ed_tower_tilt)
+
+        self.ed_tower_wall_loss = QDoubleSpinBox()
+        self.ed_tower_wall_loss.setRange(0.0, 60.0)
+        self.ed_tower_wall_loss.setSuffix(" дБ")
+        f_prop.addRow("Потери стены:", self.ed_tower_wall_loss)
+
+        self.ed_tower_azimuth = QSpinBox()
+        self.ed_tower_azimuth.setRange(0, 359)
+        self.ed_tower_azimuth.setSuffix(" °")
+        f_prop.addRow("Азимут:", self.ed_tower_azimuth)
+
+        self.ed_tower_beamwidth = QSpinBox()
+        self.ed_tower_beamwidth.setRange(1, 360)
+        self.ed_tower_beamwidth.setSuffix(" °")
+        f_prop.addRow("Ширина луча:", self.ed_tower_beamwidth)
+        el.addLayout(f_prop)
+
+        row_btn = QHBoxLayout()
+        self.btn_tower_apply = QPushButton("💾 Применить")
+        self.btn_tower_apply.setToolTip("Сохранить изменения и пересчитать зоны покрытия вышки")
+        self.btn_tower_apply.clicked.connect(self._apply_tower_panel_edits)
+        self.btn_tower_del_panel = QPushButton("Удалить")
+        self.btn_tower_del_panel.clicked.connect(self.delete_selected_tower)
+        row_btn.addWidget(self.btn_tower_apply, stretch=2)
+        row_btn.addWidget(self.btn_tower_del_panel, stretch=1)
+        el.addLayout(row_btn)
+
         self.tower_info = QTextBrowser()
         self.tower_info.setPlaceholderText("Выберите вышку на карте или в таблице")
-        tl.addWidget(self.tower_info)
+        self.tower_info.setMaximumHeight(140)
+        el.addWidget(self.tower_info)
+
+        scroll_ed.setWidget(ed_widget)
+        tl.addWidget(scroll_ed)
+
         self.btn_tower_snmp = QPushButton("SNMP-опрос вышки…")
         self.btn_tower_snmp.setToolTip("Таблицы агента SNMP базовой станции: интерфейсы, IP, соседи, радио")
         self.btn_tower_snmp.clicked.connect(self.snmp_selected)
@@ -558,10 +730,10 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         tabs.addTab(self.load_page, "Нагрузка")
         self.tabs = tabs
         split.addWidget(tabs)
-        split.setSizes([260, 520])
+        split.setSizes([220, 560])
         lay.addWidget(split, stretch=1)
-        panel.setMinimumWidth(320)
-        panel.setMaximumWidth(520)
+        panel.setMinimumWidth(390)
+        panel.setMaximumWidth(620)
         return panel
 
     # ------------------------------------------------------------------ #
@@ -685,7 +857,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._js(f"api.setMapMode('{mode}');")
         names = {"navigate": "Навигация", "place": "Размещение вышек", "measure": "Линейка",
                  "probe": "Замер сигнала", "zone_algo": "Рисование участка", "zone_forbidden": "Рисование запретной зоны",
-                 "device": "Размещение устройств", "cable": "Прокладка кабеля", "pdu": "PDU (ping)"}
+                 "device": "Размещение устройств", "cable": "Прокладка кабеля"}
         self.lbl_mode.setText(f"Режим: {names[mode]}")
         if mode == "measure":
             self.tabs.setCurrentIndex(2)
@@ -826,6 +998,23 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.db.set_meta("types", self.tower_types)
         self.active_type_combo.addItem(data["name"])
         self.active_type_combo.setCurrentText(data["name"])
+        self._update_panel_types_list()
+
+    def delete_current_tower_type(self):
+        name = self.active_type_combo.currentText()
+        if not name or name not in self.tower_types:
+            return
+        if len(self.tower_types) <= 1:
+            QMessageBox.warning(self, "Удаление типа", "Нельзя удалить единственный оставшийся тип вышки.")
+            return
+        if QMessageBox.question(self, "Удаление типа", f"Удалить тип вышки «{name}»?") != QMessageBox.StandardButton.Yes:
+            return
+        del self.tower_types[name]
+        self.db.set_meta("types", self.tower_types)
+        self.active_type_combo.clear()
+        self.active_type_combo.addItems(list(self.tower_types.keys()))
+        self._update_panel_types_list()
+        self.statusBar().showMessage(f"Тип вышки «{name}» удалён.")
 
     # ------------------------------------------------------------------ #
     #  Очередь расчётов
@@ -835,6 +1024,14 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.tower_counter += 1
         return name
 
+    def _find_nearest_structure(self, lat, lon, max_dist_m=25.0):
+        best, best_d = None, max_dist_m
+        for s in getattr(self, "structures", {}).values():
+            d = ((s.lat - lat) ** 2 + (s.lon - lon) ** 2) ** 0.5 * 111320
+            if d < best_d:
+                best, best_d = s, d
+        return best
+
     def place_tower_at_coords(self, lat, lon):
         if self._mode != "place":
             return
@@ -842,7 +1039,35 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         type_data = self.tower_types.get(type_name)
         if not type_data:
             return
-        self._enqueue([self._job_from_type(self._next_name(), lat, lon, type_name, type_data)])
+        # Антенна изначально не имеет собственной высоты от земли:
+        # 1. Прикрепляется к опорному каркасу вышки (если установлен рядом)
+        # 2. Либо монтируется на кровлю здания (высота крыши + стойка 3 м)
+        # 3. Либо остаётся незакреплённой (высота 0 м) до назначения монтажа
+        near_s = self._find_nearest_structure(lat, lon, max_dist_m=25.0)
+        bld_h = 0.0
+        if self.building_data:
+            try:
+                bld_h = float(self.building_data.heights_at([lat], [lon])[0])
+            except Exception:
+                bld_h = 0.0
+        if near_s:
+            mount = {"type": "structure", "id": near_s.id, "offset": 0.0, "bld_h": 0.0}
+            mount_h = near_s.height
+        elif bld_h > 0.0:
+            mount = {"type": "building", "id": None, "offset": 3.0, "bld_h": bld_h}
+            mount_h = bld_h + 3.0
+        else:
+            # На земле: высота по умолчанию из типа вышки (или 30 м)
+            default_h = float(type_data.get("height", 30.0))
+            if default_h <= 0.0:
+                default_h = 30.0
+            mount = {"type": "ground", "id": None, "offset": 0.0, "bld_h": 0.0}
+            mount_h = default_h
+
+        job = self._job_from_type(self._next_name(), lat, lon, type_name, type_data)
+        job["params"]["height"] = mount_h
+        job["mount"] = mount
+        self._enqueue([job])
 
     @staticmethod
     def _job_from_type(name, lat, lon, type_name, type_data):
@@ -853,7 +1078,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     @staticmethod
     def _job_from_tower(t):
         return {"action": "update", "name": t.name, "lat": t.lat, "lon": t.lon, "type_name": t.type_name,
-                "params": t.params(), "color": list(t.color), "scale": t.scale, "db_id": t.db_id}
+                "params": t.params(), "color": list(t.color), "scale": t.scale, "db_id": t.db_id,
+                "mount": getattr(t, "mount", None)}
 
     def _enqueue(self, jobs):
         upd_ids = {j.get("db_id") for j in jobs if j.get("action") == "update" and j.get("db_id") is not None}
@@ -877,6 +1103,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._worker.start()
 
     def _on_tower_done(self, tower, job):
+        if job.get("mount") is not None:
+            tower.mount = job["mount"]
         if job["action"] == "update" and tower.db_id is not None:
             idx = next((i for i, t in enumerate(self.towers) if t.db_id == tower.db_id), None)
             if idx is None:                        # вышку успели удалить, пока шёл пересчёт
@@ -1047,7 +1275,35 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     def _render_info_panels(self):
         t = self._current_tower()
         if t is None:
-            self.tower_info.setHtml("")
+            self.tower_info.setHtml("<p style='color:#888'>Выберите вышку на карте или в таблице для редактирования параметров.</p>")
+            if hasattr(self, "ed_tower_name"):
+                self._block_tower_edits = True
+                try:
+                    self.ed_tower_name.setText("")
+                    self.ed_tower_name.setEnabled(False)
+                    self.ed_tower_type.setEnabled(False)
+                    self.ed_tower_coords.setText("")
+                    self.ed_tower_coords.setEnabled(False)
+                    self.ed_tower_height.setEnabled(False)
+                    self.ed_tower_freq.setEnabled(False)
+                    self.ed_tower_power.setEnabled(False)
+                    self.ed_tower_tilt.setEnabled(False)
+                    self.ed_tower_wall_loss.setEnabled(False)
+                    self.ed_tower_azimuth.setEnabled(False)
+                    self.ed_tower_beamwidth.setEnabled(False)
+                    self.btn_tower_apply.setEnabled(False)
+                    self.btn_tower_del_panel.setEnabled(False)
+                    self.lbl_tower_eirp.setText("—")
+                    if hasattr(self, "lbl_mount_status"):
+                        self.lbl_mount_status.setText("—")
+                        self.btn_tower_mount.setEnabled(False)
+                    if hasattr(self, "cmb_tower_antenna_model"):
+                        self.cmb_tower_antenna_model.setEnabled(False)
+                        self.cmb_tower_antenna_model.blockSignals(True)
+                        self.cmb_tower_antenna_model.setCurrentIndex(0)
+                        self.cmb_tower_antenna_model.blockSignals(False)
+                finally:
+                    self._block_tower_edits = False
         else:
             sector = "круговая" if t.beamwidth >= 360 else f"{t.beamwidth:.0f}°"
             zone_rows = []
@@ -1061,19 +1317,307 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             model = ", ".join(x for x, on in (("дифракция Френеля", t.fresnel), ("лепестки антенны", t.pattern)) if on)
             self.tower_info.setHtml(
                 f"<h3 style='margin:0 0 6px 0'>{t.name}</h3>"
-                + self._html_table([
-                    ("Тип", t.type_name or "—"), ("Координаты", f"{t.lat:.6f}, {t.lon:.6f}"),
-                    ("Частота", f"{t.freq:.0f} МГц"),
-                    ("Мощность", f"{t.power:.1f} Вт ({geo.w_to_dbm(t.power):.1f} дБм)"),
-                    ("EIRP", f"{t.eirp_dbm:.1f} дБм"), ("Высота", f"{t.height:.1f} м"),
-                    ("Наклон", f"{t.tilt:.1f}° (в модель не входит)"),
-                    ("Потери на стену", f"{t.wall_loss:.1f} дБ"),
-                    ("Азимут / луч", f"{t.azimuth:.0f}° / {sector}"),
-                    ("Расчёт", f"{calc}, здания {bld}" + (f"; {model}" if model else "")),
-                ])
-                + "<p style='margin:8px 0 2px 0'><b>Зоны покрытия</b></p>" + self._html_table(zone_rows))
+                + f"<p style='margin:0 0 2px 0'><b>Расчёт:</b> {calc}, здания {bld}" + (f"; {model}" if model else "") + "</p>"
+                + "<p style='margin:4px 0 2px 0'><b>Зоны покрытия:</b></p>" + self._html_table(zone_rows))
+            if hasattr(self, "ed_tower_name"):
+                self._block_tower_edits = True
+                try:
+                    self.ed_tower_name.setEnabled(True)
+                    self.ed_tower_name.setText(t.name)
+                    self.ed_tower_type.setEnabled(True)
+                    self._update_panel_types_list(t.type_name)
+                    self.ed_tower_coords.setEnabled(True)
+                    self.ed_tower_coords.setText(f"{t.lat:.6f}, {t.lon:.6f}")
+                    self.ed_tower_height.setEnabled(True)
+                    self.ed_tower_height.setValue(float(t.height))
+                    self.ed_tower_freq.setEnabled(True)
+                    self.ed_tower_freq.setValue(float(t.freq))
+                    self.ed_tower_power.setEnabled(True)
+                    self.ed_tower_power.setValue(float(t.power))
+                    self.lbl_tower_eirp.setText(f"{t.eirp_dbm:.1f} дБм")
+                    self.ed_tower_tilt.setEnabled(True)
+                    self.ed_tower_tilt.setValue(float(t.tilt))
+                    self.ed_tower_wall_loss.setEnabled(True)
+                    self.ed_tower_wall_loss.setValue(float(t.wall_loss))
+                    self.ed_tower_azimuth.setEnabled(True)
+                    self.ed_tower_azimuth.setValue(int(t.azimuth))
+                    self.ed_tower_beamwidth.setEnabled(True)
+                    self.ed_tower_beamwidth.setValue(int(t.beamwidth))
+                    self.btn_tower_apply.setEnabled(True)
+                    self.btn_tower_del_panel.setEnabled(True)
+                    if hasattr(self, "lbl_mount_status"):
+                        mount = getattr(t, "mount", {}) or {"type": "ground"}
+                        m_type = mount.get("type", "ground")
+                        if m_type == "building":
+                            bld_h = mount.get("bld_h", 0.0)
+                            off = mount.get("offset", 3.0)
+                            self.lbl_mount_status.setText(f"🏢 Здание ({bld_h:.1f} м + {off:.1f} м = {t.height:.1f} м)")
+                        elif m_type == "structure":
+                            s_id = mount.get("id")
+                            s = getattr(self, "structures", {}).get(s_id) if s_id else None
+                            s_name = s.name if s else "Каркас"
+                            self.lbl_mount_status.setText(f"🗼 {s_name} (подвес {t.height:.1f} м)")
+                        else:
+                            self.lbl_mount_status.setText("⚠️ Не закреплена (на земле, 0 м)")
+                        self.btn_tower_mount.setEnabled(True)
+                    if hasattr(self, "cmb_tower_antenna_model"):
+                        self.cmb_tower_antenna_model.setEnabled(True)
+                        self._sync_antenna_dropdown(t.type_name)
+                finally:
+                    self._block_tower_edits = False
         self._render_measure()
         self._render_probe()
+
+    def _update_panel_types_list(self, current_name=None):
+        if not hasattr(self, "ed_tower_type"):
+            return
+        self.ed_tower_type.blockSignals(True)
+        self.ed_tower_type.clear()
+        self.ed_tower_type.addItem("— (пользовательский)")
+        for name in sorted(self.tower_types):
+            self.ed_tower_type.addItem(name)
+        if current_name and current_name in self.tower_types:
+            self.ed_tower_type.setCurrentText(current_name)
+        else:
+            self.ed_tower_type.setCurrentIndex(0)
+        self.ed_tower_type.blockSignals(False)
+
+    def _on_tower_panel_type_changed(self, idx):
+        if getattr(self, "_block_tower_edits", False):
+            return
+        name = self.ed_tower_type.currentText()
+        if name in self.tower_types:
+            preset = self.tower_types[name]
+            self._block_tower_edits = True
+            try:
+                self.ed_tower_freq.setValue(float(preset.get("freq", 1800.0)))
+                self.ed_tower_power.setValue(float(preset.get("power", 20.0)))
+                self.ed_tower_height.setValue(float(preset.get("height", 30.0)))
+                self.ed_tower_tilt.setValue(float(preset.get("tilt", 0.0)))
+                self.ed_tower_wall_loss.setValue(float(preset.get("wall_loss", 20.0)))
+                self.ed_tower_azimuth.setValue(int(preset.get("azimuth", 0.0)))
+                self.ed_tower_beamwidth.setValue(int(preset.get("beamwidth", 360.0)))
+                p_dbm = geo.w_to_dbm(float(preset.get("power", 20.0)))
+                self.lbl_tower_eirp.setText(f"{p_dbm + 14.0:.1f} дБм")
+            finally:
+                self._block_tower_edits = False
+
+    def _update_tower_panel_eirp(self, val):
+        p_dbm = geo.w_to_dbm(val)
+        if hasattr(self, "lbl_tower_eirp"):
+            self.lbl_tower_eirp.setText(f"{p_dbm + 14.0:.1f} дБм")
+
+    def _populate_antenna_dropdown(self):
+        if not hasattr(self, "cmb_tower_antenna_model") or not hasattr(self, "db") or not getattr(self.db, "conn", None):
+            return
+        import antenna_catalog
+        antennas = antenna_catalog.load_all_antennas(self.db.conn)
+        self.cmb_tower_antenna_model.blockSignals(True)
+        self.cmb_tower_antenna_model.clear()
+        self.cmb_tower_antenna_model.addItem("— Выбрать из каталога вышек —", None)
+        for a in sorted(antennas, key=lambda x: (x.manufacturer, x.model)):
+            title = f"{a.manufacturer} {a.model} ({a.freq_mhz:.0f} МГц, {a.gain_dbi:.1f} дБи)"
+            self.cmb_tower_antenna_model.addItem(title, a)
+        self.cmb_tower_antenna_model.blockSignals(False)
+
+    def _sync_antenna_dropdown(self, type_name):
+        if not hasattr(self, "cmb_tower_antenna_model"):
+            return
+        self.cmb_tower_antenna_model.blockSignals(True)
+        try:
+            target = (type_name or "").strip().lower()
+            found_idx = 0
+            if target:
+                for i in range(1, self.cmb_tower_antenna_model.count()):
+                    a = self.cmb_tower_antenna_model.itemData(i)
+                    if not a:
+                        continue
+                    if (a.model.lower() in target or target in a.model.lower()
+                            or f"{a.manufacturer} {a.model}".lower() in target
+                            or target in a.display_name.lower()):
+                        found_idx = i
+                        break
+            self.cmb_tower_antenna_model.setCurrentIndex(found_idx)
+        finally:
+            self.cmb_tower_antenna_model.blockSignals(False)
+
+    def _on_antenna_model_selected(self, idx):
+        if getattr(self, "_block_tower_edits", False):
+            return
+        if not hasattr(self, "cmb_tower_antenna_model") or idx <= 0:
+            return
+        a = self.cmb_tower_antenna_model.itemData(idx)
+        if not a:
+            return
+        self._block_tower_edits = True
+        try:
+            self.ed_tower_freq.setValue(float(a.freq_mhz))
+            self.ed_tower_power.setValue(float(a.tx_power_w))
+            self.ed_tower_beamwidth.setValue(int(a.beamwidth_h))
+            self.ed_tower_wall_loss.setValue(float(a.wall_loss_db))
+            p_dbm = geo.w_to_dbm(float(a.tx_power_w))
+            self.lbl_tower_eirp.setText(f"{p_dbm + a.gain_dbi:.1f} дБм")
+        finally:
+            self._block_tower_edits = False
+
+        preset_name = f"{a.manufacturer} {a.model}"
+        t = self._current_tower()
+        if preset_name not in self.tower_types:
+            self.tower_types[preset_name] = {
+                "name": preset_name,
+                "freq": a.freq_mhz,
+                "power": a.tx_power_w,
+                "height": t.height if t else 30.0,
+                "tilt": t.tilt if t else 4.0,
+                "wall_loss": a.wall_loss_db,
+                "color": [62, 139, 255, 255] if "5G" in a.category else [255, 140, 0, 255],
+                "model_path": None,
+                "scale": 1.0,
+                "azimuth": t.azimuth if t else 0.0,
+                "beamwidth": a.beamwidth_h,
+            }
+            self.db.set_meta("types", self.tower_types)
+            self._update_panel_types_list(preset_name)
+        else:
+            self._update_panel_types_list(preset_name)
+
+        if t is not None:
+            self.statusBar().showMessage(f"Выбрана модель «{a.manufacturer} {a.model}» ({a.freq_mhz:.0f} МГц, {a.gain_dbi:.1f} дБи). Нажмите «Применить» для сохранения.")
+        else:
+            self.statusBar().showMessage(f"Выбрана модель «{a.manufacturer} {a.model}» из каталога.")
+
+    def _apply_tower_panel_edits(self):
+        t = self._current_tower()
+        if t is None:
+            return
+        name = self.ed_tower_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Имя вышки не может быть пустым.")
+            return
+        coords_str = self.ed_tower_coords.text().strip()
+        lat, lon = t.lat, t.lon
+        try:
+            parts = [float(x.strip()) for x in coords_str.replace(";", ",").split(",")]
+            if len(parts) >= 2:
+                lat, lon = parts[0], parts[1]
+        except (ValueError, IndexError):
+            pass
+        type_name = self.ed_tower_type.currentText()
+        if type_name.startswith("—"):
+            type_name = t.type_name
+        params = {
+            "freq": self.ed_tower_freq.value(),
+            "power": self.ed_tower_power.value(),
+            "height": self.ed_tower_height.value(),
+            "tilt": self.ed_tower_tilt.value(),
+            "wall_loss": self.ed_tower_wall_loss.value(),
+            "azimuth": float(self.ed_tower_azimuth.value()),
+            "beamwidth": float(self.ed_tower_beamwidth.value()),
+        }
+        self._enqueue([{"action": "update", "name": name, "lat": lat, "lon": lon,
+                        "type_name": type_name, "params": params, "mount": getattr(t, "mount", None),
+                        "color": t.color, "scale": t.scale, "db_id": t.db_id}])
+        self.statusBar().showMessage(f"Параметры вышки «{name}» обновлены.")
+
+    def open_antenna_catalog_dialog(self):
+        """Открывает базу данных и каталог серийных промышленных антенн."""
+        import antenna_catalog
+        dlg = antenna_catalog.AntennaCatalogDialog(self.db.conn, parent=self)
+        if dlg.exec() and dlg.selected_antenna:
+            a = dlg.selected_antenna
+            preset_name = f"{a.manufacturer} {a.model}"
+            self.tower_types[preset_name] = {
+                "name": preset_name,
+                "freq": a.freq_mhz,
+                "power": a.tx_power_w,
+                "height": 30.0,
+                "tilt": 4.0,
+                "wall_loss": a.wall_loss_db,
+                "color": [62, 139, 255, 255] if "5G" in a.category else [255, 140, 0, 255],
+                "model_path": None,
+                "scale": 1.0,
+                "azimuth": 0.0,
+                "beamwidth": a.beamwidth_h,
+            }
+            self.db.set_meta("types", self.tower_types)
+            self.active_type_combo.clear()
+            self.active_type_combo.addItems(list(self.tower_types.keys()))
+            self.active_type_combo.setCurrentText(preset_name)
+            self._update_panel_types_list()
+            self._populate_antenna_dropdown()
+            self._sync_antenna_dropdown(preset_name)
+            t = self._current_tower()
+            if t is not None:
+                p = t.params()
+                p["freq"] = a.freq_mhz
+                p["power"] = a.tx_power_w
+                p["beamwidth"] = a.beamwidth_h
+                p["wall_loss"] = a.wall_loss_db
+                self._enqueue([{"action": "update", "name": t.name, "lat": t.lat, "lon": t.lon,
+                                "type_name": a.display_name, "params": p, "mount": getattr(t, "mount", None),
+                                "color": t.color, "scale": t.scale, "db_id": t.db_id}])
+                self.statusBar().showMessage(f"Модель антенны «{a.model}» применена к вышке «{t.name}» и добавлена в типы.")
+            else:
+                self.statusBar().showMessage(f"Выбран тип антенны: «{a.display_name}».")
+
+    def open_create_structure_dialog(self, lat=None, lon=None):
+        """Создание новой опорной конструкции (каркаса, мачты или столба)."""
+        import structures
+        if lat is None or lon is None:
+            t = self._current_tower()
+            lat = t.lat if t else 47.0101
+            lon = t.lon if t else 28.8638
+        dlg = structures.CreateStructureDialog(lat, lon, len(self.structures), parent=self)
+        if dlg.exec() and dlg.structure:
+            s = dlg.structure
+            self.structures[s.id] = s
+            structures.save_structure(self.db.conn, s)
+            self.statusBar().showMessage(f"Создан каркас: «{s.name}» (высота {s.height:.0f} м).")
+            # Если рядом есть выбранная вышка — предлагаем/привязываем к каркасу
+            t = self._current_tower()
+            if t is not None and abs(t.lat - s.lat) < 0.0005 and abs(t.lon - s.lon) < 0.0005:
+                t.mount = {"type": "structure", "id": s.id, "offset": 0.0, "bld_h": 0.0}
+                p = t.params()
+                p["height"] = s.height
+                self._enqueue([{"action": "update", "name": t.name, "lat": t.lat, "lon": t.lon,
+                                "type_name": t.type_name, "params": p, "mount": t.mount,
+                                "color": t.color, "scale": t.scale, "db_id": t.db_id}])
+
+    def open_mount_manager_dialog(self):
+        """Управление прикреплением антенны к зданию или каркасу вышки."""
+        t = self._current_tower()
+        if t is None:
+            QMessageBox.information(self, "Монтаж", "Сначала выберите вышку на карте или в таблице.")
+            return
+        import structures
+        mount = getattr(t, "mount", {}) or {"type": "ground", "id": None, "offset": 0.0, "bld_h": 0.0}
+        bld_h = 0.0
+        if self.building_data:
+            try:
+                bld_h = float(self.building_data.heights_at([t.lat], [t.lon])[0])
+            except Exception:
+                bld_h = 0.0
+        dlg = structures.MountManagerDialog(
+            t.lat, t.lon, self.structures,
+            building_roof_h=bld_h,
+            current_mount_type=mount.get("type", "ground"),
+            current_mount_id=mount.get("id"),
+            current_offset=mount.get("offset", 0.0),
+            parent=self
+        )
+        if dlg.exec():
+            t.mount = {
+                "type": dlg.result_mount_type,
+                "id": dlg.result_mount_id,
+                "offset": dlg.result_offset,
+                "bld_h": bld_h if dlg.result_mount_type == "building" else 0.0
+            }
+            p = t.params()
+            p["height"] = max(0.0, dlg.result_total_height)
+            self._enqueue([{"action": "update", "name": t.name, "lat": t.lat, "lon": t.lon,
+                            "type_name": t.type_name, "params": p, "mount": t.mount,
+                            "color": t.color, "scale": t.scale, "db_id": t.db_id}])
+            self.statusBar().showMessage(f"Монтаж вышки «{t.name}» обновлён: высота {p['height']:.1f} м.")
 
     # ------------------------------------------------------------------ #
     #  Редактирование / удаление
@@ -1124,6 +1668,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
 
     def load_state_from_db(self):
         self.net_load_from_db()
+        try:
+            import structures
+            self.structures = structures.load_all_structures(self.db.conn)
+        except Exception:
+            self.structures = {}
         saved = self.db.get_meta("types")
         if saved:
             self.tower_types.update(saved)

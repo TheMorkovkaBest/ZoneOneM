@@ -19,13 +19,15 @@ class RibbonGroup(QFrame):
         lay.addWidget(cap)
 
     def add_action(self, act, menu=None):
-        """Большая кнопка с иконкой; menu — выпадающий список рядом (split-кнопка)."""
+        """Кнопка с иконкой и всплывающей документацией; menu — выпадающий список рядом (split-кнопка)."""
         btn = QToolButton()
         btn.setDefaultAction(act)
-        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        btn.setIconSize(QSize(26, 26))
+        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        btn.setIconSize(QSize(24, 24))
         btn.setProperty("ribbon", True)
         btn.setAutoRaise(True)
+        if act.toolTip():
+            btn.setToolTip(act.toolTip())
         if menu is not None:
             btn.setMenu(menu)
             btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)

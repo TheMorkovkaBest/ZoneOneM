@@ -38,14 +38,20 @@ def _fmt_mbps(v):
 #  Диалоги
 # --------------------------------------------------------------------------- #
 class DeviceDialog(QDialog):
-    """Настройка устройства: питание, радиопараметры БС, IP на портах, шлюз, статические маршруты."""
+    """Настройка устройства: питание, радиопараметры БС, IP на портах и управление, шлюз, SNMP-агент."""
 
     def __init__(self, net, dev, parent=None):
         super().__init__(parent)
         self.net, self.dev = net, dev
-        self.setWindowTitle(f"Настройка: {dev.name}")
-        self.setMinimumWidth(540)
+        self.setWindowTitle(f"Настройка устройства: {dev.name}")
+        self.setMinimumWidth(580)
         lay = QVBoxLayout(self)
+
+        tabs = QTabWidget()
+
+        # --- Вкладка 1: Основные ---
+        p_main = QWidget()
+        lay_main = QVBoxLayout(p_main)
         form = QFormLayout()
         self.name = QLineEdit(dev.name)
         self.name.setEnabled(dev.tower_id is None)
@@ -63,7 +69,7 @@ class DeviceDialog(QDialog):
         self.mount.setValue(dev.mount_h)
         self.mount.setEnabled(dev.role == "radio")
         form.addRow("Высота подвеса антенны:", self.mount)
-        lay.addLayout(form)
+        lay_main.addLayout(form)
 
         self.radio_box = None
         if dev.role == "tower":
@@ -86,38 +92,75 @@ class DeviceDialog(QDialog):
             rf.addRow("Полоса:", self.bw)
             rf.addRow("Слоёв MIMO:", self.layers)
             rf.addRow("Макс. активных абонентов:", self.max_users)
-            lay.addWidget(self.radio_box)
+            lay_main.addWidget(self.radio_box)
+        lay_main.addStretch(1)
+        tabs.addTab(p_main, "Параметры")
 
-        self.ip_table = None
-        if dev.role in NC.L2_ROLES:
-            lbl = QLabel("Коммутатор/РРЛ работает на уровне L2: IP-адреса на портах не нужны (прозрачная передача кадров).")
-            lbl.setWordWrap(True)
-            lbl.setProperty("role", "dim")
-            lay.addWidget(lbl)
-        else:
-            lay.addWidget(QLabel("IP-адреса на подключённых портах (формат 10.0.0.1/24):"))
-            ports = [p for p in dev.ports() if net.port_link(dev.id, p.name) or p.name in dev.ips]
-            self.ip_ports = [p.name for p in ports]
-            self.ip_table = QTableWidget(len(ports), 2)
-            self.ip_table.setHorizontalHeaderLabels(["Порт", "IP/маска"])
-            self.ip_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-            self.ip_table.verticalHeader().setVisible(False)
-            self.ip_table.setMaximumHeight(170)
-            for r, p in enumerate(ports):
-                item = QTableWidgetItem(f"{p.name}  ({p.kind} {fmt_speed(p.mbps)})")
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.ip_table.setItem(r, 0, item)
-                self.ip_table.setItem(r, 1, QTableWidgetItem(dev.ips.get(p.name, "")))
-            lay.addWidget(self.ip_table)
-            f2 = QFormLayout()
-            self.gateway = QLineEdit(dev.gateway)
-            self.gateway.setPlaceholderText("напр. 10.0.0.1")
-            f2.addRow("Шлюз по умолчанию:", self.gateway)
-            lay.addLayout(f2)
-            lay.addWidget(QLabel("Статические маршруты (по одному в строке: «подсеть via next-hop»):"))
-            self.routes = QPlainTextEdit("\n".join(f"{r['net']} via {r['via']}" for r in dev.routes))
-            self.routes.setMaximumHeight(90)
-            lay.addWidget(self.routes)
+        # --- Вкладка 2: IP-адреса и маршруты ---
+        p_ip = QWidget()
+        lay_ip = QVBoxLayout(p_ip)
+        lay_ip.addWidget(QLabel("IP-адреса на портах (формат 10.0.0.1/24):"))
+        ports = [p for p in dev.ports() if net.port_link(dev.id, p.name) or p.name in dev.ips]
+        self.ip_ports = [p.name for p in ports]
+        self.ip_table = QTableWidget(len(ports), 2)
+        self.ip_table.setHorizontalHeaderLabels(["Порт", "IP/маска"])
+        self.ip_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.ip_table.verticalHeader().setVisible(False)
+        self.ip_table.setMaximumHeight(150)
+        for r, p in enumerate(ports):
+            item = QTableWidgetItem(f"{p.name}  ({p.kind} {fmt_speed(p.mbps)})")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.ip_table.setItem(r, 0, item)
+            self.ip_table.setItem(r, 1, QTableWidgetItem(dev.ips.get(p.name, "")))
+        lay_ip.addWidget(self.ip_table)
+
+        f_mgmt = QFormLayout()
+        self.mgmt_ip = QLineEdit(dev.ips.get("mgmt", ""))
+        self.mgmt_ip.setPlaceholderText("напр. 192.168.1.10/24 (для L2 коммутаторов / вышки)")
+        f_mgmt.addRow("Управляющий IP (Management):", self.mgmt_ip)
+        self.gateway = QLineEdit(dev.gateway)
+        self.gateway.setPlaceholderText("напр. 10.0.0.1")
+        f_mgmt.addRow("Шлюз по умолчанию:", self.gateway)
+        lay_ip.addLayout(f_mgmt)
+
+        lay_ip.addWidget(QLabel("Статические маршруты («подсеть via next-hop»):"))
+        self.routes = QPlainTextEdit("\n".join(f"{r['net']} via {r['via']}" for r in dev.routes))
+        self.routes.setMaximumHeight(80)
+        lay_ip.addWidget(self.routes)
+        tabs.addTab(p_ip, "IP и сеть")
+
+        # --- Вкладка 3: SNMP протокол ---
+        p_snmp = QWidget()
+        lay_snmp = QVBoxLayout(p_snmp)
+        snmp_cfg = dev.snmp_params() if hasattr(dev, "snmp_params") else {}
+        self.snmp_enabled = QCheckBox("Включить SNMP-агент на устройстве")
+        self.snmp_enabled.setChecked(bool(snmp_cfg.get("enabled", True)))
+        lay_snmp.addWidget(self.snmp_enabled)
+
+        f_snmp = QFormLayout()
+        self.snmp_comm = QLineEdit(str(snmp_cfg.get("community", "public")))
+        f_snmp.addRow("Community (пароль опроса):", self.snmp_comm)
+        self.snmp_port = QSpinBox()
+        self.snmp_port.setRange(1, 65535)
+        self.snmp_port.setValue(int(snmp_cfg.get("port", 161)))
+        f_snmp.addRow("SNMP UDP-порт:", self.snmp_port)
+        self.snmp_ver = QComboBox()
+        self.snmp_ver.addItems(["v2c", "v1", "v3"])
+        self.snmp_ver.setCurrentText(str(snmp_cfg.get("version", "v2c")))
+        f_snmp.addRow("Версия SNMP:", self.snmp_ver)
+        self.snmp_name = QLineEdit(str(snmp_cfg.get("sys_name", dev.name)))
+        f_snmp.addRow("sysName (имя узла):", self.snmp_name)
+        self.snmp_loc = QLineEdit(str(snmp_cfg.get("sys_location", f"{dev.lat:.6f}, {dev.lon:.6f}")))
+        f_snmp.addRow("sysLocation (место):", self.snmp_loc)
+        self.snmp_contact = QLineEdit(str(snmp_cfg.get("sys_contact", "noc@zonem.local")))
+        f_snmp.addRow("sysContact (контакт):", self.snmp_contact)
+        self.snmp_descr = QLineEdit(str(snmp_cfg.get("sys_descr", dev.spec["name"])))
+        f_snmp.addRow("sysDescr (описание):", self.snmp_descr)
+        lay_snmp.addLayout(f_snmp)
+        lay_snmp.addStretch(1)
+        tabs.addTab(p_snmp, "SNMP протокол")
+
+        lay.addWidget(tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -125,29 +168,40 @@ class DeviceDialog(QDialog):
 
     def _parse(self):
         ips = {}
-        if self.ip_table is not None:
-            for r, port in enumerate(self.ip_ports):
-                text = (self.ip_table.item(r, 1).text() or "").strip()
-                if text:
-                    ipaddress.ip_interface(text)                       # ValueError при ошибке
-                    ips[port] = text
-            gw = self.gateway.text().strip()
-            if gw:
-                ipaddress.ip_address(gw)
-            routes = []
-            for line in self.routes.toPlainText().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.replace(" via ", " ").split()
-                if len(parts) != 2:
-                    raise ValueError(f"Маршрут «{line}»: ожидается «подсеть via next-hop»")
-                ipaddress.ip_network(parts[0], strict=False)
-                ipaddress.ip_address(parts[1])
-                routes.append({"net": parts[0], "via": parts[1]})
-        else:
-            gw, routes = "", []
-        return ips, gw, routes
+        for r, port in enumerate(self.ip_ports):
+            text = (self.ip_table.item(r, 1).text() or "").strip()
+            if text:
+                ipaddress.ip_interface(text)
+                ips[port] = text
+        mgmt = self.mgmt_ip.text().strip()
+        if mgmt:
+            ipaddress.ip_interface(mgmt)
+            ips["mgmt"] = mgmt
+        gw = self.gateway.text().strip()
+        if gw:
+            ipaddress.ip_address(gw)
+        routes = []
+        for line in self.routes.toPlainText().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.replace(" via ", " ").split()
+            if len(parts) != 2:
+                raise ValueError(f"Маршрут «{line}»: ожидается «подсеть via next-hop»")
+            ipaddress.ip_network(parts[0], strict=False)
+            ipaddress.ip_address(parts[1])
+            routes.append({"net": parts[0], "via": parts[1]})
+        snmp_dict = {
+            "enabled": self.snmp_enabled.isChecked(),
+            "community": self.snmp_comm.text().strip() or "public",
+            "port": self.snmp_port.value(),
+            "version": self.snmp_ver.currentText(),
+            "sys_name": self.snmp_name.text().strip(),
+            "sys_location": self.snmp_loc.text().strip(),
+            "sys_contact": self.snmp_contact.text().strip(),
+            "sys_descr": self.snmp_descr.text().strip(),
+        }
+        return ips, gw, routes, snmp_dict
 
     def accept(self):
         try:
@@ -159,7 +213,7 @@ class DeviceDialog(QDialog):
 
     def apply(self):
         """Записывает настройки в устройство."""
-        ips, gw, routes = self._result
+        ips, gw, routes, snmp_dict = self._result
         d = self.dev
         if d.tower_id is None:
             d.name = self.name.text().strip() or d.name
@@ -169,8 +223,8 @@ class DeviceDialog(QDialog):
         if self.radio_box is not None:
             d.radio = {"tech": self.tech.currentText(), "bw_mhz": self.bw.value(), "layers": self.layers.value(),
                        "max_users": self.max_users.value()}
-        if self.ip_table is not None:
-            d.ips, d.gateway, d.routes = ips, gw, routes
+        d.ips, d.gateway, d.routes = ips, gw, routes
+        d.snmp = snmp_dict
 
 
 class PortChooserDialog(QDialog):
@@ -225,11 +279,43 @@ class SnmpDialog(QDialog):
     IF_HEAD = ("ifIndex", "ifDescr", "Тип", "Скорость", "MAC", "Admin", "Oper", "In (HC)", "Out (HC)",
                "Ошибки In", "ifAlias")
 
-    def __init__(self, poll_fn, theme, parent=None):
+    def __init__(self, poll_fn, theme, dev=None, net=None, parent=None):
         super().__init__(parent)
-        self.poll_fn, self.theme = poll_fn, theme
-        self.setMinimumSize(900, 560)
+        self.poll_fn, self.theme, self.dev, self.net = poll_fn, theme, dev, net
+        self.setMinimumSize(940, 620)
         lay = QVBoxLayout(self)
+
+        cfg = dev.snmp_params() if dev and hasattr(dev, "snmp_params") else {}
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("IP:"))
+        init_ip = snmp._first_ip(dev) if dev else "127.0.0.1"
+        self.ed_ip = QLineEdit(init_ip or "127.0.0.1")
+        self.ed_ip.setMaximumWidth(130)
+        bar.addWidget(self.ed_ip)
+        bar.addWidget(QLabel("Порт:"))
+        self.ed_port = QSpinBox()
+        self.ed_port.setRange(1, 65535)
+        self.ed_port.setValue(int(cfg.get("port", 161)))
+        bar.addWidget(self.ed_port)
+        bar.addWidget(QLabel("Community:"))
+        self.ed_comm = QLineEdit(str(cfg.get("community", "public")))
+        self.ed_comm.setMaximumWidth(100)
+        bar.addWidget(self.ed_comm)
+        bar.addWidget(QLabel("Версия:"))
+        self.ed_ver = QComboBox()
+        self.ed_ver.addItems(["v2c", "v1", "v3"])
+        self.ed_ver.setCurrentText(str(cfg.get("version", "v2c")))
+        bar.addWidget(self.ed_ver)
+        b_poll = QPushButton("Опросить")
+        b_poll.clicked.connect(self.refresh)
+        bar.addWidget(b_poll)
+        if dev and net:
+            b_cfg = QPushButton("Настройки SNMP…")
+            b_cfg.clicked.connect(self._open_config)
+            bar.addWidget(b_cfg)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
         self.header = QLabel()
         self.header.setTextFormat(Qt.TextFormat.RichText)
         self.header.setWordWrap(True)
@@ -263,6 +349,21 @@ class SnmpDialog(QDialog):
         self.result = None
         self.refresh()
 
+    def _open_config(self):
+        if not self.dev or not self.net:
+            return
+        dlg = DeviceDialog(self.net, self.dev, self)
+        if dlg.exec():
+            dlg.apply()
+            cfg = self.dev.snmp_params()
+            self.ed_comm.setText(str(cfg.get("community", "public")))
+            self.ed_port.setValue(int(cfg.get("port", 161)))
+            self.ed_ver.setCurrentText(str(cfg.get("version", "v2c")))
+            ip = snmp._first_ip(self.dev)
+            if ip:
+                self.ed_ip.setText(ip)
+            self.refresh()
+
     @staticmethod
     def _table(head):
         t = QTableWidget(0, len(head))
@@ -285,15 +386,36 @@ class SnmpDialog(QDialog):
                 table.setItem(r, c, item)
 
     def refresh(self):
-        res = self.result = self.poll_fn()
+        target_ip, port, comm, ver = None, None, None, None
+        if hasattr(self, "ed_ip"):
+            t = self.ed_ip.text()
+            if isinstance(t, str) and t.strip():
+                target_ip = t.strip()
+        if hasattr(self, "ed_port"):
+            p = self.ed_port.value()
+            if isinstance(p, int):
+                port = p
+        if hasattr(self, "ed_comm"):
+            c = self.ed_comm.text()
+            if isinstance(c, str) and c.strip():
+                comm = c.strip()
+        if hasattr(self, "ed_ver"):
+            v = self.ed_ver.currentText()
+            if isinstance(v, str) and v.strip():
+                ver = v.strip()
+        try:
+            res = self.result = self.poll_fn(target_ip=target_ip, port=port, community=comm, version=ver)
+        except TypeError:
+            res = self.result = self.poll_fn()
         self.setWindowTitle(f"SNMP: {res.name}")
         ok_color = "#2ecc71" if res.reachable and res.transport == "network" else (
             "#f5a524" if res.reachable else "#e5484d")
         path = " → ".join(res.path) if res.path else "—"
+        comm_name = comm or (self.dev.snmp_params()["community"] if self.dev and hasattr(self.dev, "snmp_params") else snmp.COMMUNITY)
         self.header.setText(
             f"<b style='font-size:14px'>{res.name}</b> &nbsp; <code>{res.command}</code><br>"
             f"<span style='color:{ok_color}'><b>{res.status}</b></span><br>"
-            f"Менеджер: {res.manager} · SNMPv2c, community «{snmp.COMMUNITY}» · путь запроса: {path}"
+            f"Менеджер: {res.manager} · SNMP {ver or 'v2c'}, community «{comm_name}» · путь запроса: {path}"
             + (f"<br>sysUpTime: {snmp.fmt_ticks(res.uptime_s).split(') ')[-1]}" if res.reachable else ""))
         self._fill(self.t_sys, [(o, n.split("::")[-1], v) for o, n, v in res.system])
         colors = ["#e5484d" if not r["ifOperStatus"].startswith("up") and r["ifAlias"] else
@@ -806,6 +928,8 @@ class NetworkMixin:
         self._net_sel = ("link", link.id)
         self.net_after_change()
         self._js(f"api.selectLink({json.dumps(link.id)});")
+        if hasattr(self, "_mode_actions") and "navigate" in self._mode_actions:
+            self._mode_actions["navigate"].setChecked(True)
         self.tabs.setCurrentWidget(self.net_page)
         st = net.status[link.id]
         text, _ = STATE_TEXT[st.state]
@@ -911,10 +1035,13 @@ class NetworkMixin:
         self.net.evaluate(self.building_data)
         dev = self.net.devices[did]
         tower = next((t for t in self.towers if t.db_id == dev.tower_id), None) if dev.tower_id is not None else None
-        poll = lambda: snmp.poll(self.net, did, link_util=self._current_link_util(), tower=tower)
-        dlg = SnmpDialog(poll, self.th, self)
+        poll = lambda target_ip=None, port=None, community=None, version=None: snmp.poll(
+            self.net, did, link_util=self._current_link_util(), tower=tower,
+            target_ip=target_ip, port=port, community=community, version=version)
+        dlg = SnmpDialog(poll, self.th, dev=dev, net=self.net, parent=self)
         self._last_snmp = dlg.result
-        self.statusBar().showMessage(f"SNMP {dev.name}: {dlg.result.status}")
+        if dlg.result:
+            self.statusBar().showMessage(f"SNMP {dev.name}: {dlg.result.status}")
         dlg.exec()
 
     def net_export_bom(self):
@@ -1138,12 +1265,19 @@ class NetworkMixin:
         st = res.steps[i]
         users = [[round(float(la), 6), round(float(lo), 6), int(s)]
                  for la, lo, s in zip(res.lat, res.lon, st.state)]
-        lines, served = [], [u for u in range(len(res.lat)) if st.serving[u] >= 0 and st.state[u] != loadtest.STATE_IDLE]
-        step = max(1, len(served) // 400)                          # на карте не больше ~400 линий
-        for u in served[::step]:
-            tlat, tlon = res.tower_pos[int(st.serving[u])]
-            lines.append([round(float(res.lat[u]), 6), round(float(res.lon[u]), 6), tlat, tlon,
-                          2 if st.state[u] == loadtest.STATE_DEGRADED else 1])
+        lines = []
+        t_served = {}
+        for u in range(len(res.lat)):
+            s = int(st.serving[u])
+            if s >= 0 and st.state[u] != loadtest.STATE_IDLE:
+                t_served.setdefault(s, []).append(u)
+        for s, u_list in t_served.items():
+            if s < len(res.tower_pos):
+                tlat, tlon = res.tower_pos[s]
+                stride = max(1, len(u_list) // 25)
+                for u in u_list[::stride]:
+                    lines.append([round(float(res.lat[u]), 6), round(float(res.lon[u]), 6), tlat, tlon,
+                                  2 if st.state[u] == loadtest.STATE_DEGRADED else 1])
         util = {lid: round(float(st.link_util[e]), 3) for e, lid in enumerate(res.link_ids)}
         self._js(f"api.setTraffic({json.dumps({'users': users, 'lines': lines, 'linkUtil': util})});")
 

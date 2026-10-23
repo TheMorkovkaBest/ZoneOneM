@@ -63,6 +63,22 @@ class Device:
     power_mode: str = "local"                     # local | poe
     radio: dict = field(default_factory=dict)     # для БС: tech, bw_mhz, layers, max_users
     mount_h: float = 20.0                         # высота подвеса антенны РРЛ, м
+    snmp: dict = field(default_factory=dict)      # community, port, version, sys_contact, sys_location, sys_name, sys_descr
+
+    def snmp_params(self):
+        base = {
+            "enabled": True,
+            "community": "public",
+            "port": 161,
+            "version": "v2c",
+            "sys_contact": "noc@zonem.local",
+            "sys_location": f"{self.lat:.6f}, {self.lon:.6f}",
+            "sys_name": self.name,
+            "sys_descr": f"{self.spec['name']} ({self.role})",
+        }
+        if self.snmp:
+            base.update(self.snmp)
+        return base
 
     @property
     def spec(self):
@@ -707,7 +723,7 @@ class Network:
         return {
             "version": 1, "next_dev": self._next_dev, "next_link": self._next_link,
             "devices": [{k: getattr(d, k) for k in ("id", "model", "name", "lat", "lon", "tower_id", "ips",
-                                                    "gateway", "routes", "power_mode", "radio", "mount_h")}
+                                                    "gateway", "routes", "power_mode", "radio", "mount_h", "snmp")}
                         for d in self.devices.values()],
             "links": [{k: getattr(l, k) for k in ("id", "a_dev", "a_port", "b_dev", "b_port", "cable", "length_m")}
                       for l in self.links.values()],

@@ -52,6 +52,7 @@ ICONS = {
     "bar": '<line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/>',
     "sliders": '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
     "list": '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>',
+    "structure": '<line x1="4" y1="21" x2="10" y2="4"/><line x1="20" y1="21" x2="14" y2="4"/><line x1="10" y1="4" x2="14" y2="4"/><line x1="12" y1="1" x2="12" y2="4"/><line x1="8" y1="10" x2="16" y2="10"/><line x1="6" y1="16" x2="18" y2="16"/><line x1="10" y1="4" x2="16" y2="10"/><line x1="14" y1="4" x2="8" y2="10"/><line x1="8" y1="10" x2="18" y2="16"/><line x1="16" y1="10" x2="6" y2="16"/><line x1="6" y1="16" x2="20" y2="21"/><line x1="18" y1="16" x2="4" y2="21"/>',
     "x": '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
 }
 
@@ -112,10 +113,10 @@ QTreeWidget { background: @bg1; border: 1px solid @border; border-radius: 8px; o
     selection-background-color: @accent; selection-color: @accent_text; }
 QTreeWidget::item { padding: 3px 2px; }
 QPlainTextEdit { font-family: "Consolas", "Cascadia Mono", monospace; }
-QToolButton[ribbon="true"] { padding: 4px 5px; min-width: 54px; border-radius: 8px; }
+QToolButton[ribbon="true"] { padding: 4px 6px; min-width: 32px; min-height: 32px; border-radius: 6px; }
 QToolButton[ribbon="true"]::menu-button { border: none; width: 12px; }
-QFrame#ribbonGroup { border: none; border-right: 1px solid @border; background: transparent; }
-QLabel[role="ribbon"] { color: @dim; font-size: 10px; }
+QFrame#ribbonGroup { border: none; border-right: 1px solid @border; background: transparent; padding: 0 4px; }
+QLabel[role="ribbon"] { color: @dim; font-size: 10px; font-weight: 600; padding-top: 2px; }
 QToolButton[role="zone"] { background: @bg2; border: 1px solid @border; padding: 7px 10px; text-align: left; }
 QToolButton[role="zone"]:hover { border-color: @accent; }
 QToolButton[role="zone"]:checked { background: @accent; border-color: @accent; }

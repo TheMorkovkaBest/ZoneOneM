@@ -27,7 +27,6 @@
     zone_forbidden: 'Запретная зона: ЛКМ — вершины, двойной клик/Enter — завершить, ПКМ — отменить',
     device: 'Установка устройства — кликните на карту (тип выбран в палитре «Сеть»)',
     cable: 'Кабель: кликните первое устройство или вышку, затем второе (ПКМ — отменить выбор, Esc — выход)',
-    pdu: 'PDU (ping): кликните устройство-источник, затем получателя',
   };
   const ROLE_COLORS = { tower: '#ff5d5d', switch_l2: '#3e8bff', switch_l3: '#7c5cff', router: '#2ec4b6',
     firewall: '#ff9f1c', radio: '#ff4d9d', core: '#30c26f' };
@@ -206,7 +205,7 @@
         ctx.fillText(txt, p.x, p.y - 7);
       }
     }
-    if (state.towers && state.towers.length) {
+    if ((!deckOverlay || typeof deck === 'undefined') && state.towers && state.towers.length) {
       ctx.font = '600 11.5px "Segoe UI", system-ui, sans-serif';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
@@ -285,7 +284,8 @@
   function renderAzimuthHandle() {
     if (!map) return;
     const t = selectedTower();
-    const show = t && t.beamwidth < 360 && state.mode === 'navigate';
+    const show = t && typeof t.lat === 'number' && typeof t.lon === 'number' &&
+                 isFinite(t.lat) && isFinite(t.lon) && t.beamwidth < 360 && state.mode === 'navigate';
     if (!show) {
       if (azMarker) { azMarker.remove(); azMarker = null; }
       setData('azline', EMPTY);
@@ -294,6 +294,11 @@
     if (azDragging) return;
     const az = state.azPreview && state.azPreview.id === t.id ? state.azPreview.azimuth : t.azimuth;
     const pos = handleLngLat(t, az);
+    if (!pos || !isFinite(pos[0]) || !isFinite(pos[1])) {
+      if (azMarker) { azMarker.remove(); azMarker = null; }
+      setData('azline', EMPTY);
+      return;
+    }
     if (!azMarker) {
       const el = document.createElement('div');
       el.className = 'az-handle';
@@ -302,7 +307,8 @@
       azMarker.on('drag', onAzDrag);
       azMarker.on('dragend', onAzEnd);
     } else azMarker.setLngLat(pos);
-    azMarker.getElement().querySelector('.az-text').textContent = Math.round(az) + '°';
+    const txt = azMarker.getElement().querySelector('.az-text');
+    if (txt) txt.textContent = Math.round(az) + '°';
     setData('azline', lineFrom([t.lon, t.lat], pos));
   }
   function onAzDrag() {
@@ -368,24 +374,35 @@
       const t0 = state.towers.find((x) => x.id === tid);
       if (t0) {
         const t = previewOf(t0);
-        return [t.lat, t.lon];
+        if (typeof t.lat === 'number' && typeof t.lon === 'number' && isFinite(t.lat) && isFinite(t.lon)) {
+          return [t.lat, t.lon];
+        }
       }
     }
     const d = state.net.devices.find((x) => x.id === devId);
-    if (d) return [d.lat, d.lon];
-    return fallback;
+    if (d && typeof d.lat === 'number' && typeof d.lon === 'number' && isFinite(d.lat) && isFinite(d.lon)) {
+      return [d.lat, d.lon];
+    }
+    if (fallback && typeof fallback[0] === 'number' && typeof fallback[1] === 'number' &&
+        isFinite(fallback[0]) && isFinite(fallback[1])) {
+      return fallback;
+    }
+    return [0, 0];
   }
 
   function linkFeatures() {
-    return { type: 'FeatureCollection', features: state.net.links.map((l) => {
+    const list = [];
+    for (const l of state.net.links) {
       const a = devPos(l.a_dev, l.a), b = devPos(l.b_dev, l.b);
+      if (!a || !b || !isFinite(a[0]) || !isFinite(a[1]) || !isFinite(b[0]) || !isFinite(b[1])) continue;
       const u = linkUtil(l.id);
       const col = (u !== null && l.state !== 'down') ? utilColor(u) : (l.state === 'warn' ? '#f5a524' : l.color);
-      return { type: 'Feature', properties: { id: l.id, state: l.state, col, width: l.width,
+      list.push({ type: 'Feature', properties: { id: l.id, state: l.state, col, width: l.width,
         sel: l.id === state.selLink ? 1 : 0,
-        lbl: l.label + (u !== null ? ' · ' + Math.round(u * 100) + '%' : '') },
-        geometry: { type: 'LineString', coordinates: [[a[1], a[0]], [b[1], b[0]]] } };
-    }) };
+        lbl: (l.label || '') + (u !== null ? ' · ' + Math.round(u * 100) + '%' : '') },
+        geometry: { type: 'LineString', coordinates: [[a[1], a[0]], [b[1], b[0]]] } });
+    }
+    return { type: 'FeatureCollection', features: list };
   }
 
   /* Устройство тащат: двигаем концы его кабелей сразу (раньше кабель «прыгал» только после отпускания). */
@@ -407,6 +424,7 @@
     for (const [id, m] of devMarkers) if (!ids.has(id)) { m.remove(); devMarkers.delete(id); }
     for (const d of state.net.devices) {
       if (d.tower) continue;
+      if (typeof d.lon !== 'number' || typeof d.lat !== 'number' || !isFinite(d.lon) || !isFinite(d.lat)) continue;
       let m = devMarkers.get(d.id);
       if (!m) {
         const el = document.createElement('div');
@@ -418,31 +436,42 @@
         m.on('drag', () => { const ll = m.getLngLat(); moveDevicePreview(d.id, ll.lat, ll.lng); });
         m.on('dragend', () => { const ll = m.getLngLat(); send({ type: 'net_move', id: d.id, lat: ll.lat, lon: ll.lng }); });
         devMarkers.set(d.id, m);
+      } else {
+        m.setLngLat([d.lon, d.lat]);
       }
-      m.setLngLat([d.lon, d.lat]);
       const el = m.getElement();
       el.classList.toggle('movable', canDrag());
       el.style.setProperty('--c', ROLE_COLORS[d.role] || '#888');
-      el.querySelector('.nm').textContent = d.name;
+      const nmEl = el.querySelector('.nm');
+      if (nmEl) nmEl.textContent = d.name;
       el.classList.toggle('selected', d.id === state.selDevice);
       el.classList.toggle('unpowered', d.powered === false);
     }
     // подписи кабелей и вышек рисуются на одном 2D-холсте поверх карты, без DOM-маркеров и без symbol-воркеров
-    renderFlowDots(performance.now());
+    renderFlowDots(performance.now(), false);
     renderArm();
     drawLabels();
   }
 
   function renderArm() {
     const d = state.cableFrom && state.net.devices.find((x) => x.id === state.cableFrom);
-    if (!d) { if (armMarker) { armMarker.remove(); armMarker = null; } return; }
+    if (!d || !map) {
+      if (armMarker) { armMarker.remove(); armMarker = null; }
+      return;
+    }
+    const pos = devPos(d.id, [d.lat, d.lon]);
+    if (!pos || typeof pos[0] !== 'number' || typeof pos[1] !== 'number' || !isFinite(pos[0]) || !isFinite(pos[1])) {
+      if (armMarker) { armMarker.remove(); armMarker = null; }
+      return;
+    }
+    const targetLngLat = [pos[1], pos[0]];
     if (!armMarker) {
       const el = document.createElement('div');
       el.className = 'arm-ring';
-      armMarker = new maplibregl.Marker({ element: el }).addTo(map);
+      armMarker = new maplibregl.Marker({ element: el }).setLngLat(targetLngLat).addTo(map);
+    } else {
+      armMarker.setLngLat(targetLngLat);
     }
-    const pos = devPos(d.id, [d.lat, d.lon]);
-    armMarker.setLngLat([pos[1], pos[0]]);
   }
 
   /* Устройства перетаскиваются только в режиме навигации: в режимах «Кабель»/PDU малейшее
@@ -502,13 +531,15 @@
     if (t && !flowReq) flowReq = requestAnimationFrame(flowTick);
   }
 
-  function renderFlowDots(now) {
+  function renderFlowDots(now, fast) {
     const feats = [];
+    // 1. Пакеты по кабелям транспортной сети
     if (state.traffic && state.traffic.linkUtil) {
       for (const l of state.net.links) {
         const u = linkUtil(l.id);
         if (u === null || u <= 0.01 || l.state === 'down') continue;
         const a = devPos(l.a_dev, l.a), b = devPos(l.b_dev, l.b);
+        if (!a || !b || !isFinite(a[0]) || !isFinite(b[0])) continue;
         const n = 1 + Math.round(u * 5), period = 2600 - u * 1700;
         for (let k = 0; k < n; k++) {
           const f = ((now / period) + k / n) % 1;
@@ -520,12 +551,41 @@
         }
       }
     }
-    setData('flow', { type: 'FeatureCollection', features: feats });
+    // 2. Пакеты по радиоканалу: от базовой станции к пользователям и обратно
+    if (state.traffic && state.traffic.lines && state.traffic.lines.length) {
+      const period = 1300;
+      const lines = state.traffic.lines;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const ulat = line[0], ulon = line[1], tlat = line[2], tlon = line[3], st = line[4];
+        if (!isFinite(ulat) || !isFinite(ulon) || !isFinite(tlat) || !isFinite(tlon)) continue;
+        const col = st === 2 ? '#f5a524' : '#2ecc71';
+        // Downlink пакет (БС -> абонент)
+        const fDl = ((now / period) + (i * 0.17)) % 1;
+        feats.push({
+          type: 'Feature', properties: { col },
+          geometry: { type: 'Point', coordinates: [tlon + (ulon - tlon) * fDl, tlat + (ulat - tlat) * fDl] }
+        });
+        // Uplink пакет (абонент -> БС)
+        if (i % 2 === 0) {
+          const fUl = 1 - (((now / (period * 1.15)) + (i * 0.23)) % 1);
+          feats.push({
+            type: 'Feature', properties: { col },
+            geometry: { type: 'Point', coordinates: [tlon + (ulon - tlon) * fUl, tlat + (ulat - tlat) * fUl] }
+          });
+        }
+      }
+    }
+    setData('flow', { type: 'FeatureCollection', features: feats }, fast !== undefined ? fast : true);
   }
+  let lastFlow = 0;
   function flowTick(now) {
     flowReq = 0;
-    if (!state.traffic) { renderFlowDots(now); return; }
-    renderFlowDots(now);
+    if (!state.traffic) { renderFlowDots(now, false); return; }
+    if (now - lastFlow >= 40) {
+      lastFlow = now;
+      renderFlowDots(now, true);
+    }
     flowReq = requestAnimationFrame(flowTick);
   }
 
@@ -571,15 +631,20 @@
 
   function rubberBand() {
     const d = state.cableFrom && state.net.devices.find((x) => x.id === state.cableFrom);
-    if (!d || !state.mouse) { renderDraft(); return; }
+    if (!d || !state.mouse || typeof state.mouse.lng !== 'number' || typeof state.mouse.lat !== 'number' ||
+        !isFinite(state.mouse.lng) || !isFinite(state.mouse.lat)) {
+      renderDraft();
+      return;
+    }
     const pos = devPos(d.id, [d.lat, d.lon]);
+    if (!pos || !isFinite(pos[0]) || !isFinite(pos[1])) { renderDraft(); return; }
     setData('draft', lineFrom([pos[1], pos[0]], [state.mouse.lng, state.mouse.lat]), true);
   }
 
   function renderDeck() {
     if (!deckOverlay || typeof deck === 'undefined') return;
     const list = state.towers.map(previewOf);
-    const key = list.map((t) => t.id + ':' + t.lat + ':' + t.lon + ':' + t.height + ':' + t.tilt + ':' + t.scale).join('|');
+    const key = list.map((t) => t.id + ':' + t.lat + ':' + t.lon + ':' + t.height + ':' + t.tilt + ':' + t.scale + ':' + (t.id === state.selectedId ? '1' : '0')).join('|');
     if (key === deckKey) return;
     deckKey = key;
     const layers = [];
@@ -595,6 +660,43 @@
       getPosition: (d) => [d.lon, d.lat], getOrientation: (d) => [0, 0, d.tilt],
       sizeScale: 1, getSize: (d) => d.scale,
     }));
+    // Оголовок антенны прямо на крыше здания / вершине вышки в 3D (Z = d.height)
+    if (list.length && deck.ScatterplotLayer) {
+      layers.push(new deck.ScatterplotLayer({
+        id: 'tower-heads-3d',
+        data: list,
+        getPosition: (d) => [d.lon, d.lat, d.height],
+        getRadius: 8,
+        radiusUnits: 'pixels',
+        getFillColor: (d) => d.color,
+        getLineColor: (d) => d.id === state.selectedId ? [62, 139, 255, 255] : [255, 255, 255, 255],
+        getLineWidth: (d) => d.id === state.selectedId ? 4 : 2.5,
+        lineWidthUnits: 'pixels',
+        stroked: true,
+        filled: true,
+        pickable: false,
+      }));
+    }
+    // 3D подпись вышки на уровне оголовка антенны на крыше
+    if (list.length && deck.TextLayer) {
+      layers.push(new deck.TextLayer({
+        id: 'tower-labels-3d',
+        data: list,
+        getPosition: (d) => [d.lon, d.lat, d.height],
+        getText: (d) => d.name,
+        getSize: 12,
+        getColor: state.theme === 'light' ? [28, 36, 48, 255] : [230, 234, 240, 255],
+        getTextAnchor: 'start',
+        getAlignmentBaseline: 'center',
+        getPixelOffset: [14, 0],
+        fontFamily: '"Segoe UI", system-ui, sans-serif',
+        fontWeight: 600,
+        background: true,
+        backgroundColor: state.theme === 'light' ? [255, 255, 255, 220] : [16, 20, 26, 220],
+        backgroundPadding: [4, 2],
+        pickable: false,
+      }));
+    }
     deckOverlay.setProps({ layers });
   }
 
@@ -649,9 +751,11 @@
     map.addLayer({ id: 'flow-dots', type: 'circle', source: 'flow', paint: {
       'circle-radius': 3.2, 'circle-color': '#ffffff', 'circle-stroke-color': ['get', 'col'], 'circle-stroke-width': 1.5 } });
     map.addLayer({ id: 'tower-dot', type: 'circle', source: 'towers', paint: {
-      'circle-radius': ['case', ['==', ['get', 'sel'], 1], 8, 6.5], 'circle-color': ['get', 'color'],
-      'circle-stroke-color': ['case', ['==', ['get', 'sel'], 1], '#3e8bff', '#ffffff'],
-      'circle-stroke-width': ['case', ['==', ['get', 'sel'], 1], 4, 2],
+      'circle-radius': 3.5, 'circle-color': ['get', 'color'],
+      'circle-opacity': 0.25,
+      'circle-stroke-color': '#000000',
+      'circle-stroke-width': 1,
+      'circle-stroke-opacity': 0.25,
       'circle-pitch-alignment': 'viewport' } });
     deckKey = '';
     renderCoverage(); renderZones(); renderMeasure(); renderDraft(); renderNet(); renderTraffic();
@@ -672,7 +776,7 @@
     if (ind) { ind.textContent = HINTS[mode] || ''; ind.style.display = HINTS[mode] ? 'block' : 'none'; }
     if (map) {
       map.getCanvas().style.cursor = { select: 'pointer', place: 'cell', measure: 'crosshair', device: 'cell',
-        cable: 'alias', pdu: 'alias', probe: 'crosshair', zone_algo: 'crosshair', zone_forbidden: 'crosshair' }[mode] || '';
+        cable: 'alias', probe: 'crosshair', zone_algo: 'crosshair', zone_forbidden: 'crosshair' }[mode] || '';
       if (drawing()) map.doubleClickZoom.disable(); else map.doubleClickZoom.enable();
     }
     renderAzimuthHandle();
@@ -717,7 +821,10 @@
       case 'device': send({ type: 'net_place', lat, lon }); break;
       case 'cable': case 'pdu': {
         const d = pickDevice(e.point, e);
-        if (!d) break;
+        if (!d) {
+          if (state.cableFrom) { state.cableFrom = null; renderArm(); renderDraft(); }
+          break;
+        }
         if (!state.cableFrom) { state.cableFrom = d.id; renderArm(); break; }
         if (d.id === state.cableFrom) break;
         const a = state.cableFrom;
@@ -839,7 +946,7 @@
   map.on('style.load', () => {
     setupLayers();
     if (!deckOverlay && typeof deck !== 'undefined') {
-      deckOverlay = new deck.MapboxOverlay({ interleaved: false, layers: [] });
+      deckOverlay = new deck.MapboxOverlay({ interleaved: true, layers: [] });
       map.addControl(deckOverlay);
     }
     deckKey = '';
@@ -871,6 +978,7 @@
 
   let hoverThrottle = 0, hudThrottle = 0;
   map.on('mousemove', (e) => {
+    if (!e || !e.lngLat) return;
     const now = Date.now();
     state.mouse = e.lngLat;
     if (state.towerDrag && !state.towerDrag.done) {

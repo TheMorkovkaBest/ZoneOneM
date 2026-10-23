@@ -51,7 +51,8 @@ PARAM_KEYS = ("freq", "power", "height", "tilt", "wall_loss", "azimuth", "beamwi
 class Tower:
     def __init__(self, name, lat, lon, freq, power, height, tilt, wall_loss, color,
                  model_path=None, scale=1.0, building_data=None, azimuth=0.0, beamwidth=360.0,
-                 type_name=None, db_id=None, reach=None, fresnel=True, pattern=True, calc=None):
+                 type_name=None, db_id=None, reach=None, fresnel=True, pattern=True, calc=None,
+                 mount=None):
         self.name = name
         self.lat = lat
         self.lon = lon
@@ -69,6 +70,7 @@ class Tower:
         self.db_id = db_id
         self.fresnel = bool(fresnel)    # дифракция в зоне Френеля
         self.pattern = bool(pattern)    # диаграмма с боковыми/задним лепестками
+        self.mount = dict(mount or {"type": "ground", "id": None, "offset": 0.0, "bld_h": 0.0})
 
         self.model_b64 = None
         if model_path:
@@ -141,6 +143,7 @@ class Tower:
             "area_km2": list(self.areas),
             "reach": np.round(self.reach, 1).tolist(),
             "calc": dict(self.calc, used_buildings=self.used_buildings, pending=self.buildings_pending),
+            "mount": self.mount,
         }
         return d
 
@@ -173,6 +176,7 @@ class Tower:
             azimuth=data.get("azimuth", 0.0), beamwidth=data.get("beamwidth", 360.0),
             type_name=data.get("type_name"), db_id=data.get("id"), reach=reach,
             calc=data.get("calc") if reach is not None else None,
+            mount=data.get("mount"),
         )
 
     @classmethod
@@ -190,12 +194,18 @@ class Tower:
             calc = json.loads(row["calc"]) if row.get("calc") else None
         except ValueError:
             calc = None
+        mount = None
+        if row.get("mount"):
+            try:
+                mount = json.loads(row["mount"])
+            except Exception:
+                mount = None
         return cls(
             name=row["name"], lat=row["lat"], lon=row["lon"], freq=row["freq"], power=row["power"],
             height=row["height"], tilt=row["tilt"], wall_loss=row["wall_loss"], color=color,
             scale=row["scale"], building_data=building_data, azimuth=row["azimuth"],
             beamwidth=row["beamwidth"], type_name=row.get("type_name"), db_id=row["id"], reach=reach,
-            calc=calc,
+            calc=calc, mount=mount,
         )
 
 
@@ -213,6 +223,16 @@ class TowerDB:
         except sqlite3.DatabaseError:
             pass
         self.create_table()
+        try:
+            import antenna_catalog
+            antenna_catalog.init_antenna_db(self.conn)
+        except Exception:
+            pass
+        try:
+            import structures
+            structures.init_structures_db(self.conn)
+        except Exception:
+            pass
 
     def create_table(self):
         with self.conn:
@@ -227,7 +247,7 @@ class TowerDB:
             self.conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
             # миграция БД старых версий: добавляем недостающие столбцы
             have = {r["name"] for r in self.conn.execute("PRAGMA table_info(towers)")}
-            for col in ("color", "type_name", "reach", "calc"):
+            for col in ("color", "type_name", "reach", "calc", "mount"):
                 if col not in have:
                     self.conn.execute(f"ALTER TABLE towers ADD COLUMN {col} TEXT")
 
@@ -236,8 +256,8 @@ class TowerDB:
         with self.conn:
             cur = self.conn.execute("""
                 INSERT INTO towers (name, lat, lon, freq, power, height, tilt, wall_loss, scale,
-                                    azimuth, beamwidth, color, type_name, reach, calc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    azimuth, beamwidth, color, type_name, reach, calc, mount)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, self._values(tower_dict))
             return cur.lastrowid
 
@@ -245,7 +265,7 @@ class TowerDB:
         with self.conn:
             self.conn.execute("""
                 UPDATE towers SET name=?, lat=?, lon=?, freq=?, power=?, height=?, tilt=?,
-                       wall_loss=?, scale=?, azimuth=?, beamwidth=?, color=?, type_name=?, reach=?, calc=?
+                       wall_loss=?, scale=?, azimuth=?, beamwidth=?, color=?, type_name=?, reach=?, calc=?, mount=?
                 WHERE id=?
             """, (*self._values(tower_dict), db_id))
 
@@ -255,7 +275,8 @@ class TowerDB:
                 d["wall_loss"], d.get("scale", 1.0), d.get("azimuth", 0.0), d.get("beamwidth", 360.0),
                 json.dumps(d.get("color", [255, 0, 0, 255])), d.get("type_name"),
                 json.dumps(d["reach"]) if d.get("reach") is not None else None,
-                json.dumps(d["calc"]) if d.get("calc") else None)
+                json.dumps(d["calc"]) if d.get("calc") else None,
+                json.dumps(d.get("mount", {})) if d.get("mount") is not None else None)
 
     def load_all_towers(self):
         return self.conn.execute("SELECT * FROM towers ORDER BY id").fetchall()
