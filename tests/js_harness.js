@@ -11,6 +11,8 @@ out.checks.fmt = [U.fmtDist(250), U.fmtDist(1500), U.fmtBearing(45)];
 
 // ---------- заглушки ----------
 global.window = global;
+const handlers = {}, docHandlers = {};
+global.addEventListener = (e, f) => { docHandlers[e] = f; };
 const makeEl = () => {
   const el = { style: { setProperty(k, v) { this[k] = v; } }, textContent: '', innerHTML: '', _cls: new Set(), _kids: {},
     dataset: {}, setAttribute() {}, addEventListener() {},
@@ -19,7 +21,6 @@ const makeEl = () => {
     querySelector(sel) { return (el._kids[sel] = el._kids[sel] || makeEl()); } };
   return el;
 };
-const handlers = {}, docHandlers = {};
 global.document = { getElementById: () => makeEl(), createElement: makeEl,
   body: makeEl(), addEventListener: (e, f) => { docHandlers[e] = f; } };
 global.console = { log: (m) => { if (String(m).startsWith('PY:')) out.messages.push(JSON.parse(m.slice(3))); },

@@ -47,6 +47,7 @@
     probe: null, ready: false, azPreview: null,
     net: { devices: [], links: [] }, selDevice: null, selLink: null, cableFrom: null, traffic: null,
     mouse: null, towerDrag: null,
+    coverageMode: 'standard', selectedTowers: [], selectedDevices: [],
   };
   let map = null, deckOverlay = null;
   let measureMarkers = [], probeMarker = null, azMarker = null, azDragging = false, azTimer = null, dragTimer = null;
@@ -55,6 +56,7 @@
   const ringCache = new Map();              // id вышки -> {key, rings}: полигоны зон не пересчитываются зря
   let activeId = null;                      // вышка, которую сейчас крутят/тащат: рисуется в отдельном источнике
   let armMarker = null, animReq = 0, animTimer = null, animMarkers = [], flowReq = 0;
+  let lastMousePoint = null, radialLngLat = null, boxSelecting = false, boxStart = null;
 
   const $ = (id) => document.getElementById(id);
 
@@ -84,15 +86,43 @@
     return rings;
   }
 
+  function isTowerSelected(id) {
+    if (id === state.selectedId) return true;
+    if (state.selectedTowers && state.selectedTowers.includes(id)) return true;
+    return false;
+  }
+
   function coverageFeatures(only) {         // only: undefined — все, кроме активной; id — только эта вышка
+    const isBest = state.coverageMode === 'best_server';
     const feats = [];
-    for (const t of state.towers) {
-      if (only === undefined ? t.id === activeId : t.id !== only) continue;
-      const rings = towerRings(t), sel = t.id === state.selectedId ? 1 : 0;
-      ZONES.forEach((z, k) => {
-        if (rings[k]) feats.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [rings[k]] },
-          properties: { fill: z.fill, stroke: z.stroke, sel } });
-      });
+    if (!isBest) {
+      for (const t of state.towers) {
+        if (only === undefined ? t.id === activeId : t.id !== only) continue;
+        const rings = towerRings(t), sel = isTowerSelected(t.id) ? 1 : 0;
+        ZONES.forEach((z, k) => {
+          if (rings[k]) feats.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [rings[k]] },
+            properties: { fill: z.fill, stroke: z.stroke, sel, pattern: '' } });
+        });
+      }
+    } else {
+      // Режим лучшей силы (штриховка):
+      // Отрисовка от слабых зон к наилучшим (Weak -> Good -> Excellent -> Green).
+      // Таким образом на стыке и наложении двух вышек побеждает и виден лучший уровень сигнала.
+      for (let k = 0; k < ZONES.length; k++) {
+        const z = ZONES[k];
+        const patId = 'hatch-' + z.name;
+        for (const t of state.towers) {
+          if (only === undefined ? t.id === activeId : t.id !== only) continue;
+          const rings = towerRings(t), sel = isTowerSelected(t.id) ? 1 : 0;
+          if (rings[k]) {
+            feats.push({
+              type: 'Feature',
+              geometry: { type: 'Polygon', coordinates: [rings[k]] },
+              properties: { fill: z.fill, stroke: z.stroke, sel, pattern: patId }
+            });
+          }
+        }
+      }
     }
     return { type: 'FeatureCollection', features: feats };
   }
@@ -102,7 +132,7 @@
       const t = previewOf(t0);
       return { type: 'Feature', geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
         properties: { id: t.id, name: t.name, color: 'rgb(' + t.color.slice(0, 3).join(',') + ')',
-          sel: t.id === state.selectedId ? 1 : 0 } };
+          sel: isTowerSelected(t.id) ? 1 : 0 } };
     }) };
   }
   const toRing = (poly) => { const r = poly.map((p) => [p[1], p[0]]); r.push(r[0].slice()); return r; };
@@ -700,6 +730,49 @@
     deckOverlay.setProps({ layers });
   }
 
+  /* ---------------- узоры штриховки и слои карты ---------------- */
+  function createHatchImage(strokeColor, bgColor, angleDeg, lineWidth, step) {
+    const size = 32;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const ctx = c.getContext('2d');
+    if (bgColor) {
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, size, size);
+    }
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = lineWidth || 2.5;
+    ctx.lineCap = 'square';
+    const rad = (angleDeg || 45) * Math.PI / 180;
+    const cos = Math.cos(rad), sin = Math.sin(rad);
+    for (let x = -size * 2; x <= size * 3; x += (step || 8)) {
+      ctx.beginPath();
+      ctx.moveTo(x, -size);
+      ctx.lineTo(x + size * 4 * cos, -size + size * 4 * sin);
+      ctx.stroke();
+    }
+    return ctx.getImageData(0, 0, size, size);
+  }
+
+  function initPatterns() {
+    if (!map) return;
+    const defs = [
+      { id: 'hatch-green', stroke: '#2ecc71', bg: 'rgba(46,204,113,0.30)', angle: 45, width: 2.8, step: 8 },
+      { id: 'hatch-excellent', stroke: '#a3d945', bg: 'rgba(163,217,69,0.25)', angle: 45, width: 2.2, step: 8 },
+      { id: 'hatch-good', stroke: '#f1c40f', bg: 'rgba(241,196,15,0.22)', angle: -45, width: 2.2, step: 9 },
+      { id: 'hatch-weak', stroke: '#e76432', bg: 'rgba(231,100,50,0.18)', angle: 0, width: 2.0, step: 10 },
+    ];
+    for (const d of defs) {
+      try {
+        if (map.hasImage(d.id)) map.removeImage(d.id);
+        const img = createHatchImage(d.stroke, d.bg, d.angle, d.width, d.step);
+        map.addImage(d.id, img);
+      } catch (err) {
+        console.warn('initPatterns error for ' + d.id + ':', err);
+      }
+    }
+  }
+
   /* ---------------- слои карты (пересоздаются при смене подложки) ---------------- */
   function setupLayers() {
     if (map.getSource('coverage')) return;
@@ -707,7 +780,11 @@
       'netlinks', 'flow', 'trfusers', 'trflines']) map.addSource(id, { type: 'geojson', data: EMPTY });
     for (const src of ['coverage', 'coverage-active']) {
       map.addLayer({ id: src + '-fill', type: 'fill', source: src,
+        filter: ['==', ['coalesce', ['get', 'pattern'], ''], ''],
         paint: { 'fill-color': ['get', 'fill'], 'fill-opacity': 0.75 } });
+      map.addLayer({ id: src + '-hatch', type: 'fill', source: src,
+        filter: ['!=', ['coalesce', ['get', 'pattern'], ''], ''],
+        paint: { 'fill-pattern': ['get', 'pattern'], 'fill-opacity': 0.95 } });
       map.addLayer({ id: src + '-outline', type: 'line', source: src,
         paint: { 'line-color': ['get', 'stroke'], 'line-opacity': 0.85,
           'line-width': ['case', ['==', ['get', 'sel'], 1], 3, 1.2] } });
@@ -798,6 +875,220 @@
     if (state.draft.length >= 3) send({ type: 'zone', kind, polygon: state.draft.slice() });
     state.draft = []; renderDraft();
   }
+  /* ---------------- Круговое меню (Ctrl+A / Pie Menu) ---------------- */
+  const RADIAL_DATA = [
+    {
+      id: 'towers',
+      label: 'Вышки и Антенны',
+      icon: '🗼',
+      color: '#ff5d5d',
+      subitems: [
+        { name: 'Huawei AAU 5G (64T64R)', type: 'tower', preset: 'Huawei AAU5613' },
+        { name: 'Ericsson AIR 3268', type: 'tower', preset: 'Ericsson AIR 3268' },
+        { name: 'Kathrein 80010865 (65°)', type: 'tower', preset: 'Kathrein 80010865' },
+        { name: 'CommScope RVV-65D-R5', type: 'tower', preset: 'CommScope RVV-65D-R5' },
+        { name: 'Базовая станция (круговая)', type: 'tower', preset: 'Базовая станция (круговая)' },
+        { name: 'Сектор 120° (LTE)', type: 'tower', preset: 'Сектор 120°' }
+      ]
+    },
+    {
+      id: 'structures',
+      label: 'Опоры и Каркасы',
+      icon: '🏗️',
+      color: '#ff9f1c',
+      subitems: [
+        { name: 'Решётчатая башня 45 м', type: 'structure', kind: 'lattice', height: 45 },
+        { name: 'Решётчатая башня 30 м', type: 'structure', kind: 'lattice', height: 30 },
+        { name: 'Мачта на оттяжках 25 м', type: 'structure', kind: 'guyed', height: 25 },
+        { name: 'Монополь 20 м', type: 'structure', kind: 'monopole', height: 20 },
+        { name: 'Трубостойка на крышу 5 м', type: 'structure', kind: 'roof_mast', height: 5 },
+        { name: 'Столб освещения 10 м', type: 'structure', kind: 'pole', height: 10 }
+      ]
+    },
+    {
+      id: 'switches',
+      label: 'Коммутаторы L2/L3',
+      icon: '🔀',
+      color: '#3e8bff',
+      subitems: [
+        { name: 'L2 Доступ, 24×1G PoE+', type: 'device', model: 'sw_l2_24poe' },
+        { name: 'L2 Промышленный 8×PoE+', type: 'device', model: 'sw_l2_8poe' },
+        { name: 'L2 Доступ, 48×1G PoE+', type: 'device', model: 'sw_l2_48poe' },
+        { name: 'L3 Агрегация 24×10G SFP+', type: 'device', model: 'sw_l3_agg10' },
+        { name: 'Multi-Gig 24×(до 10G) PoE++', type: 'device', model: 'sw_mgig_24bt' }
+      ]
+    },
+    {
+      id: 'routers',
+      label: 'Маршрутизаторы',
+      icon: '🌐',
+      color: '#2ec4b6',
+      subitems: [
+        { name: 'Cell Site Router (CSR)', type: 'device', model: 'rt_csr' },
+        { name: 'Агрегирующий роутер', type: 'device', model: 'rt_agg' },
+        { name: 'Маршрутизатор ядра (PE)', type: 'device', model: 'rt_pe' },
+        { name: 'Межсетевой экран (NGFW)', type: 'device', model: 'fw_ngfw' }
+      ]
+    },
+    {
+      id: 'core',
+      label: 'Ядро сети и Серверы',
+      icon: '🖥️',
+      color: '#30c26f',
+      subitems: [
+        { name: 'Ядро сети (5GC / EPC)', type: 'device', model: 'core_5gc' },
+        { name: 'Макро-БС 5G NR (gNB)', type: 'device', model: 'bs_macro_5g' },
+        { name: 'Макро-БС LTE (eNodeB)', type: 'device', model: 'bs_macro_lte' },
+        { name: 'Малая сота (Small Cell)', type: 'device', model: 'bs_small' }
+      ]
+    },
+    {
+      id: 'radio_ptp',
+      label: 'Радиорелейные линии',
+      icon: '📡',
+      color: '#ff4d9d',
+      subitems: [
+        { name: 'РРЛ 6–42 ГГц (традиционная)', type: 'device', model: 'mw_trad' },
+        { name: 'РРЛ E-band 71–86 ГГц (10G)', type: 'device', model: 'mw_eband' },
+        { name: 'РРЛ V-band 57–66 ГГц (PoE)', type: 'device', model: 'mw_vband' }
+      ]
+    }
+  ];
+
+  function polarToCartesian(cx, cy, r, angleInDegrees) {
+    const angleInRadians = (angleInDegrees - 90) * Math.PI / 180.0;
+    return {
+      x: cx + (r * Math.cos(angleInRadians)),
+      y: cy + (r * Math.sin(angleInRadians))
+    };
+  }
+
+  function describeDonutSegment(cx, cy, rIn, rOut, startAngle, endAngle) {
+    const p1 = polarToCartesian(cx, cy, rOut, startAngle);
+    const p2 = polarToCartesian(cx, cy, rOut, endAngle);
+    const p3 = polarToCartesian(cx, cy, rIn, endAngle);
+    const p4 = polarToCartesian(cx, cy, rIn, startAngle);
+    const largeArc = endAngle - startAngle <= 180 ? '0' : '1';
+    return [
+      'M', p1.x, p1.y,
+      'A', rOut, rOut, 0, largeArc, 1, p2.x, p2.y,
+      'L', p3.x, p3.y,
+      'A', rIn, rIn, 0, largeArc, 0, p4.x, p4.y,
+      'Z'
+    ].join(' ');
+  }
+
+  function buildRadialMenu() {
+    const svg = $('radial-svg');
+    if (!svg) return;
+    svg.innerHTML = '';
+    const n = RADIAL_DATA.length;
+    const stepDeg = 360 / n;
+    const cx = 250, cy = 250;
+    const rIn = 48, rOut = 135;
+
+    RADIAL_DATA.forEach((cat, i) => {
+      const startAngle = i * stepDeg + 2;
+      const endAngle = (i + 1) * stepDeg - 2;
+      const midAngle = (startAngle + endAngle) / 2;
+
+      const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      g.className.baseVal = 'radial-slice';
+
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', describeDonutSegment(cx, cy, rIn, rOut, startAngle, endAngle));
+      path.setAttribute('fill', cat.color);
+      path.setAttribute('fill-opacity', '0.80');
+      path.setAttribute('stroke', '#ffffff');
+      path.setAttribute('stroke-width', '1.5');
+      path.setAttribute('stroke-opacity', '0.6');
+      g.appendChild(path);
+
+      const pos = polarToCartesian(cx, cy, (rIn + rOut) / 2, midAngle);
+
+      const tIcon = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      tIcon.setAttribute('x', pos.x);
+      tIcon.setAttribute('y', pos.y - 4);
+      tIcon.setAttribute('text-anchor', 'middle');
+      tIcon.setAttribute('dominant-baseline', 'central');
+      tIcon.setAttribute('font-size', '20');
+      tIcon.textContent = cat.icon;
+      g.appendChild(tIcon);
+
+      const tText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      tText.setAttribute('x', pos.x);
+      tText.setAttribute('y', pos.y + 16);
+      tText.setAttribute('text-anchor', 'middle');
+      tText.setAttribute('dominant-baseline', 'central');
+      tText.setAttribute('font-size', '10');
+      tText.setAttribute('font-weight', '700');
+      tText.setAttribute('fill', '#ffffff');
+      tText.textContent = cat.label;
+      g.appendChild(tText);
+
+      g.addEventListener('mouseenter', () => {
+        showRadialSubMenu(cat, midAngle);
+      });
+
+      svg.appendChild(g);
+    });
+  }
+
+  function showRadialSubMenu(cat, midAngle) {
+    const box = $('radial-sub-box');
+    if (!box) return;
+    const rad = (midAngle - 90) * Math.PI / 180;
+    const dist = 168;
+    const cx = 250 + dist * Math.cos(rad);
+    const cy = 250 + dist * Math.sin(rad);
+
+    box.style.left = (cx - 75) + 'px';
+    box.style.top = (cy - 40) + 'px';
+    box.innerHTML = '<div style="font-weight:700; color:' + cat.color + '; margin-bottom:5px; font-size:12px;">' + cat.icon + ' ' + cat.label + '</div>';
+
+    cat.subitems.forEach((item) => {
+      const row = document.createElement('div');
+      row.className = 'radial-sub-item';
+      let tag = item.type === 'tower' ? 'Антенна' : (item.type === 'structure' ? (item.height + ' м') : 'Сеть');
+      row.innerHTML = '<span>' + item.name + '</span><span class="sub-tag">' + tag + '</span>';
+      row.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        closeRadialMenu();
+        const pos = radialLngLat || (state.mouse || map.getCenter());
+        send({
+          type: 'radial_select',
+          item: item,
+          lat: pos.lat,
+          lon: pos.lng !== undefined ? pos.lng : pos.lon
+        });
+      });
+      box.appendChild(row);
+    });
+    box.style.display = 'block';
+  }
+
+  function closeRadialMenu() {
+    const ov = $('radial-overlay');
+    if (ov) ov.style.display = 'none';
+    const box = $('radial-sub-box');
+    if (box) box.style.display = 'none';
+  }
+
+  function openRadialMenu(x, y) {
+    const ov = $('radial-overlay');
+    const menu = $('radial-menu');
+    if (!ov || !menu) return;
+    radialLngLat = state.mouse || map.getCenter();
+    const cx = Math.max(260, Math.min(window.innerWidth - 260, x || window.innerWidth / 2));
+    const cy = Math.max(260, Math.min(window.innerHeight - 260, y || window.innerHeight / 2));
+    menu.style.left = cx + 'px';
+    menu.style.top = cy + 'px';
+    buildRadialMenu();
+    ov.style.display = 'block';
+    const box = $('radial-sub-box');
+    if (box) box.style.display = 'none';
+  }
+
   function undoLast() {
     if (state.cableFrom) { state.cableFrom = null; renderArm(); renderDraft(); return; }   // отмена начатого кабеля
     if (state.mode === 'measure') { state.measure.pop(); renderMeasure(); send({ type: 'measure', points: state.measure.slice() }); }
@@ -818,7 +1109,12 @@
         if (state.mode === 'select') send({ type: 'select', id: null });
         break;
       }
-      case 'device': send({ type: 'net_place', lat, lon }); break;
+      case 'device': {
+        const pitch = map.getPitch ? map.getPitch() : 0;
+        const bearing = map.getBearing ? map.getBearing() : 0;
+        send({ type: 'net_place', lat, lon, pitch, bearing });
+        break;
+      }
       case 'cable': case 'pdu': {
         const d = pickDevice(e.point, e);
         if (!d) {
@@ -832,7 +1128,19 @@
         send({ type: state.mode === 'cable' ? 'net_connect' : 'net_pdu', a, b: d.id });
         break;
       }
-      case 'place': send({ type: 'place', lat, lon }); break;
+      case 'place': {
+        const pitch = map.getPitch ? map.getPitch() : 0;
+        const bearing = map.getBearing ? map.getBearing() : 0;
+        let bldHeight = 0;
+        try {
+          const feats = map.queryRenderedFeatures(e.point, { layers: ['3d-buildings-extrusion'] });
+          if (feats && feats.length) {
+            bldHeight = feats[0].properties.render_height || feats[0].properties.height || 15;
+          }
+        } catch (err) {}
+        send({ type: 'place', lat, lon, pitch, bearing, bld_height: bldHeight });
+        break;
+      }
       case 'probe': send({ type: 'probe', lat, lon }); break;
       case 'measure':
         state.measure.push([lat, lon]); renderMeasure();
@@ -928,6 +1236,8 @@
     animate,
     setTraffic(t) { state.traffic = t; renderTraffic(); },
     clearTraffic() { state.traffic = null; renderTraffic(); },
+    setCoverageMode(mode) { state.coverageMode = mode; renderCoverage(); },
+    openRadialMenu(x, y) { openRadialMenu(x, y); },
     getState() { return state; },
     project(lat, lon) { const p = map.project([lon, lat]); return [p.x, p.y]; },   // для проверок/отладки
   };
@@ -944,15 +1254,35 @@
   map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
   map.on('style.load', () => {
+    initPatterns();
     setupLayers();
-    if (!deckOverlay && typeof deck !== 'undefined') {
-      deckOverlay = new deck.MapboxOverlay({ interleaved: true, layers: [] });
-      map.addControl(deckOverlay);
+    if (deckOverlay) {
+      try { map.removeControl(deckOverlay); } catch (e) {}
+      deckOverlay = null;
+    }
+    if (typeof deck !== 'undefined') {
+      try {
+        deckOverlay = new deck.MapboxOverlay({ interleaved: true, layers: [] });
+        map.addControl(deckOverlay);
+      } catch (e) {
+        console.warn('deckOverlay init error: ' + e);
+      }
     }
     deckKey = '';
     renderDeck();
     drawLabels();
-    if (!state.ready) { state.ready = true; send({ type: 'ready' }); }
+    renderCoverage();
+    renderNet();
+    renderZones();
+    renderMeasure();
+    renderDraft();
+    renderTraffic();
+    if (!state.ready) {
+      state.ready = true;
+      send({ type: 'ready' });
+    } else {
+      send({ type: 'style_loaded' });
+    }
   });
   map.on('render', drawLabels);
   map.on('error', (e) => { if (e && e.error) console.warn('map error: ' + e.error.message); });
@@ -962,7 +1292,18 @@
     window.addEventListener('mouseup', () => { if (state.towerDrag && !state.towerDrag.done) endTowerDrag(); });
   }
   map.on('zoom', () => { if (!azDragging) renderAzimuthHandle(); });
-  map.on('mousedown', (e) => {              // перенос вышки: нажать на неё в режиме «Навигация» и тянуть
+  map.on('mousedown', (e) => {              // перенос вышки или рамка выделения (Shift + drag)
+    lastMousePoint = e.point ? { x: e.point.x, y: e.point.y } : null;
+    if (e.originalEvent && (e.originalEvent.shiftKey || state.mode === 'select')) {
+      const tgt = e.originalEvent && e.originalEvent.target;
+      if (!tgt || (!tgt.closest('.az-handle') && !tgt.closest('.net-dev'))) {
+        boxSelecting = true;
+        boxStart = { x: e.point.x, y: e.point.y };
+        map.dragPan.disable();
+        if (e.preventDefault) e.preventDefault();
+        return;
+      }
+    }
     if (state.mode !== 'navigate' || deviceFromEvent(e) || (e.originalEvent && e.originalEvent.button)) return;
     const tgt = e.originalEvent && e.originalEvent.target;
     if (tgt && tgt.closest && tgt.closest('.az-handle')) return;
@@ -971,7 +1312,41 @@
     if (e.preventDefault) e.preventDefault();                 // карту при этом не панорамируем
     startTowerDrag(t, e);
   });
-  map.on('mouseup', () => { if (state.towerDrag && !state.towerDrag.done) endTowerDrag(); });
+  map.on('mouseup', (e) => {
+    if (state.towerDrag && !state.towerDrag.done) endTowerDrag();
+    if (boxSelecting) {
+      boxSelecting = false;
+      map.dragPan.enable();
+      const selEl = $('selection-box');
+      if (selEl) selEl.style.display = 'none';
+      if (boxStart && e && e.point) {
+        const minX = Math.min(boxStart.x, e.point.x), maxX = Math.max(boxStart.x, e.point.x);
+        const minY = Math.min(boxStart.y, e.point.y), maxY = Math.max(boxStart.y, e.point.y);
+        const w = maxX - minX, h = maxY - minY;
+        boxStart = null;
+        if (w > 8 && h > 8) {
+          const selTowers = [];
+          for (const t of state.towers) {
+            const p = map.project([t.lon, t.lat]);
+            if (p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY) selTowers.push(t.id);
+          }
+          const selDevs = [];
+          if (state.net && state.net.devices) {
+            for (const d of state.net.devices) {
+              const p = map.project([d.lon, d.lat]);
+              if (p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY) selDevs.push(d.id);
+            }
+          }
+          state.selectedTowers = selTowers;
+          state.selectedDevices = selDevs;
+          if (selTowers.length > 0) state.selectedId = selTowers[0];
+          renderCoverage();
+          renderNet();
+          send({ type: 'selection_box', tower_ids: selTowers, dev_ids: selDevs });
+        }
+      }
+    }
+  });
   map.on('click', onClick);
   map.on('dblclick', onDblClick);
   map.on('contextmenu', (e) => { e.preventDefault(); undoLast(); });
@@ -981,6 +1356,20 @@
     if (!e || !e.lngLat) return;
     const now = Date.now();
     state.mouse = e.lngLat;
+    lastMousePoint = e.point ? { x: e.point.x, y: e.point.y } : null;
+    if (boxSelecting && boxStart) {
+      const minX = Math.min(boxStart.x, e.point.x), maxX = Math.max(boxStart.x, e.point.x);
+      const minY = Math.min(boxStart.y, e.point.y), maxY = Math.max(boxStart.y, e.point.y);
+      const selEl = $('selection-box');
+      if (selEl) {
+        selEl.style.left = minX + 'px';
+        selEl.style.top = minY + 'px';
+        selEl.style.width = (maxX - minX) + 'px';
+        selEl.style.height = (maxY - minY) + 'px';
+        selEl.style.display = 'block';
+      }
+      return;
+    }
     if (state.towerDrag && !state.towerDrag.done) {
       if (e.originalEvent && e.originalEvent.buttons !== undefined && (e.originalEvent.buttons & 1) === 0) {
         endTowerDrag();
@@ -999,5 +1388,31 @@
       send({ type: 'hover_load', lat: e.lngLat.lat, lon: e.lngLat.lng });
     }
   });
-  document.addEventListener('keydown', onKey);
+
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      closeRadialMenu();
+      state.draft = []; state.cableFrom = null; renderArm(); renderDraft(); clearAnim();
+      send({ type: 'mode', mode: 'navigate' });
+      return;
+    }
+    if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'a' || ev.key === 'A' || ev.code === 'KeyA')) {
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) return;
+      ev.preventDefault();
+      const p = lastMousePoint || { x: (window.innerWidth || 800) / 2, y: (window.innerHeight || 600) / 2 };
+      openRadialMenu(p.x, p.y);
+      return;
+    }
+    onKey(ev);
+  });
+
+  const radialOverlay = $('radial-overlay');
+  if (radialOverlay) {
+    radialOverlay.addEventListener('click', (ev) => {
+      if (ev.target === radialOverlay || (ev.target.closest && ev.target.closest('#radial-center'))) {
+        closeRadialMenu();
+      }
+    });
+  }
 })();

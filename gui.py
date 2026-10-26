@@ -206,6 +206,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._mode_actions = {}
         self._undo_stack = []
         self._is_undoing = False
+        self._clipboard_towers = []
+        self._clipboard_devices = []
+        self._clipboard_center = None
+        self.selected_ids = []
+        self.coverage_mode = "standard"
 
         self.init_ui()
         self.apply_theme(self.theme_name)
@@ -253,6 +258,73 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             else:
                 self.act_undo.setEnabled(False)
                 self.act_undo.setToolTip("<b>Отменить (Ctrl+Z)</b><br>Нет действий для отмены")
+
+    def toggle_coverage_mode(self, checked):
+        """Переключение режима отображения зон: обычный или лучшая сила (штриховка)."""
+        self.coverage_mode = "best_server" if checked else "standard"
+        self._js(f"api.setCoverageMode('{self.coverage_mode}');")
+        msg = ("Режим зон: лучшая сила сигнала (штриховка)" if checked
+               else "Режим зон: стандартный (наложение)")
+        self.statusBar().showMessage(msg)
+
+    def trigger_radial_menu(self):
+        """Открытие кругового меню выбора оборудования (Ctrl+A)."""
+        self._js("api.openRadialMenu();")
+
+    def copy_selected(self):
+        """Копирование выбранных вышек в буфер обмена (Ctrl+C)."""
+        towers_to_copy = []
+        if self.selected_ids:
+            towers_to_copy = [t for t in self.towers if t.db_id in self.selected_ids]
+        if not towers_to_copy:
+            cur = self._current_tower()
+            if cur:
+                towers_to_copy = [cur]
+        if not towers_to_copy:
+            self.statusBar().showMessage("Нет выбранных вышек для копирования (выделите рамкой Shift+ЛКМ или кликом).")
+            return
+        self._clipboard_towers = [t.to_dict() for t in towers_to_copy]
+        c_lat = sum(t["lat"] for t in self._clipboard_towers) / len(self._clipboard_towers)
+        c_lon = sum(t["lon"] for t in self._clipboard_towers) / len(self._clipboard_towers)
+        self._clipboard_center = (c_lat, c_lon)
+        self.statusBar().showMessage(f"Скопировано в буфер: вышек — {len(self._clipboard_towers)} (Ctrl+V для вставки).")
+
+    def paste_from_clipboard(self):
+        """Вставка вышек из буфера обмена (Ctrl+V) со сдвигом или в точку курсора."""
+        if not self._clipboard_towers or not self._clipboard_center:
+            self.statusBar().showMessage("Буфер обмена пуст. Сначала скопируйте вышку (Ctrl+C).")
+            return
+        target_lat, target_lon = None, None
+        if self._hover_point:
+            target_lat, target_lon = self._hover_point
+        else:
+            target_lat = self._clipboard_center[0] - 0.0004
+            target_lon = self._clipboard_center[1] + 0.0006
+        c_lat, c_lon = self._clipboard_center
+        jobs = []
+        new_names = []
+        for t_data in self._clipboard_towers:
+            dlat = t_data["lat"] - c_lat
+            dlon = t_data["lon"] - c_lon
+            p_lat = target_lat + dlat
+            p_lon = target_lon + dlon
+            name = self._next_name()
+            new_names.append(name)
+            job = self._job_from_type(name, p_lat, p_lon, t_data.get("type_name"), t_data)
+            job["params"] = {k: t_data[k] for k in PARAM_KEYS}
+            job["mount"] = t_data.get("mount")
+            jobs.append(job)
+        if jobs:
+            self._enqueue(jobs)
+            def undo_paste():
+                for n in new_names:
+                    tw = next((x for x in self.towers if x.name == n), None)
+                    if tw:
+                        self.db.delete_tower(tw.db_id)
+                        self.towers = [x for x in self.towers if x.db_id != tw.db_id]
+                self._refresh_all()
+            self.push_undo(undo_paste, f"Вставка {len(jobs)} вышек")
+            self.statusBar().showMessage(f"Вставлено вышек: {len(jobs)}.")
 
     def _act(self, text, icon=None, slot=None, checkable=False, shortcut=None, tip=None):
         act = QAction(text, self)
@@ -360,7 +432,18 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.act_undo = self._act("Отменить", "undo", self.undo, shortcut=QKeySequence.StandardKey.Undo,
                                   tip="<b>Отменить (Ctrl+Z / Cmd+Z)</b><br>Отмена последнего действия: размещение, перемещение, удаление вышки, поворот азимута, параметры.")
         self.act_undo.setEnabled(False)
+        self.act_copy = self._act("Копировать", "copy", self.copy_selected, shortcut=QKeySequence.StandardKey.Copy,
+                                  tip="<b>Копировать (Ctrl+C / Cmd+C)</b><br>Копировать выбранные вышки в буфер обмена.")
+        self.act_paste = self._act("Вставить", "clipboard", self.paste_from_clipboard, shortcut=QKeySequence.StandardKey.Paste,
+                                   tip="<b>Вставить (Ctrl+V / Cmd+V)</b><br>Вставить вышки из буфера обмена в точку курсора.")
+        self.act_best_server = self._act("Штриховка (лучший сигнал)", "hatch", self.toggle_coverage_mode, checkable=True,
+                                         tip="<b>Штриховка покрытия (лучший сигнал)</b><br>Отображение зон со штриховкой: наложение вышек показывает лучшую силу сигнала.")
+        self.act_radial = self._act("Круговое меню", "radial", self.trigger_radial_menu, shortcut="Ctrl+A",
+                                    tip="<b>Круговое меню (Ctrl+A)</b><br>Быстрый круговой выбор всех типов вышек, опор и сетевых устройств.")
         QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
+        QShortcut(QKeySequence("Ctrl+C"), self, activated=self.copy_selected)
+        QShortcut(QKeySequence("Ctrl+V"), self, activated=self.paste_from_clipboard)
+        QShortcut(QKeySequence("Ctrl+A"), self, activated=self.trigger_radial_menu)
         self.act_recalc = self._act("Пересчитать всё", "refresh", self.recalc_all, shortcut="F5",
                                     tip="<b>Пересчитать всё (F5)</b><br>Полный пересчёт зон покрытия всех вышек по зданиям.")
         self.act_antenna_catalog = self._act("Каталог антенн", "layers", self.open_antenna_catalog_dialog,
@@ -418,6 +501,10 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         m_edit = mb.addMenu("Правка")
         m_edit.addAction(self.act_undo)
         m_edit.addSeparator()
+        m_edit.addAction(self.act_copy)
+        m_edit.addAction(self.act_paste)
+        m_edit.addAction(self.act_radial)
+        m_edit.addSeparator()
         m_edit.addAction(self.act_edit)
         m_edit.addAction(self.act_delete)
         m = mb.addMenu("Инструменты")
@@ -428,6 +515,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             m.addAction(a)
         m = mb.addMenu("Вид")
         m.addAction(self.act_theme)
+        m.addAction(self.act_best_server)
         bm = m.addMenu("Подложка карты")
         for a in self.base_actions.values():
             bm.addAction(a)
@@ -444,9 +532,13 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         g = bar.add_group("Карта")
         g.add_action(m["navigate"])
         g.add_action(self.act_undo)
+        g.add_action(self.act_copy)
+        g.add_action(self.act_paste)
         g.add_action(self.act_goto)
         g = bar.add_group("Радиосеть")
         g.add_action(m["place"])
+        g.add_action(self.act_radial)
+        g.add_action(self.act_best_server)
         g.add_action(self.act_create_structure)
         g.add_action(self.act_antenna_catalog)
         g.add_action(self.act_edit)
@@ -815,8 +907,14 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     def _push_theme(self, force_base=False):
         if not self._map_ready:
             return
+        self._js_revs = {}
         self._js(f"api.setTheme('{self.theme_name}');")
         self._js(f"api.setBase('{self.base_name or self.theme_name}');")     # JS пропускает повтор той же подложки
+        self._push_towers()
+        self._push_net()
+        self._push_zones()
+        if getattr(self, "coverage_mode", "standard") != "standard":
+            self._js(f"api.setCoverageMode('{self.coverage_mode}');")
 
     # ------------------------------------------------------------------ #
     #  Связь с картой
@@ -865,7 +963,61 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     def _handle_map_event(self, ev):
         t = ev.get("type")
         if t == "place":
-            self.place_tower_at_coords(ev["lat"], ev["lon"])
+            self.place_tower_at_coords(ev["lat"], ev["lon"],
+                                       pitch=ev.get("pitch", 0.0),
+                                       bearing=ev.get("bearing", 0.0),
+                                       bld_height=ev.get("bld_height", 0.0))
+        elif t == "selection_box":
+            t_ids = ev.get("tower_ids", [])
+            self.selected_ids = t_ids
+            if len(t_ids) == 1:
+                self.select_tower_by_id(t_ids[0])
+            elif len(t_ids) > 1:
+                self.selected_id = t_ids[0]
+                self._update_action_states()
+                self.statusBar().showMessage(f"Выделено рамкой: вышек — {len(t_ids)} (Ctrl+C для копирования)")
+        elif t == "style_loaded":
+            self._js_revs = {}
+            self._push_towers()
+            self._push_net()
+            self._push_zones()
+            if getattr(self, "coverage_mode", "standard") != "standard":
+                self._js(f"api.setCoverageMode('{self.coverage_mode}');")
+        elif t == "radial_select":
+            item = ev.get("item", {})
+            lat = ev.get("lat")
+            lon = ev.get("lon")
+            itype = item.get("type")
+            if itype == "tower":
+                preset = item.get("preset")
+                if preset in self.tower_types:
+                    self.active_type_combo.setCurrentText(preset)
+                self.set_mode("place")
+                if lat and lon:
+                    self.place_tower_at_coords(lat, lon)
+            elif itype == "device":
+                model_id = item.get("model")
+                if hasattr(self, "net_set_model"):
+                    self.net_set_model(model_id)
+                self.set_mode("device")
+                if lat and lon:
+                    self.net_place_device(lat, lon)
+            elif itype == "structure":
+                try:
+                    import structures
+                    s = structures.create_structure(
+                        self.db.conn,
+                        name=item.get("name", "Каркас"),
+                        kind=item.get("kind", "lattice"),
+                        lat=lat or 47.0101,
+                        lon=lon or 28.8638,
+                        height=float(item.get("height", 30.0))
+                    )
+                    self.structures[s.id] = s
+                    self._push_towers()
+                    self.statusBar().showMessage(f"Создан каркас «{s.name}» (высота {s.height:.0f} м).")
+                except Exception as e:
+                    self.statusBar().showMessage(f"Ошибка создания каркаса: {e}")
         elif t == "select":
             self.select_tower_by_id(ev.get("id"))
         elif t == "hover_load":
@@ -1095,17 +1247,39 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                 best, best_d = s, d
         return best
 
-    def place_tower_at_coords(self, lat, lon):
+    def place_tower_at_coords(self, lat, lon, pitch=0.0, bearing=0.0, bld_height=0.0):
         if self._mode != "place":
             return
         type_name = self.active_type_combo.currentText()
         type_data = self.tower_types.get(type_name)
         if not type_data:
             return
-        # Антенна изначально не имеет собственной высоты от земли:
-        # 1. Прикрепляется к опорному каркасу вышки (если установлен рядом)
-        # 2. Либо монтируется на кровлю здания (высота крыши + стойка 3 м)
-        # 3. Либо остаётся незакреплённой (высота 0 м) до назначения монтажа
+
+        # Если камера наклонена (3D вид, pitch > 8°), луч клика по крыше пересекает землю далеко позади здания.
+        # Трассируем луч от точки пересечения земли обратно к камере, находя фактическую крышу здания:
+        if pitch > 8.0 and self.building_data:
+            import math
+            cam_az = (bearing + 180.0) % 360.0
+            rad_az = math.radians(cam_az)
+            cos_az, sin_az = math.cos(rad_az), math.sin(rad_az)
+            tan_pitch = math.tan(math.radians(pitch))
+            m_lat = 111320.0
+            m_lon = m_lat * math.cos(math.radians(lat))
+            hit_lat, hit_lon, hit_h = None, None, 0.0
+            for step_m in range(1, 160, 2):
+                ray_z = step_m / tan_pitch
+                test_lat = lat + (step_m * cos_az) / m_lat
+                test_lon = lon + (step_m * sin_az) / m_lon
+                try:
+                    h = float(self.building_data.heights_at([test_lat], [test_lon])[0])
+                    if h >= ray_z * 0.82:
+                        hit_lat, hit_lon, hit_h = test_lat, test_lon, h
+                        break
+                except Exception:
+                    pass
+            if hit_lat is not None and hit_h > 0.0:
+                lat, lon = hit_lat, hit_lon
+
         near_s = self._find_nearest_structure(lat, lon, max_dist_m=25.0)
         bld_h = 0.0
         if self.building_data:
@@ -1113,6 +1287,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                 bld_h = float(self.building_data.heights_at([lat], [lon])[0])
             except Exception:
                 bld_h = 0.0
+        if bld_h <= 0.0 and bld_height > 0.0:
+            bld_h = float(bld_height)
         if near_s:
             mount = {"type": "structure", "id": near_s.id, "offset": 0.0, "bld_h": 0.0}
             mount_h = near_s.height

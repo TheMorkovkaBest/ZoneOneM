@@ -62,10 +62,49 @@
     transform: translateY(-26px); white-space: nowrap; }
   .pkt-result.ok { background: #1f9d57; } .pkt-result.fail { background: #d63a40; }
   .maplibregl-ctrl-attrib { font-size: 10px; }
+  #selection-box { display: none; position: absolute; border: 2px dashed #3e8bff;
+    background: rgba(62,139,255,0.18); box-shadow: 0 0 12px rgba(62,139,255,0.45);
+    pointer-events: none; z-index: 20; border-radius: 4px; }
+
+  /* --- Radial Pie Menu (Ctrl+A) --- */
+  .radial-overlay { position: fixed; inset: 0; z-index: 50; display: none;
+    background: rgba(0,0,0,0.38); backdrop-filter: blur(3px); }
+  .radial-menu { position: absolute; transform: translate(-50%, -50%);
+    width: 500px; height: 500px; pointer-events: auto; }
+  .radial-center { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: 74px; height: 74px; border-radius: 50%; background: var(--panel);
+    border: 2px solid var(--border); box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: var(--text); font-size: 10px; font-weight: 700; text-align: center;
+    cursor: pointer; z-index: 60; transition: transform 0.15s ease, background 0.15s; }
+  .radial-center:hover { transform: translate(-50%, -50%) scale(1.06); background: rgba(62,139,255,0.25); }
+  .radial-center-icon { font-size: 20px; line-height: 1; margin-bottom: 2px; }
+  .radial-svg { width: 100%; height: 100%; overflow: visible; filter: drop-shadow(0 4px 16px rgba(0,0,0,0.5)); }
+  .radial-slice { cursor: pointer; transition: transform 0.16s ease, filter 0.16s ease; transform-origin: 250px 250px; }
+  .radial-slice:hover { filter: brightness(1.28) drop-shadow(0 0 8px rgba(255,255,255,0.35)); }
+  .radial-slice text { pointer-events: none; user-select: none; font-family: "Segoe UI", system-ui, sans-serif; }
+  .radial-sub-box { position: absolute; z-index: 70; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.7);
+    max-width: 260px; font-size: 11px; backdrop-filter: blur(10px); pointer-events: auto; }
+  .radial-sub-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 5px;
+    color: var(--text); cursor: pointer; font-weight: 600; transition: background 0.12s; }
+  .radial-sub-item:hover { background: rgba(62,139,255,0.3); color: #fff; }
+  .radial-sub-item .sub-tag { font-size: 9px; opacity: 0.7; font-weight: normal; margin-left: auto; }
 </style>
 </head>
 <body data-theme="dark">
   <div id="map"></div>
+  <div id="selection-box"></div>
+  <div id="radial-overlay" class="radial-overlay">
+    <div id="radial-menu" class="radial-menu">
+      <div id="radial-center" class="radial-center" title="Закрыть (Esc)">
+        <div class="radial-center-icon">⚡</div>
+        <div>Устройства</div>
+      </div>
+      <svg id="radial-svg" class="radial-svg" viewBox="0 0 500 500"></svg>
+      <div id="radial-sub-box" class="radial-sub-box" style="display:none;"></div>
+    </div>
+  </div>
   <div id="hud" class="panel"><span id="hud-coords">—</span></div>
   <div id="mode-indicator" class="panel"></div>
   <div id="legend" class="panel">
