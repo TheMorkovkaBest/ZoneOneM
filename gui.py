@@ -1308,6 +1308,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         job["mount"] = mount
         if self.chk_buildings.isChecked() and self.building_data:
             if not self.building_data.is_covered(lat, lon, BUILDINGS_NEED_M):
+                self.building_data.reset_cooldown()
                 self._request_buildings([(lat, lon)])
         self._enqueue([job])
 
@@ -1468,6 +1469,13 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     def recalc_all(self):
         if not self.towers:
             return
+        if self.building_data:
+            self.building_data.reset_cooldown()
+            if self.chk_buildings.isChecked():
+                missing = [t for t in self.towers
+                           if not self.building_data.is_covered(t.lat, t.lon, BUILDINGS_NEED_M)]
+                if missing:
+                    self._request_buildings([(t.lat, t.lon) for t in missing])
         self._enqueue([self._job_from_tower(t) for t in self.towers])
 
     # ------------------------------------------------------------------ #

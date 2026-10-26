@@ -28,13 +28,16 @@ TILE = 256
 # параллельно (по OVERPASS_PARALLEL), а первым идёт сервер, ответивший успешно в прошлый раз.
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
 ]
-OVERPASS_PARALLEL = 2
-HTTP_TIMEOUT = (6.0, 75.0)       # (соединение, чтение), с: большие ответы идут десятки секунд
+OVERPASS_PARALLEL = 3
+HTTP_TIMEOUT = (10.0, 60.0)       # (соединение, чтение), с
 FAIL_COOLDOWN_S = 20.0
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 ZoneM/1.0"
 RASTER_CHUNK = 200               # зданий за один захват блокировки (расчёт вышки не ждёт всю пачку)
 RASTER_FILE = "raster_cache.npz"
 RASTER_VERSION = 1
@@ -70,6 +73,112 @@ def parse_height(tags):
     return TYPE_HEIGHTS.get(tags.get("building", ""), DEFAULT_HEIGHT_M)
 
 
+def _urllib_download(url, query, headers):
+    """Запасной загрузчик из стандартной библиотеки Python (не требует requests).
+
+    Поддерживает системные прокси Windows, SSL с обходом проблемных сертификатов
+    (например, перехват антивирусом Касперского/ESET) и gzip-распаковку.
+    """
+    import gzip
+    import ssl
+    import urllib.parse
+    import urllib.request
+
+    contexts = []
+    try:
+        contexts.append(ssl.create_default_context())
+    except Exception:
+        pass
+    try:
+        contexts.append(ssl._create_unverified_context())
+    except Exception:
+        pass
+    if not contexts:
+        contexts.append(None)
+
+    encoded_data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+    last_err = None
+
+    for ctx in contexts:
+        # 1. Попытка POST
+        try:
+            req = urllib.request.Request(url, data=encoded_data, headers=headers)
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT[0] + HTTP_TIMEOUT[1], context=ctx) as r:
+                raw = r.read()
+                if r.headers.get("Content-Encoding") == "gzip" or (len(raw) >= 2 and raw[:2] == b"\x1f\x8b"):
+                    raw = gzip.decompress(raw)
+                data = json.loads(raw.decode("utf-8", errors="replace"))
+                remark = str(data.get("remark", ""))
+                if "error" in remark.lower():
+                    raise RuntimeError(remark[:120])
+                return data
+        except Exception as exc:
+            last_err = exc
+
+        # 2. Попытка GET (если сервер или прокси блокирует POST)
+        try:
+            get_url = f"{url}?{urllib.parse.urlencode({'data': query})}"
+            req = urllib.request.Request(get_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT[0] + HTTP_TIMEOUT[1], context=ctx) as r:
+                raw = r.read()
+                if r.headers.get("Content-Encoding") == "gzip" or (len(raw) >= 2 and raw[:2] == b"\x1f\x8b"):
+                    raw = gzip.decompress(raw)
+                data = json.loads(raw.decode("utf-8", errors="replace"))
+                remark = str(data.get("remark", ""))
+                if "error" in remark.lower():
+                    raise RuntimeError(remark[:120])
+                return data
+        except Exception as exc2:
+            last_err = exc2
+            continue
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("Не удалось получить ответ через urllib")
+
+
+def _download_from_url(url, query, headers):
+    """Скачивание с одного URL с автоматическим выбором requests / urllib и обходом SSL-ошибок Windows."""
+    if requests is not None:
+        try:
+            resp = requests.post(url, data={"data": query}, headers=headers, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 200:
+                data = resp.json()
+                remark = str(data.get("remark", ""))
+                if "error" in remark.lower():
+                    raise RuntimeError(remark[:120])
+                return data
+            elif resp.status_code in (403, 405):
+                resp = requests.get(url, params={"data": query}, headers=headers, timeout=HTTP_TIMEOUT)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    remark = str(data.get("remark", ""))
+                    if "error" in remark.lower():
+                        raise RuntimeError(remark[:120])
+                    return data
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        except Exception as exc:
+            ssl_err_cls = getattr(getattr(requests, "exceptions", None), "SSLError", ())
+            if isinstance(exc, ssl_err_cls):
+                try:
+                    resp = requests.post(url, data={"data": query}, headers=headers, timeout=HTTP_TIMEOUT, verify=False)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        remark = str(data.get("remark", ""))
+                        if "error" in remark.lower():
+                            raise RuntimeError(remark[:120])
+                        return data
+                except Exception:
+                    pass
+            # Запасной путь через стандартную библиотеку urllib
+            try:
+                return _urllib_download(url, query, headers)
+            except Exception:
+                raise exc
+
+    return _urllib_download(url, query, headers)
+
+
 class BuildingData:
     def __init__(self, cache_dir=None):
         self.buildings = []           # список dict(id, height, poly, bbox) — для совместимости
@@ -88,6 +197,11 @@ class BuildingData:
     # ------------------------------------------------------------------ #
     #  Загрузка
     # ------------------------------------------------------------------ #
+    def reset_cooldown(self):
+        """Сброс паузы после ошибки сети, чтобы повторная попытка (например, по F5) сработала немедленно."""
+        self._fail_until = 0.0
+        self.last_error = None
+
     def is_covered(self, lat, lon, need_m=400.0):
         """Есть ли уже загруженные данные, покрывающие область точки."""
         with self._lock:
@@ -120,9 +234,6 @@ class BuildingData:
             # пока ждали блокировку, другой поток мог скачать этот же район — второй запрос не нужен
             if self.is_covered(lat, lon, need_m):
                 return True
-            if requests is None:
-                self.last_error = "не установлен модуль requests"
-                return False
             if time.time() < self._fail_until:      # недавно была ошибка сети — не долбим сервер
                 return False
             self.status = "загрузка зданий…"
@@ -151,17 +262,15 @@ class BuildingData:
         """Запрос к серверам Overpass: по OVERPASS_PARALLEL одновременно, побеждает первый успешный ответ."""
         urls = sorted(OVERPASS_URLS, key=lambda u: u != self._good_url)
         results = queue.Queue()
-        headers = {'User-Agent': 'ZoneM/1.0 (radio planning student project)'}
+        headers = {
+            'User-Agent': USER_AGENT,
+            'Accept': 'application/json',
+            'Accept-Encoding': 'gzip, deflate',
+        }
 
         def worker(url):
             try:
-                resp = requests.post(url, data={'data': query}, headers=headers, timeout=HTTP_TIMEOUT)
-                if resp.status_code != 200:
-                    raise RuntimeError(f"HTTP {resp.status_code}")
-                data = resp.json()
-                remark = str(data.get('remark', ''))
-                if 'error' in remark.lower():       # тайм-аут на сервере: ответ неполный, в кэш его нельзя
-                    raise RuntimeError(remark[:120])
+                data = _download_from_url(url, query, headers)
                 results.put((url, data, None))
             except Exception as exc:             # сеть/JSON — пробуем следующий сервер
                 results.put((url, None, exc))
@@ -259,7 +368,12 @@ class BuildingData:
                         "ids": [i for i in self._ids if isinstance(i, (str, int))], "sources": self._sources()}
             tmp = self._raster_path().with_suffix(".tmp.npz")
             np.savez_compressed(tmp, keys=keys, tiles=tiles, meta=np.array(json.dumps(meta)))
-            tmp.replace(self._raster_path())
+            try:
+                tmp.replace(self._raster_path())
+            except PermissionError:
+                # На Windows файл может быть кратковременно заблокирован антивирусом
+                time.sleep(0.05)
+                tmp.replace(self._raster_path())
         except Exception as exc:
             self.last_error = f"растр не сохранён: {exc}"
 
@@ -267,7 +381,12 @@ class BuildingData:
         try:
             with np.load(self._raster_path()) as z:
                 meta = json.loads(str(z["meta"]))
-                if meta.get("version") != RASTER_VERSION or [list(s) for s in sources] != meta.get("sources"):
+                cached_sources = meta.get("sources", [])
+                source_names = {s[0] for s in sources}
+                cached_names = {s[0] for s in cached_sources}
+                # На Windows при git-клонировании с core.autocrlf размер overpass_*.json меняется из-за перевода строк.
+                # Сравниваем состав файлов по именам.
+                if meta.get("version") != RASTER_VERSION or source_names != cached_names:
                     return False                      # появились/изменились ответы Overpass — пересобрать
                 keys, tiles = z["keys"], z["tiles"]
         except (OSError, KeyError, ValueError):

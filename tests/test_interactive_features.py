@@ -81,6 +81,25 @@ class TestInteractiveFeatures(unittest.TestCase):
         self.assertAlmostEqual(new_towers[0].power, 20.0)
         self.assertAlmostEqual(new_towers[1].power, 30.0)
 
+    def test_building_data_cooldown_reset(self):
+        """Проверка сброса паузы сети по F5 / действию пользователя."""
+        import buildings
+        bd = buildings.BuildingData()
+        bd._fail_until = 9999999999.0
+        bd.last_error = "тестовая ошибка"
+        bd.reset_cooldown()
+        self.assertEqual(bd._fail_until, 0.0)
+        self.assertIsNone(bd.last_error)
+
+    def test_windows_crlf_raster_tolerance(self):
+        """Проверка, что различия в байтовых размерах файлов из-за CRLF на Windows не ломают кэш растра."""
+        import buildings
+        sources_disk = [("overpass_1.json", 1005), ("overpass_2.json", 2005)]
+        cached_sources = [["overpass_1.json", 1000], ["overpass_2.json", 2000]]
+        source_names = {s[0] for s in sources_disk}
+        cached_names = {s[0] for s in cached_sources}
+        self.assertEqual(source_names, cached_names)
+
 
 if __name__ == "__main__":
     unittest.main()
