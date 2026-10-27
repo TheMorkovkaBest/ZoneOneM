@@ -107,7 +107,7 @@
     } else {
       // Режим лучшей силы (штриховка):
       // Отрисовка от слабых зон к наилучшим (Weak -> Good -> Excellent -> Green).
-      // Таким образом на стыке и наложении двух вышек побеждает и виден лучший уровень сигнала.
+      // Каждая более сильная зона перекрывает более слабую и оставляет только лучший уровень сигнала.
       for (let k = 0; k < ZONES.length; k++) {
         const z = ZONES[k];
         const patId = 'hatch-' + z.name;
@@ -118,7 +118,13 @@
             feats.push({
               type: 'Feature',
               geometry: { type: 'Polygon', coordinates: [rings[k]] },
-              properties: { fill: z.fill, stroke: z.stroke, sel, pattern: patId }
+              properties: {
+                fill: z.fill,
+                stroke: sel ? z.stroke : 'transparent',
+                sel,
+                pattern: patId,
+                isBest: 1
+              }
             });
           }
         }
@@ -756,11 +762,13 @@
 
   function initPatterns() {
     if (!map) return;
+    const isDark = (state.theme !== 'light');
+    const baseBg = isDark ? '#141820' : '#ffffff';
     const defs = [
-      { id: 'hatch-green', stroke: '#2ecc71', bg: 'rgba(46,204,113,0.30)', angle: 45, width: 2.8, step: 8 },
-      { id: 'hatch-excellent', stroke: '#a3d945', bg: 'rgba(163,217,69,0.25)', angle: 45, width: 2.2, step: 8 },
-      { id: 'hatch-good', stroke: '#f1c40f', bg: 'rgba(241,196,15,0.22)', angle: -45, width: 2.2, step: 9 },
-      { id: 'hatch-weak', stroke: '#e76432', bg: 'rgba(231,100,50,0.18)', angle: 0, width: 2.0, step: 10 },
+      { id: 'hatch-green', stroke: '#22c55e', bg: baseBg, angle: 45, width: 2.8, step: 8 },
+      { id: 'hatch-excellent', stroke: '#84cc16', bg: baseBg, angle: 45, width: 2.3, step: 9 },
+      { id: 'hatch-good', stroke: '#eab308', bg: baseBg, angle: -45, width: 2.2, step: 10 },
+      { id: 'hatch-weak', stroke: '#f97316', bg: baseBg, angle: 0, width: 2.0, step: 11 },
     ];
     for (const d of defs) {
       try {
@@ -875,13 +883,13 @@
     if (state.draft.length >= 3) send({ type: 'zone', kind, polygon: state.draft.slice() });
     state.draft = []; renderDraft();
   }
-  /* ---------------- Круговое меню (Ctrl+A / Pie Menu) ---------------- */
+  /* ---------------- Круговое меню (Ctrl+A / Quick Palette) ---------------- */
   const RADIAL_DATA = [
     {
       id: 'towers',
-      label: 'Вышки и Антенны',
+      label: 'Вышки и БС',
       icon: '🗼',
-      color: '#ff5d5d',
+      color: '#ef4444',
       subitems: [
         { name: 'Huawei AAU 5G (64T64R)', type: 'tower', preset: 'Huawei AAU5613' },
         { name: 'Ericsson AIR 3268', type: 'tower', preset: 'Ericsson AIR 3268' },
@@ -895,7 +903,7 @@
       id: 'structures',
       label: 'Опоры и Каркасы',
       icon: '🏗️',
-      color: '#ff9f1c',
+      color: '#f97316',
       subitems: [
         { name: 'Решётчатая башня 45 м', type: 'structure', kind: 'lattice', height: 45 },
         { name: 'Решётчатая башня 30 м', type: 'structure', kind: 'lattice', height: 30 },
@@ -907,9 +915,9 @@
     },
     {
       id: 'switches',
-      label: 'Коммутаторы L2/L3',
+      label: 'Коммутаторы',
       icon: '🔀',
-      color: '#3e8bff',
+      color: '#3b82f6',
       subitems: [
         { name: 'L2 Доступ, 24×1G PoE+', type: 'device', model: 'sw_l2_24poe' },
         { name: 'L2 Промышленный 8×PoE+', type: 'device', model: 'sw_l2_8poe' },
@@ -922,7 +930,7 @@
       id: 'routers',
       label: 'Маршрутизаторы',
       icon: '🌐',
-      color: '#2ec4b6',
+      color: '#06b6d4',
       subitems: [
         { name: 'Cell Site Router (CSR)', type: 'device', model: 'rt_csr' },
         { name: 'Агрегирующий роутер', type: 'device', model: 'rt_agg' },
@@ -932,9 +940,9 @@
     },
     {
       id: 'core',
-      label: 'Ядро сети и Серверы',
+      label: 'Ядро и Серверы',
       icon: '🖥️',
-      color: '#30c26f',
+      color: '#10b981',
       subitems: [
         { name: 'Ядро сети (5GC / EPC)', type: 'device', model: 'core_5gc' },
         { name: 'Макро-БС 5G NR (gNB)', type: 'device', model: 'bs_macro_5g' },
@@ -944,9 +952,9 @@
     },
     {
       id: 'radio_ptp',
-      label: 'Радиорелейные линии',
+      label: 'РРЛ Линии',
       icon: '📡',
-      color: '#ff4d9d',
+      color: '#ec4899',
       subitems: [
         { name: 'РРЛ 6–42 ГГц (традиционная)', type: 'device', model: 'mw_trad' },
         { name: 'РРЛ E-band 71–86 ГГц (10G)', type: 'device', model: 'mw_eband' },
@@ -984,50 +992,73 @@
     svg.innerHTML = '';
     const n = RADIAL_DATA.length;
     const stepDeg = 360 / n;
-    const cx = 250, cy = 250;
-    const rIn = 48, rOut = 135;
+    const cx = 220, cy = 220;
+    const rIn = 52, rOut = 142;
+    const isLight = (state.theme === 'light');
+    const bgFill = isLight ? 'rgba(255, 255, 255, 0.94)' : 'rgba(23, 28, 36, 0.94)';
+    const strokeCol = isLight ? '#d3dae4' : '#2b3443';
+    const textCol = isLight ? '#1c2430' : '#e6eaf0';
 
     RADIAL_DATA.forEach((cat, i) => {
-      const startAngle = i * stepDeg + 2;
-      const endAngle = (i + 1) * stepDeg - 2;
+      const startAngle = i * stepDeg + 1.5;
+      const endAngle = (i + 1) * stepDeg - 1.5;
       const midAngle = (startAngle + endAngle) / 2;
 
       const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
       g.className.baseVal = 'radial-slice';
 
+      // Основной лепесток
       const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       path.setAttribute('d', describeDonutSegment(cx, cy, rIn, rOut, startAngle, endAngle));
-      path.setAttribute('fill', cat.color);
-      path.setAttribute('fill-opacity', '0.80');
-      path.setAttribute('stroke', '#ffffff');
-      path.setAttribute('stroke-width', '1.5');
-      path.setAttribute('stroke-opacity', '0.6');
+      path.setAttribute('class', 'slice-bg');
+      path.setAttribute('fill', bgFill);
+      path.setAttribute('stroke', strokeCol);
+      path.setAttribute('stroke-width', '1.2');
       g.appendChild(path);
 
+      // Внешний цветной акцентный кант
+      const arcR = rOut - 1.5;
+      const a1 = polarToCartesian(cx, cy, arcR, startAngle + 2);
+      const a2 = polarToCartesian(cx, cy, arcR, endAngle - 2);
+      const arcPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      arcPath.setAttribute('d', ['M', a1.x, a1.y, 'A', arcR, arcR, 0, 0, 1, a2.x, a2.y].join(' '));
+      arcPath.setAttribute('fill', 'none');
+      arcPath.setAttribute('stroke', cat.color);
+      arcPath.setAttribute('stroke-width', '3.5');
+      arcPath.setAttribute('stroke-linecap', 'round');
+      g.appendChild(arcPath);
+
+      // Позиция центра сектора
       const pos = polarToCartesian(cx, cy, (rIn + rOut) / 2, midAngle);
 
-      const tIcon = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      tIcon.setAttribute('x', pos.x);
-      tIcon.setAttribute('y', pos.y - 4);
-      tIcon.setAttribute('text-anchor', 'middle');
-      tIcon.setAttribute('dominant-baseline', 'central');
-      tIcon.setAttribute('font-size', '20');
-      tIcon.textContent = cat.icon;
-      g.appendChild(tIcon);
+      // Акцентная метка категории
+      const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      dot.setAttribute('cx', pos.x);
+      dot.setAttribute('cy', pos.y - 7);
+      dot.setAttribute('r', '3.5');
+      dot.setAttribute('fill', cat.color);
+      g.appendChild(dot);
 
+      // Текстовая подпись
       const tText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
       tText.setAttribute('x', pos.x);
-      tText.setAttribute('y', pos.y + 16);
+      tText.setAttribute('y', pos.y + 11);
       tText.setAttribute('text-anchor', 'middle');
       tText.setAttribute('dominant-baseline', 'central');
-      tText.setAttribute('font-size', '10');
-      tText.setAttribute('font-weight', '700');
-      tText.setAttribute('fill', '#ffffff');
+      tText.setAttribute('font-size', '10.5');
+      tText.setAttribute('font-weight', '600');
+      tText.setAttribute('fill', textCol);
       tText.textContent = cat.label;
       g.appendChild(tText);
 
       g.addEventListener('mouseenter', () => {
+        path.setAttribute('fill', isLight ? 'rgba(31, 111, 224, 0.12)' : 'rgba(62, 139, 255, 0.18)');
+        path.setAttribute('stroke', isLight ? '#1f6fe0' : '#3e8bff');
         showRadialSubMenu(cat, midAngle);
+      });
+      g.addEventListener('mouseleave', () => {
+        path.setAttribute('fill', bgFill);
+        path.setAttribute('stroke', strokeCol);
       });
 
       svg.appendChild(g);
@@ -1038,19 +1069,19 @@
     const box = $('radial-sub-box');
     if (!box) return;
     const rad = (midAngle - 90) * Math.PI / 180;
-    const dist = 168;
-    const cx = 250 + dist * Math.cos(rad);
-    const cy = 250 + dist * Math.sin(rad);
+    const dist = 162;
+    const cx = 220 + dist * Math.cos(rad);
+    const cy = 220 + dist * Math.sin(rad);
 
-    box.style.left = (cx - 75) + 'px';
-    box.style.top = (cy - 40) + 'px';
-    box.innerHTML = '<div style="font-weight:700; color:' + cat.color + '; margin-bottom:5px; font-size:12px;">' + cat.icon + ' ' + cat.label + '</div>';
+    box.style.left = Math.max(10, Math.min(270, cx - 110)) + 'px';
+    box.style.top = Math.max(10, Math.min(270, cy - 60)) + 'px';
+    box.innerHTML = '<div class="radial-sub-header"><span class="sub-dot" style="background:' + cat.color + '"></span><span>' + cat.label + '</span><span class="sub-count">' + cat.subitems.length + '</span></div>';
 
     cat.subitems.forEach((item) => {
       const row = document.createElement('div');
       row.className = 'radial-sub-item';
       let tag = item.type === 'tower' ? 'Антенна' : (item.type === 'structure' ? (item.height + ' м') : 'Сеть');
-      row.innerHTML = '<span>' + item.name + '</span><span class="sub-tag">' + tag + '</span>';
+      row.innerHTML = '<span class="item-name">' + item.name + '</span><span class="sub-tag">' + tag + '</span>';
       row.addEventListener('click', (ev) => {
         ev.stopPropagation();
         closeRadialMenu();
@@ -1079,8 +1110,8 @@
     const menu = $('radial-menu');
     if (!ov || !menu) return;
     radialLngLat = state.mouse || map.getCenter();
-    const cx = Math.max(260, Math.min(window.innerWidth - 260, x || window.innerWidth / 2));
-    const cy = Math.max(260, Math.min(window.innerHeight - 260, y || window.innerHeight / 2));
+    const cx = Math.max(230, Math.min(window.innerWidth - 230, x || window.innerWidth / 2));
+    const cy = Math.max(230, Math.min(window.innerHeight - 230, y || window.innerHeight / 2));
     menu.style.left = cx + 'px';
     menu.style.top = cy + 'px';
     buildRadialMenu();
@@ -1223,7 +1254,9 @@
       document.body.setAttribute('data-theme', theme);
       if (map && map.getLayer('3d-buildings-extrusion'))
         map.setPaintProperty('3d-buildings-extrusion', 'fill-extrusion-color', theme === 'dark' ? '#4a5160' : '#c5ccd6');
+      initPatterns();
       drawLabels();
+      renderCoverage();
     },
     setBase(name) {
       if (!STYLES[name] || !map || state.base === name) return;

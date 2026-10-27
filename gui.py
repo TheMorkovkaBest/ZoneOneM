@@ -537,7 +537,6 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         g.add_action(self.act_goto)
         g = bar.add_group("Радиосеть")
         g.add_action(m["place"])
-        g.add_action(self.act_radial)
         g.add_action(self.act_best_server)
         g.add_action(self.act_create_structure)
         g.add_action(self.act_antenna_catalog)
@@ -774,6 +773,12 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         h_cat.addWidget(self.cmb_tower_antenna_model, stretch=1)
         h_cat.addWidget(btn_open_catalog)
         f_prop.addRow("Каталог вышек:", h_cat)
+        self.lbl_tower_preview = QLabel()
+        self.lbl_tower_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_tower_preview.setFixedHeight(140)
+        self.lbl_tower_preview.setStyleSheet("background: rgba(0, 0, 0, 0.25); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px; margin: 4px 0;")
+        self.lbl_tower_preview.setVisible(False)
+        f_prop.addRow(self.lbl_tower_preview)
         self._populate_antenna_dropdown()
 
         self.ed_tower_height = QDoubleSpinBox()
@@ -1571,6 +1576,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                         self.cmb_tower_antenna_model.blockSignals(True)
                         self.cmb_tower_antenna_model.setCurrentIndex(0)
                         self.cmb_tower_antenna_model.blockSignals(False)
+                    if hasattr(self, "lbl_tower_preview"):
+                        self.lbl_tower_preview.setVisible(False)
                 finally:
                     self._block_tower_edits = False
         else:
@@ -1632,6 +1639,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                     if hasattr(self, "cmb_tower_antenna_model"):
                         self.cmb_tower_antenna_model.setEnabled(True)
                         self._sync_antenna_dropdown(t.type_name)
+                    self._update_tower_preview(t)
                 finally:
                     self._block_tower_edits = False
         self._render_measure()
@@ -1680,13 +1688,19 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         if not hasattr(self, "cmb_tower_antenna_model") or not hasattr(self, "db") or not getattr(self.db, "conn", None):
             return
         import antenna_catalog
+        import antenna_images
         antennas = antenna_catalog.load_all_antennas(self.db.conn)
         self.cmb_tower_antenna_model.blockSignals(True)
         self.cmb_tower_antenna_model.clear()
+        self.cmb_tower_antenna_model.setIconSize(QSize(24, 24))
         self.cmb_tower_antenna_model.addItem("— Выбрать из каталога вышек —", None)
         for a in sorted(antennas, key=lambda x: (x.manufacturer, x.model)):
             title = f"{a.manufacturer} {a.model} ({a.freq_mhz:.0f} МГц, {a.gain_dbi:.1f} дБи)"
-            self.cmb_tower_antenna_model.addItem(title, a)
+            icon = antenna_images.get_antenna_icon(a, size=24)
+            if icon and not icon.isNull():
+                self.cmb_tower_antenna_model.addItem(icon, title, a)
+            else:
+                self.cmb_tower_antenna_model.addItem(title, a)
         self.cmb_tower_antenna_model.blockSignals(False)
 
     def _sync_antenna_dropdown(self, type_name):
@@ -1710,14 +1724,55 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         finally:
             self.cmb_tower_antenna_model.blockSignals(False)
 
+    def _update_tower_preview(self, t=None):
+        if not hasattr(self, "lbl_tower_preview"):
+            return
+        if t is None:
+            t = self._current_tower()
+        if t is None:
+            self.lbl_tower_preview.setVisible(False)
+            return
+
+        import antenna_images
+        a = None
+        if hasattr(self, "cmb_tower_antenna_model"):
+            idx = self.cmb_tower_antenna_model.currentIndex()
+            if idx > 0:
+                a = self.cmb_tower_antenna_model.itemData(idx)
+        if not a:
+            import antenna_catalog
+            target = (t.type_name or "").lower()
+            for item in antenna_catalog.BUILTIN_ANTENNAS:
+                if (item.model.lower() in target or target in item.model.lower()
+                        or f"{item.manufacturer} {item.model}".lower() in target):
+                    a = item
+                    break
+        if a:
+            pix = antenna_images.get_antenna_pixmap(a, width=280, height=135)
+            if pix and not pix.isNull():
+                self.lbl_tower_preview.setPixmap(pix)
+                self.lbl_tower_preview.setVisible(True)
+                return
+        self.lbl_tower_preview.setVisible(False)
+
     def _on_antenna_model_selected(self, idx):
         if getattr(self, "_block_tower_edits", False):
             return
         if not hasattr(self, "cmb_tower_antenna_model") or idx <= 0:
+            if hasattr(self, "lbl_tower_preview"):
+                self.lbl_tower_preview.setVisible(False)
             return
         a = self.cmb_tower_antenna_model.itemData(idx)
         if not a:
+            if hasattr(self, "lbl_tower_preview"):
+                self.lbl_tower_preview.setVisible(False)
             return
+        if hasattr(self, "lbl_tower_preview"):
+            import antenna_images
+            pix = antenna_images.get_antenna_pixmap(a, width=280, height=135)
+            if pix and not pix.isNull():
+                self.lbl_tower_preview.setPixmap(pix)
+                self.lbl_tower_preview.setVisible(True)
         self._block_tower_edits = True
         try:
             self.ed_tower_freq.setValue(float(a.freq_mhz))

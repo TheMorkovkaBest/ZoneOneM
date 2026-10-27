@@ -31,6 +31,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+import antenna_images
+
 
 @dataclass
 class StructureTypeSpec:
@@ -130,12 +132,19 @@ class CreateStructureDialog(QDialog):
     def __init__(self, lat: float, lon: float, existing_count: int = 0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Создать каркас вышки (опорную конструкцию)")
-        self.resize(440, 260)
+        self.resize(460, 420)
         self.lat = lat
         self.lon = lon
         self.structure: Optional[TowerStructure] = None
 
         lay = QVBoxLayout(self)
+
+        self.lbl_struct_image = QLabel()
+        self.lbl_struct_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_struct_image.setFixedHeight(150)
+        self.lbl_struct_image.setStyleSheet("background: rgba(0, 0, 0, 0.25); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;")
+        lay.addWidget(self.lbl_struct_image)
+
         form = QFormLayout()
 
         self.ed_name = QLineEdit(f"Каркас #{existing_count + 1}")
@@ -158,6 +167,7 @@ class CreateStructureDialog(QDialog):
         form.addRow("Координаты:", self.lbl_coords)
 
         lay.addLayout(form)
+        self._on_model_change()
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self._on_ok)
@@ -168,6 +178,10 @@ class CreateStructureDialog(QDialog):
         spec = self.cmb_model.currentData()
         if spec:
             self.spn_height.setValue(spec.height)
+            if hasattr(self, "lbl_struct_image"):
+                pix = antenna_images.get_structure_pixmap(spec, width=320, height=145)
+                if pix and not pix.isNull():
+                    self.lbl_struct_image.setPixmap(pix)
 
     def _on_ok(self):
         spec = self.cmb_model.currentData()

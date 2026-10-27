@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -39,6 +39,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+import antenna_images
 
 
 @dataclass
@@ -1025,6 +1027,7 @@ class AntennaCatalogDialog(QDialog):
             "Производитель", "Модель", "Категория", "Частота", "Ку, дБи", "Ширина луча (H)"
         ])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.setIconSize(QSize(32, 32))
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.itemSelectionChanged.connect(self._on_table_select)
@@ -1036,6 +1039,13 @@ class AntennaCatalogDialog(QDialog):
         d_lay = QVBoxLayout(detail_widget)
         d_lay.setContentsMargins(10, 0, 0, 0)
         d_lay.setSpacing(8)
+
+        d_lay.addWidget(QLabel("<b>Изображение и схема антенны</b>"))
+        self.lbl_image = QLabel()
+        self.lbl_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_image.setFixedHeight(180)
+        self.lbl_image.setStyleSheet("background: rgba(0, 0, 0, 0.25); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;")
+        d_lay.addWidget(self.lbl_image)
 
         d_lay.addWidget(QLabel("<b>Технические характеристики антенны</b>"))
         self.detail_browser = QTextBrowser()
@@ -1075,7 +1085,11 @@ class AntennaCatalogDialog(QDialog):
     def _populate_table(self):
         self.table.setRowCount(len(self.filtered))
         for r, a in enumerate(self.filtered):
-            self.table.setItem(r, 0, QTableWidgetItem(a.manufacturer))
+            item0 = QTableWidgetItem(a.manufacturer)
+            icon = antenna_images.get_antenna_icon(a, size=32)
+            if icon and not icon.isNull():
+                item0.setIcon(icon)
+            self.table.setItem(r, 0, item0)
             self.table.setItem(r, 1, QTableWidgetItem(a.model))
             self.table.setItem(r, 2, QTableWidgetItem(a.category))
             self.table.setItem(r, 3, QTableWidgetItem(f"{a.freq_mhz:.0f} МГц"))
@@ -1110,6 +1124,8 @@ class AntennaCatalogDialog(QDialog):
             if hasattr(self, "btn_choose"):
                 self.btn_choose.setEnabled(False)
             self.btn_apply.setEnabled(False)
+            if hasattr(self, "lbl_image"):
+                self.lbl_image.clear()
             self.detail_browser.setHtml("<p style='color:#888'>Выберите антенну из списка</p>")
             return
         row = rows[0].row()
@@ -1121,6 +1137,12 @@ class AntennaCatalogDialog(QDialog):
             self._render_details(self.selected_antenna)
 
     def _render_details(self, a: AntennaType):
+        if hasattr(self, "lbl_image"):
+            pix = antenna_images.get_antenna_pixmap(a, width=320, height=180)
+            if pix and not pix.isNull():
+                self.lbl_image.setPixmap(pix)
+            else:
+                self.lbl_image.clear()
         eirp_w = a.tx_power_w * (10 ** (a.gain_dbi / 10.0))
         eirp_dbm = 10 * (eirp_w / 0.001) if eirp_w > 0 else 0
         html = f"""
