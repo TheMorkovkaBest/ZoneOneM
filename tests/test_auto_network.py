@@ -71,5 +71,36 @@ class TestAutoNetwork(unittest.TestCase):
         self.assertEqual(len(restored.links), 0)
 
 
+    def test_large_scale_network_connectivity(self):
+        """Тест масштабирования: 45 вышек требуют нескольких Core Routers (PE) и 100% связности."""
+        net = Network()
+        towers = [
+            Tower(f"БС-{i}", 55.700 + (i // 7) * 0.005, 37.600 + (i % 7) * 0.005,
+                  1800.0, 20.0, 25.0, 4.0, 20.0, [0, 0, 0, 255], db_id=i)
+            for i in range(1, 46)
+        ]
+        stats = build_backhaul_network(net, towers, max_towers_per_csr=3, max_csrs_per_core_router=6)
+        self.assertEqual(stats["status"], "ok")
+        self.assertGreater(stats["core_routers"], 1)
+
+        # Проверяем, что ВСЕ устройства в сети подключены (0 изолированных)
+        core_devs = [d for d in net.devices.values() if d.role == "core"]
+        self.assertEqual(len(core_devs), 1)
+
+        for did, dev in net.devices.items():
+            has_link = any((l.a_dev == did or l.b_dev == did) for l in net.links.values())
+            self.assertTrue(has_link, f"Устройство {dev.name} ({dev.id}) оказалось изолированным без линков!")
+
+        # Проверяем, что маршрутизаторы ядра соединены с ядром
+        pe_devs = [d for d in net.devices.values() if d.role == "router" and ("PE" in d.name or d.model == "rt_pe")]
+        self.assertGreater(len(pe_devs), 1)
+
+        # Проверяем пинг от нескольких случайных вышек до ядра
+        for sample_id in (1, 15, 30, 45):
+            t_did = f"T{sample_id}"
+            ping_res = net.ping(t_did, core_devs[0].id)
+            self.assertTrue(ping_res.ok, f"Пинг от {t_did} до ядра сети не прошёл: {ping_res.reason}")
+
+
 if __name__ == "__main__":
     unittest.main()

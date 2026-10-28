@@ -473,6 +473,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                                               tip="<b>Каркас вышки</b><br>Создание опорной конструкции (решётчатой башни, мачты, столба).<br>Позволяет размещать несколько секторов на одной опоре.")
         self.act_auto_network = self._act("Авто-сеть", "network", self.auto_build_network, shortcut="Ctrl+W",
                                           tip="<b>Авто-сеть (Ctrl+W)</b><br>Автоматически объединить вышки в маршрутизаторы CSR и ядро сети (5GC).")
+        self.addAction(self.act_auto_network)
         self.act_net_auto = self._act("Авто-IP", "sliders", self.net_autoconfigure,
                                       tip="<b>Авто-IP</b><br>Автоматическое назначение IP-адресов подсетей (/30, /24) и построение таблиц маршрутизации.")
         self.act_bom = self._act("Спецификация", "list", self.net_export_bom,
@@ -571,7 +572,6 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._cable_menu = self.build_cable_menu()
         g.add_action(m["device"], self._device_menu)
         g.add_action(m["cable"], self._cable_menu)
-        g.add_action(self.act_auto_network)
         g.add_action(self.act_net_auto)
         g.add_action(self.act_snmp)
         g.add_action(self.act_bom)
