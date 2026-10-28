@@ -1,0 +1,405 @@
+"""Опрос устройств сети по SNMP (модель агента), без зависимостей от Qt.
+
+Каждое устройство проекта (БС, коммутатор, маршрутизатор, РРЛ, ядро) отвечает на snmpwalk
+так, как ответил бы реальный агент SNMPv2c: группа system, ifTable/ifXTable (скорость,
+состояние, счётчики октетов, ошибки), ipAddrTable, таблица маршрутов, соседи LLDP,
+PoE (POWER-ETHERNET-MIB) у коммутаторов и радиопараметры у базовых станций.
+
+Значения берутся из сетевой модели (network.py): состояние линков, согласованная скорость,
+IP-адреса после «Авто-IP», PoE-бюджет. Счётчики трафика растут со временем работы агента
+пропорционально загрузке линка (из теста нагрузки, если он запускался).
+
+Доступность честная: менеджер SNMP (NMS) стоит на ядре сети, и запрос идёт по смоделированной
+IP-сети (тот же ping, что и в режиме PDU). Нет маршрута — «Timeout: No Response», данные тогда
+показываются как при локальном подключении к порту управления (craft).
+"""
+import hashlib
+import ipaddress
+import re
+import time
+from dataclasses import dataclass, field
+
+import geo
+import netcatalog as NC
+from network import fmt_speed
+
+ENTERPRISE = "1.3.6.1.4.1.64999"          # условный номер предприятия ZoneM (для собственных объектов)
+COMMUNITY = "public"
+IF_TYPES = {"AIR": (188, "radioMAC")}     # остальные порты — ethernetCsmacd(6)
+STATUS = {1: "up", 2: "down", 7: "lowerLayerDown"}
+_OID = {
+    "sysDescr": "1.3.6.1.2.1.1.1.0", "sysObjectID": "1.3.6.1.2.1.1.2.0", "sysUpTime": "1.3.6.1.2.1.1.3.0",
+    "sysContact": "1.3.6.1.2.1.1.4.0", "sysName": "1.3.6.1.2.1.1.5.0", "sysLocation": "1.3.6.1.2.1.1.6.0",
+    "sysServices": "1.3.6.1.2.1.1.7.0",
+    "rxPower": f"{ENTERPRISE}.2.12.0", "txPower": f"{ENTERPRISE}.2.13.0",
+}
+IF_COLUMNS = (("ifIndex", "1.3.6.1.2.1.2.2.1.1"), ("ifDescr", "1.3.6.1.2.1.2.2.1.2"), ("ifType", "1.3.6.1.2.1.2.2.1.3"),
+              ("ifMtu", "1.3.6.1.2.1.2.2.1.4"), ("ifPhysAddress", "1.3.6.1.2.1.2.2.1.6"),
+              ("ifAdminStatus", "1.3.6.1.2.1.2.2.1.7"), ("ifOperStatus", "1.3.6.1.2.1.2.2.1.8"),
+              ("ifInErrors", "1.3.6.1.2.1.2.2.1.14"), ("ifHCInOctets", "1.3.6.1.2.1.31.1.1.1.6"),
+              ("ifHCOutOctets", "1.3.6.1.2.1.31.1.1.1.10"), ("ifHighSpeed", "1.3.6.1.2.1.31.1.1.1.15"),
+              ("ifAlias", "1.3.6.1.2.1.31.1.1.1.18"))
+
+_BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
+_TYPE_PREFIX_RE = re.compile(r"^(?:STRING|INTEGER|Gauge32|Counter64|OID|IpAddress):\s*")
+
+WALK_TEMPLATES = (
+    'Device: [string_substring(oid("1.3.6.1.2.1.1.5.0"),0,32)]',
+    'Model: [string_substring(oid("1.3.6.1.2.1.1.1.0"),0,64)]',
+    'Location: [string_substring(oid("1.3.6.1.2.1.1.6.0"),0,32)]',
+    'Uptime: [string_substring(oid("1.3.6.1.2.1.1.3.0"),0,13)]',
+    'RX Power: [string_substring(oid("1.3.6.1.4.1.64999.2.12.0"),0,13)] dbm',
+    'TX Power: [string_substring(oid("1.3.6.1.4.1.64999.2.13.0"),0,13)] dbm',
+)
+
+
+def _clean_snmp_val(val) -> str:
+    s = str(val)
+    if s.startswith("Timeticks:"):
+        return s.split(") ", 1)[-1] if ") " in s else s
+    s = _TYPE_PREFIX_RE.sub("", s)
+    return s
+
+
+def eval_snmp_expr(expr: str, oids: dict) -> str:
+    """Вычисляет выражение в стиле The Dude: oid("...") и string_substring(..., start, end)."""
+    def _oid(key: str) -> str:
+        return str(oids.get(str(key).lstrip("."), ""))
+
+    def _string_substring(val, start: int = 0, end: int = None) -> str:
+        s = str(val)
+        return s[int(start):] if end is None else s[int(start):int(end)]
+
+    try:
+        res = eval(expr, {"__builtins__": {}}, {"oid": _oid, "string_substring": _string_substring})
+        return "" if res is None else str(res)
+    except Exception:
+        return ""
+
+
+def format_snmp_template(template: str, oids: dict) -> str:
+    """Подставляет значения OID в шаблон вида 'RX Power: [string_substring(oid("1.3.6.1.2.1.1.3.0"),0,13)] dbm'."""
+    return _BRACKET_RE.sub(lambda m: eval_snmp_expr(m.group(1), oids), template)
+
+
+@dataclass
+class SnmpResult:
+    device_id: str
+    name: str
+    ip: str = ""                     # адрес агента (пусто — нет IP)
+    manager: str = ""                # кто опрашивает (NMS на ядре) или «локально»
+    transport: str = "local"         # network | local
+    reachable: bool = True           # агент ответил (по сети или локально)
+    status: str = ""                 # строка состояния для заголовка
+    rtt_ms: float = 0.0
+    path: list = field(default_factory=list)          # имена узлов по пути запроса
+    uptime_s: float = 0.0
+    system: list = field(default_factory=list)        # [(oid, объект, значение)]
+    interfaces: list = field(default_factory=list)    # [dict] строки ifTable
+    ip_addrs: list = field(default_factory=list)      # [dict]
+    routes: list = field(default_factory=list)        # [dict]
+    neighbors: list = field(default_factory=list)     # [dict] LLDP
+    extra_title: str = ""
+    extra: list = field(default_factory=list)         # [(oid, объект, значение)] — радио БС / PoE
+    oids: dict = field(default_factory=dict)          # {oid: чистое_значение} для шаблонов [oid("...")]
+    custom_command: str = ""
+
+    @property
+    def command(self):
+        return self.custom_command or f"snmpwalk -v2c -c {COMMUNITY} {self.ip or '<нет IP>'}"
+
+    @command.setter
+    def command(self, val):
+        self.custom_command = val
+
+    def _build_oids(self):
+        oids = dict(self.oids)
+        for oid, _name, val in self.system:
+            oids.setdefault(oid, _clean_snmp_val(val))
+        for row in self.interfaces:
+            i = row["ifIndex"]
+            for col, oid in IF_COLUMNS:
+                oids.setdefault(f"{oid}.{i}", _clean_snmp_val(row[col]))
+        for r in self.ip_addrs:
+            oids.setdefault(f"1.3.6.1.2.1.4.20.1.1.{r['addr']}", str(r["addr"]))
+            oids.setdefault(f"1.3.6.1.2.1.4.20.1.2.{r['addr']}", str(r["ifIndex"]))
+            oids.setdefault(f"1.3.6.1.2.1.4.20.1.3.{r['addr']}", str(r["mask"]))
+        for r in self.routes:
+            oids.setdefault(f"1.3.6.1.2.1.4.24.4.1.4.{r['dest']}", str(r["next_hop"]))
+            oids.setdefault(f"1.3.6.1.2.1.4.24.4.1.7.{r['dest']}", str(r["proto"]))
+        for r in self.neighbors:
+            p = r["local_port"]
+            oids.setdefault(f"1.0.8802.1.1.2.1.4.1.1.9.{p}", str(r["sys_name"]))
+            oids.setdefault(f"1.0.8802.1.1.2.1.4.1.1.7.{p}", str(r["port_id"]))
+        for oid, _name, val in self.extra:
+            oids.setdefault(oid, _clean_snmp_val(val))
+        oids.setdefault(_OID["rxPower"], "20")
+        oids.setdefault(_OID["txPower"], "20")
+        return oids
+
+    def format_template(self, template: str) -> str:
+        return format_snmp_template(template, self._build_oids())
+
+    def walk_text(self):
+        """Преобразованный вывод SNMP WALK по шаблонам вида [string_substring(oid("..."),0,13)]."""
+        out = [f"$ {self.command}"]
+        if not self.reachable:
+            out.append(f"Timeout: No Response from {self.ip or self.name}.")
+            return "\n".join(out)
+        oids = self._build_oids()
+        for tpl in WALK_TEMPLATES:
+            out.append(format_snmp_template(tpl, oids))
+        for row in self.interfaces:
+            i = row["ifIndex"]
+            tpl = (
+                f'Interface [string_substring(oid("1.3.6.1.2.1.2.2.1.2.{i}"),0,16)]: '
+                f'[string_substring(oid("1.3.6.1.2.1.2.2.1.8.{i}"),0,16)] · '
+                f'Speed: [string_substring(oid("1.3.6.1.2.1.31.1.1.1.15.{i}"),0,8)] Mbps · '
+                f'ifHCInOctets: [string_substring(oid("1.3.6.1.2.1.31.1.1.1.6.{i}"),0,20)] · '
+                f'ifHCOutOctets: [string_substring(oid("1.3.6.1.2.1.31.1.1.1.10.{i}"),0,20)]'
+            )
+            out.append(format_snmp_template(tpl, oids))
+        for r in self.ip_addrs:
+            a = r["addr"]
+            tpl = (
+                f'IP Address: [string_substring(oid("1.3.6.1.2.1.4.20.1.1.{a}"),0,16)] / '
+                f'[string_substring(oid("1.3.6.1.2.1.4.20.1.3.{a}"),0,16)] '
+                f'(ifIndex [oid("1.3.6.1.2.1.4.20.1.2.{a}")])'
+            )
+            out.append(format_snmp_template(tpl, oids))
+        for r in self.routes:
+            d = r["dest"]
+            tpl = (
+                f'Route {d}: nextHop [string_substring(oid("1.3.6.1.2.1.4.24.4.1.4.{d}"),0,16)] '
+                f'([string_substring(oid("1.3.6.1.2.1.4.24.4.1.7.{d}"),0,16)])'
+            )
+            out.append(format_snmp_template(tpl, oids))
+        for r in self.neighbors:
+            p = r["local_port"]
+            tpl = (
+                f'LLDP {p}: [string_substring(oid("1.0.8802.1.1.2.1.4.1.1.9.{p}"),0,32)] '
+                f'port [string_substring(oid("1.0.8802.1.1.2.1.4.1.1.7.{p}"),0,16)]'
+            )
+            out.append(format_snmp_template(tpl, oids))
+        for oid, name, _val in self.extra:
+            short = name.split("::")[-1]
+            tpl = f'{short}: [string_substring(oid("{oid}"),0,32)]'
+            out.append(format_snmp_template(tpl, oids))
+        return "\n".join(out)
+
+
+def _h(*parts):
+    return int.from_bytes(hashlib.md5("|".join(map(str, parts)).encode()).digest()[:8], "big")
+
+
+def mac_of(dev_id, port):
+    b = _h("mac", dev_id, port).to_bytes(8, "big")[:4]
+    return "02:5a:" + ":".join(f"{x:02x}" for x in b)        # локально администрируемый MAC
+
+
+def fmt_ticks(sec):
+    d, rem = divmod(int(sec), 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    return f"Timeticks: ({int(sec * 100)}) {d} д {h:02d}:{m:02d}:{s:02d}"
+
+
+def fmt_octets(n):
+    for unit, k in (("ТБ", 1e12), ("ГБ", 1e9), ("МБ", 1e6), ("КБ", 1e3)):
+        if n >= k:
+            return f"{n / k:.2f} {unit}"
+    return f"{n} Б"
+
+
+def _first_ip(dev):
+    for cidr in dev.ips.values():
+        return str(ipaddress.ip_interface(cidr).ip)
+    return ""
+
+
+def _boot_time(net, dev_id):
+    """Агент «загрузился» за 1–40 суток до запуска программы (детерминированно по id)."""
+    return getattr(net, "boot_time", time.time()) - 86400.0 * (1 + _h("boot", dev_id) % 40) - _h("s", dev_id) % 86400
+
+
+def poll(net, dev_id, link_util=None, tower=None, now=None, target_ip=None, port=None, community=None, version=None):
+    """snmpwalk по устройству dev_id. link_util — {link_id: загрузка 0..1} (из теста нагрузки) или None."""
+    dev = net.devices[dev_id]
+    cfg = dev.snmp_params() if hasattr(dev, "snmp_params") else {}
+    comm = community if community is not None else cfg.get("community", COMMUNITY)
+    snmp_port = int(port if port is not None else cfg.get("port", 161))
+    ver = version if version is not None else cfg.get("version", "v2c")
+    enabled = cfg.get("enabled", True)
+    now = time.time() if now is None else now
+    if not net.status and net.links:
+        net.evaluate()
+    target = target_ip or _first_ip(dev)
+    res = SnmpResult(dev_id, dev.name, ip=target)
+    res.command = f"snmpwalk -{ver} -c {comm} {target}:{snmp_port} 1.3.6.1"
+    if not enabled:
+        res.reachable = False
+        res.status = f"Агент SNMP выключен в настройках устройства {dev.name}"
+        return res
+    if comm != cfg.get("community", COMMUNITY):
+        res.reachable = False
+        res.status = f"Timeout: No Response from {target} (Authentication failure: неверный community «{comm}»)"
+        return res
+    _connect(net, dev, res)
+    if not res.reachable:
+        return res
+    res.uptime_s = max(now - _boot_time(net, dev_id), 1.0)
+    spec = dev.spec
+    model_idx = list(NC.MODELS).index(dev.model) + 1
+    sys_descr = cfg.get("sys_descr") or f"{spec['name']} — {spec['example']}"
+    sys_contact = cfg.get("sys_contact") or "noc@zonem.local"
+    sys_name = cfg.get("sys_name") or dev.name
+    sys_location = cfg.get("sys_location") or f"{dev.lat:.6f}, {dev.lon:.6f}"
+    res.system = [
+        (_OID["sysDescr"], "SNMPv2-MIB::sysDescr.0", f"STRING: {sys_descr}"),
+        (_OID["sysObjectID"], "SNMPv2-MIB::sysObjectID.0", f"OID: {ENTERPRISE}.1.{model_idx}"),
+        (_OID["sysUpTime"], "DISMAN-EVENT-MIB::sysUpTimeInstance", fmt_ticks(res.uptime_s)),
+        (_OID["sysContact"], "SNMPv2-MIB::sysContact.0", f"STRING: {sys_contact}"),
+        (_OID["sysName"], "SNMPv2-MIB::sysName.0", f"STRING: {sys_name}"),
+        (_OID["sysLocation"], "SNMPv2-MIB::sysLocation.0", f"STRING: {sys_location}"),
+        (_OID["sysServices"], "SNMPv2-MIB::sysServices.0",
+         f"INTEGER: {78 if dev.role in NC.L3_ROLES or dev.role == 'core' else 6}"),
+    ]
+    port_index = {}
+    for i, p in enumerate(dev.ports(), 1):
+        port_index[p.name] = i
+        res.interfaces.append(_if_row(net, dev, p, i, res.uptime_s, link_util))
+    for port, cidr in dev.ips.items():
+        itf = ipaddress.ip_interface(cidr)
+        res.ip_addrs.append({"addr": str(itf.ip), "ifIndex": port_index.get(port, 0), "port": port,
+                             "mask": str(itf.network.netmask), "prefix": itf.network.prefixlen})
+    for port, cidr in dev.ips.items():
+        net_ = ipaddress.ip_interface(cidr).network
+        res.routes.append({"dest": str(net_), "next_hop": "0.0.0.0", "port": port, "proto": "local(2)"})
+    for r in dev.routes:
+        res.routes.append({"dest": r["net"], "next_hop": r["via"], "port": "", "proto": "netmgmt(3)"})
+    if dev.gateway:
+        res.routes.append({"dest": "0.0.0.0/0", "next_hop": dev.gateway, "port": "", "proto": "netmgmt(3)"})
+    for p in dev.ports():
+        l = net.port_link(dev.id, p.name)
+        if not l or net.status.get(l.id) is None or net.status[l.id].state == "down":
+            continue
+        peer_id, peer_port = (l.b_dev, l.b_port) if l.a_dev == dev.id else (l.a_dev, l.a_port)
+        peer = net.devices[peer_id]
+        res.neighbors.append({"local_port": p.name, "sys_name": peer.name, "port_id": peer_port,
+                              "sys_desc": peer.spec["name"], "man_addr": _first_ip(peer),
+                              "cable": NC.CABLES[l.cable]["name"]})
+    if dev.role == "tower":
+        res.extra_title = "Радио БС"
+        res.extra = _radio_rows(dev, tower)
+    elif dev.spec.get("poe_budget_w"):
+        res.extra_title = "PoE"
+        res.extra = _poe_rows(net, dev)
+    rx_dbm = "20" if dev.role in ("tower", "radio") else f"{-4.5 + (_h('rx', dev.id) % 30) / 10.0:.1f}"
+    tx_dbm = f"{geo.w_to_dbm(tower.power):.1f}" if tower is not None else (
+        "20" if dev.role == "radio" else f"{-1.5 + (_h('tx', dev.id) % 25) / 10.0:.1f}")
+    res.oids[_OID["rxPower"]] = rx_dbm
+    res.oids[_OID["txPower"]] = tx_dbm
+    res.oids = res._build_oids()
+    return res
+
+
+def _connect(net, dev, res):
+    st = net.dev_state.get(dev.id, {})
+    if not st.get("powered", True):
+        res.reachable, res.transport = False, "network"
+        res.status = f"Нет ответа: у устройства нет питания ({st.get('reason', '')})"
+        return
+    cores = [d for d in net.devices.values() if d.role == "core"]
+    if not cores:
+        res.manager = "ноутбук инженера (craft-порт)"
+        res.status = "Локальное подключение к порту управления: в проекте нет ядра сети/NMS"
+        return
+    mgr = cores[0]
+    res.manager = f"NMS на {mgr.name}" + (f" ({_first_ip(mgr)})" if mgr.ips else "")
+    if mgr.id == dev.id:
+        res.transport, res.status = "network", "Агент на самом сервере NMS (localhost)"
+        return
+    if not dev.ips or not mgr.ips:
+        who = dev.name if not dev.ips else mgr.name
+        res.manager = "ноутбук инженера (craft-порт)"
+        res.status = (f"У {who} нет IP-адреса — опрос по сети невозможен (выполните «Авто-IP»); "
+                      "показаны данные с локального порта управления")
+        return
+    ping = net.ping(mgr.id, dev.id)
+    if ping.ok:
+        res.transport, res.rtt_ms = "network", ping.rtt_ms
+        res.path = [net.devices[i].name for i in ping.hops]
+        res.status = f"Ответ по сети от {res.ip}: RTT {ping.rtt_ms:.2f} мс, {len(ping.hops) - 1} перех."
+    else:
+        res.manager = "ноутбук инженера (craft-порт)"
+        res.status = (f"Timeout: No Response from {res.ip} ({ping.reason}); "
+                      "показаны данные с локального порта управления")
+
+
+def _if_row(net, dev, p, idx, uptime_s, link_util):
+    l = net.port_link(dev.id, p.name)
+    st = net.status.get(l.id) if l else None
+    up = st is not None and st.state != "down"
+    oper = 1 if up else (7 if (l and st is not None) else 2)
+    speed = (st.speed_mbps if up else p.mbps) or p.mbps
+    util = 0.0
+    if up:
+        util = (link_util or {}).get(l.id)
+        if util is None:                                       # фоновый трафик 2–20% (детерминированно)
+            util = 0.02 + (_h("u", l.id) % 1800) / 10000.0
+    bps = speed * 1e6 / 8.0 * util
+    forward = l is not None and l.a_dev == dev.id
+    in_oct = int(bps * uptime_s * (0.55 if forward else 1.0)) % 2 ** 64
+    out_oct = int(bps * uptime_s * (1.0 if forward else 0.55)) % 2 ** 64
+    errors = int(in_oct / 1e9 * (3 if st is not None and st.state == "warn" else 0.01))
+    peer = ""
+    if l:
+        peer_id, peer_port = (l.b_dev, l.b_port) if l.a_dev == dev.id else (l.a_dev, l.a_port)
+        peer = f"→ {net.devices[peer_id].name}:{peer_port} ({NC.CABLES[l.cable]['name']})"
+    t_num, t_name = IF_TYPES.get(p.kind, (6, "ethernetCsmacd"))
+    return {"ifIndex": idx, "ifDescr": p.name, "ifType": f"{t_name}({t_num})",
+            "ifMtu": 9216 if p.mbps >= 10000 else 1500, "ifPhysAddress": mac_of(dev.id, p.name),
+            "ifAdminStatus": "up(1)", "ifOperStatus": f"{STATUS[oper]}({oper})",
+            "ifInErrors": errors, "ifHCInOctets": in_oct, "ifHCOutOctets": out_oct,
+            "ifHighSpeed": int(speed), "ifAlias": peer, "kind": p.kind, "util": util, "speed_text": fmt_speed(speed)}
+
+
+def _radio_rows(dev, tower):
+    base = f"{ENTERPRISE}.2"
+    r = dev.radio
+    rows = [(f"{base}.1.0", "ZONEM-RAN::ranTechnology.0", f"STRING: {r.get('tech', 'LTE')}"),
+            (f"{base}.2.0", "ZONEM-RAN::ranBandwidthMHz.0", f"Gauge32: {r.get('bw_mhz', 0):g}"),
+            (f"{base}.3.0", "ZONEM-RAN::ranMimoLayers.0", f"INTEGER: {r.get('layers', 0)}"),
+            (f"{base}.4.0", "ZONEM-RAN::ranMaxActiveUsers.0", f"INTEGER: {r.get('max_users', 0)}"),
+            (f"{base}.12.0", "ZONEM-RAN::ranRxPowerDbm.0", "STRING: 20")]
+    if tower is not None:
+        rows += [(f"{base}.5.0", "ZONEM-RAN::ranFrequencyMHz.0", f"Gauge32: {tower.freq:g}"),
+                 (f"{base}.6.0", "ZONEM-RAN::ranTxPowerW.0", f"STRING: {tower.power:g}"),
+                 (f"{base}.7.0", "ZONEM-RAN::ranEirpDbm.0", f"STRING: {tower.eirp_dbm:.1f}"),
+                 (f"{base}.8.0", "ZONEM-RAN::ranAntennaHeightM.0", f"STRING: {tower.height:g}"),
+                 (f"{base}.9.0", "ZONEM-RAN::ranAzimuthDeg.0", f"INTEGER: {int(round(tower.azimuth))}"),
+                 (f"{base}.10.0", "ZONEM-RAN::ranBeamwidthDeg.0", f"INTEGER: {int(round(tower.beamwidth))}"),
+                 (f"{base}.11.0", "ZONEM-RAN::ranCellRadiusWeakM.0", f"Gauge32: {int(tower.r_weak * 1000)}"),
+                 (f"{base}.13.0", "ZONEM-RAN::ranTxPowerDbm.0", f"STRING: {geo.w_to_dbm(tower.power):.1f}")]
+    return rows
+
+
+def _poe_rows(net, dev):
+    st = net.dev_state.get(dev.id, {})
+    rows = [("1.3.6.1.2.1.105.1.3.1.1.2.1", "POWER-ETHERNET-MIB::pethMainPsePower.1",
+             f"Gauge32: {dev.spec['poe_budget_w']:g} W"),
+            ("1.3.6.1.2.1.105.1.3.1.1.4.1", "POWER-ETHERNET-MIB::pethMainPseConsumptionPower.1",
+             f"Gauge32: {st.get('poe_used_w', 0.0):.0f} W")]
+    for i, p in enumerate(dev.ports(), 1):
+        if not p.pse:
+            continue
+        l = net.port_link(dev.id, p.name)
+        delivering = False
+        if l:
+            peer_id = l.b_dev if l.a_dev == dev.id else l.a_dev
+            peer = net.devices[peer_id]
+            delivering = peer.power_mode == "poe" and net.dev_state.get(peer_id, {}).get("powered", False)
+        state = "deliveringPower(3)" if delivering else "searching(2)"
+        rows.append((f"1.3.6.1.2.1.105.1.1.1.6.1.{i}", f"POWER-ETHERNET-MIB::pethPsePortDetectionStatus.1.{i}",
+                     f"INTEGER: {state}  [{p.name}, {NC.POE_NAMES[p.pse]}]"))
+    return rows
