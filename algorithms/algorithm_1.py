@@ -11,8 +11,9 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -46,6 +47,31 @@ class CandidateSector:
     @property
     def key(self) -> Tuple[float, float, float]:
         return (round(self.site.lat, 6), round(self.site.lon, 6), round(self.azimuth, 1))
+
+
+def _building_roof_point(poly: Sequence[Tuple[float, float]]) -> Tuple[float, float]:
+    """Находит точку, гарантированно лежащую на кровле здания (внутри полигона)."""
+    if not poly:
+        return 0.0, 0.0
+    c_lat = sum(p[0] for p in poly) / len(poly)
+    c_lon = sum(p[1] for p in poly) / len(poly)
+    if geo.point_in_polygon(c_lat, c_lon, poly):
+        return c_lat, c_lon
+
+    # Если центроид снаружи (например, внутренний двор) — ищем точку внутри
+    n = len(poly)
+    for i in range(n):
+        p1 = poly[i]
+        p2 = poly[(i + 1) % n]
+        mid_lat = (p1[0] + p2[0]) / 2.0
+        mid_lon = (p1[1] + p2[1]) / 2.0
+        for factor in (0.05, 0.1, 0.2, 0.3, 0.5):
+            test_lat = mid_lat + (c_lat - mid_lat) * factor
+            test_lon = mid_lon + (c_lon - mid_lon) * factor
+            if geo.point_in_polygon(test_lat, test_lon, poly):
+                return test_lat, test_lon
+
+    return poly[0][0], poly[0][1]
 
 
 def find_candidate_sites(
@@ -102,9 +128,8 @@ def find_candidate_sites(
                 poly = b.get("poly", [])
                 if not poly:
                     continue
-                # Центроид здания
-                b_lat = sum(p[0] for p in poly) / len(poly)
-                b_lon = sum(p[1] for p in poly) / len(poly)
+                # Гарантированная точка на крыше здания
+                b_lat, b_lon = _building_roof_point(poly)
 
                 dist_m = math.hypot(
                     (b_lat - c_lat) * calculations.M_PER_DEG_LAT,
@@ -166,19 +191,38 @@ def optimize_coverage(
     target_coverage_ratio: float = 0.95,
     min_gain_tiles: int = 3,
     max_sectors_per_site: int = 3,
+    min_quality_level: str = "good",
+    progress_callback: Optional[Callable[[float, str, Optional[float]], None]] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> List[Dict[str, Any]]:
     """Основная функция Алгоритма 1: расчёт оптимального покрытия.
 
     :param task: Объект PlacementTask с полями area, forbidden, tower_type, max_towers, building_data.
     :param grid_step_m: Шаг сетки дискретизации покрытия (метры).
     :param azimuth_step_deg: Дискретный шаг перебора азимута сектора (градусы).
-    :param target_coverage_ratio: Целевая доля покрытия территории (0.0 .. 1.0).
+    :param target_coverage_ratio: Целевая доля среднего покрытия (например, 0.95 для >= 95%).
     :param min_gain_tiles: Минимальный прирост новых точек для установки очередного сектора.
     :param max_sectors_per_site: Максимум секторов на одну и ту же площадку/здание.
+    :param min_quality_level: Порог качества сигнала ("good" = средняя зона >= -85 дБм, "weak" = >= -105 дБм).
+    :param progress_callback: Функция уведомления о прогрессе: callback(pct, msg, eta_seconds).
+    :param is_cancelled: Функция проверки отмены: callback() -> bool.
     :return: Список словарей с характеристиками отобранных вышек: [{'lat', 'lon', 'azimuth', 'height', ...}].
     """
     area_poly = getattr(task, "area", [])
     if not area_poly or len(area_poly) < 3:
+        return []
+
+    # Читаем параметры из task, если они заданы
+    grid_step_m = getattr(task, "grid_step_m", grid_step_m)
+    azimuth_step_deg = getattr(task, "azimuth_step_deg", azimuth_step_deg)
+    target_coverage_ratio = getattr(task, "target_coverage_ratio", target_coverage_ratio)
+    min_gain_tiles = getattr(task, "min_gain_tiles", min_gain_tiles)
+    max_sectors_per_site = getattr(task, "max_sectors_per_site", max_sectors_per_site)
+    min_quality_level = getattr(task, "min_quality_level", min_quality_level)
+    progress_cb = getattr(task, "progress_callback", progress_callback)
+    check_cancelled = getattr(task, "is_cancelled", is_cancelled)
+
+    if check_cancelled and check_cancelled():
         return []
 
     forbidden = getattr(task, "forbidden", []) or []
@@ -194,6 +238,29 @@ def optimize_coverage(
     tilt = float(tower_type.get("tilt", 4.0))
     beamwidth = float(tower_type.get("beamwidth", 65.0))
 
+    # Выбор порога радиосигнала
+    # THRESHOLDS в calculations.py:
+    # 0: green (-55 дБм), 1: excellent (-70 дБм), 2: good (-85 дБм), 3: weak (-105 дБм)
+    if min_quality_level == "excellent":
+        reach_col = 1
+        req_level = 3
+        quality_desc = "отличного (≥ -70 дБм)"
+    elif min_quality_level == "green":
+        reach_col = 0
+        req_level = 4
+        quality_desc = "зелёного (≥ -55 дБм)"
+    elif min_quality_level == "weak":
+        reach_col = 3
+        req_level = 1
+        quality_desc = "любого (≥ -105 дБм)"
+    else:  # default: "good" (средняя зона и выше, >= -85 дБм)
+        reach_col = 2
+        req_level = 2
+        quality_desc = "среднего (≥ -85 дБм)"
+
+    if progress_cb:
+        progress_cb(5.0, f"Этап 1/5: Дискретизация целевой сетки (порог: {quality_desc})...", None)
+
     # --- ЭТАП 1: Дискретизация целевой зоны на сетку ---
     t_lats, t_lons, actual_step = coverage.sample_polygon(
         area_poly, forbidden=forbidden, step_m=grid_step_m, max_points=25000
@@ -202,8 +269,14 @@ def optimize_coverage(
     if total_tiles == 0:
         return []
 
+    if check_cancelled and check_cancelled():
+        return []
+
     # Множество ещё непокрытых индексов
     uncovered_mask = np.ones(total_tiles, dtype=bool)
+
+    if progress_cb:
+        progress_cb(12.0, "Этап 2/5: Анализ площадок на крышах зданий...", None)
 
     # --- ЭТАП 2: Поиск площадок-кандидатов (доминантных высот) ---
     sites = find_candidate_sites(
@@ -216,19 +289,24 @@ def optimize_coverage(
     if not sites:
         return []
 
+    if check_cancelled and check_cancelled():
+        return []
+
     # --- ЭТАП 3: Генерация направленных секторов и предрасчёт зон покрытия ---
     if beamwidth >= 330.0:
-        # Для круговой антенны (Omni) достаточно одного направления
         azimuth_angles = [0.0]
     else:
-        # Для секторной антенны — дискретный шаг (например, 0°, 45°, 90°, ...)
         azimuth_angles = list(np.arange(0.0, 360.0, azimuth_step_deg))
 
     candidate_sectors: List[CandidateSector] = []
+    t_start_phase3 = time.perf_counter()
+    num_sites = len(sites)
 
-    for site in sites:
+    for site_idx, site in enumerate(sites):
+        if check_cancelled and check_cancelled():
+            return []
+
         for az in azimuth_angles:
-            # Создаём временную вышку для быстрого расчёта лучей
             t = Tower(
                 name="cand",
                 lat=site.lat,
@@ -243,12 +321,14 @@ def optimize_coverage(
                 beamwidth=float(beamwidth),
                 building_data=building_data,
             )
-            # Уровни сигнала в целевых точках сетки
+
+            # Берём дальность до границы выбранного качества покрытия (по умолчанию reach[:, 2] = -85 дБм, "средняя зона")
+            quality_reach = t.reach[:, reach_col]
+
             mask_u64 = None
             if c_coverage.is_c_available():
-                # Быстрый расчёт маски зоны сектора в Си
                 mask_u64, count = c_coverage.c_compute_sector_mask(
-                    t_lats, t_lons, site.lat, site.lon, t.reach[:, -1]
+                    t_lats, t_lons, site.lat, site.lon, quality_reach
                 )
                 if count >= min_gain_tiles:
                     candidate_sectors.append(CandidateSector(
@@ -261,7 +341,7 @@ def optimize_coverage(
                     ))
             else:
                 levels = coverage.level_at_points(t, t_lats, t_lons)
-                covered_idx = np.where(levels >= 1)[0]
+                covered_idx = np.where(levels >= req_level)[0]
                 if len(covered_idx) >= min_gain_tiles:
                     candidate_sectors.append(CandidateSector(
                         site=site,
@@ -271,10 +351,28 @@ def optimize_coverage(
                         tower_instance=t,
                     ))
 
+        # Оценка оставшегося времени (ETA)
+        done_sites = site_idx + 1
+        elapsed = time.perf_counter() - t_start_phase3
+        sec_per_site = elapsed / max(done_sites, 1)
+        remaining_sites = num_sites - done_sites
+        eta_sec = sec_per_site * remaining_sites + 0.3
+        pct = 15.0 + 65.0 * (done_sites / num_sites)
+
+        if progress_cb:
+            msg = f"Этап 3/5: Расчёт зон секторов (площадка {done_sites}/{num_sites}, кандидатов: {len(candidate_sectors)})..."
+            progress_cb(pct, msg, eta_sec)
+
     if not candidate_sectors:
         return []
 
+    if check_cancelled and check_cancelled():
+        return []
+
     # --- ЭТАП 4: Итеративный жадный отбор и ЭТАП 5: Очистка дублей ---
+    if progress_cb:
+        progress_cb(82.0, f"Этап 4/5: Жадный отбор секторов (цель: ≥ {target_coverage_ratio * 100:.0f}% {quality_desc})...", 0.5)
+
     selected: List[CandidateSector] = []
 
     # 1. Если скомпилировано Си-ядро — используем сверхбыстрый битовый движок
@@ -299,6 +397,9 @@ def optimize_coverage(
         target_covered_count = int(total_tiles * target_coverage_ratio)
 
         while len(selected) < max_towers:
+            if check_cancelled and check_cancelled():
+                return []
+
             current_covered = total_tiles - int(uncovered_mask.sum())
             if current_covered >= target_covered_count:
                 break
@@ -328,6 +429,8 @@ def optimize_coverage(
 
         # Зачистка дублей в Python fallback
         if len(selected) > 1:
+            if progress_cb:
+                progress_cb(94.0, "Этап 5/5: Очистка избыточных дублирующих секторов...", 0.2)
             pruned_selected: List[CandidateSector] = list(selected)
             for s in reversed(selected):
                 others = [o for o in pruned_selected if o is not s]
@@ -339,6 +442,9 @@ def optimize_coverage(
                 if np.all(other_covered[s.covered_indices]):
                     pruned_selected.remove(s)
             selected = pruned_selected
+
+    if progress_cb:
+        progress_cb(100.0, f"Готово! Отобрано оптимальных секторов: {len(selected)}", 0.0)
 
     # Формируем итоговый результат
     result: List[Dict[str, Any]] = []
@@ -357,6 +463,7 @@ def optimize_coverage(
             "building_id": s.site.building_id,
             "site_name": s.site.name,
             "gain_tiles": tiles_count,
+            "quality_level": min_quality_level,
         })
 
     return result

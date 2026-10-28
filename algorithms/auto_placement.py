@@ -24,6 +24,14 @@ class PlacementTask:
     tower_type: dict = field(default_factory=dict)  # параметры вышки (freq, power, height, ...)
     max_towers: int = 10
     building_data: object = None                 # buildings.BuildingData или None
+    target_coverage_ratio: float = 0.95          # целевая доля среднего покрытия (например, 0.95 для >= 95%)
+    min_quality_level: str = "good"              # "good" (средняя зона и выше, >= -85 дБм), "weak", "excellent"
+    grid_step_m: float = 20.0                    # шаг целевой сетки (м)
+    azimuth_step_deg: float = 45.0               # шаг перебора азимута (градусы)
+    min_gain_tiles: int = 3                      # минимальный полезный прирост точек
+    max_sectors_per_site: int = 3                # максимум секторов на одну крышу / площадку
+    progress_callback: object = None             # callback(pct, msg, eta_s)
+    is_cancelled: object = None                  # callback() -> bool
 
     def is_allowed(self, lat, lon):
         """Точка внутри участка и вне запретных зон."""

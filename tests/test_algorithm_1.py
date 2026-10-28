@@ -177,6 +177,53 @@ class TestAlgorithm1(unittest.TestCase):
         )
         self.assertEqual(set(selected), {0, 1})
 
+    def test_quality_level_average_coverage(self):
+        """Проверка расчёта покрытия для средней зоны (good, >= -85 дБм)."""
+        task = PlacementTask(
+            area=self.area_poly,
+            forbidden=[],
+            tower_type=self.tower_type,
+            max_towers=5,
+            target_coverage_ratio=0.95,
+            min_quality_level="good",
+        )
+        res = algorithm_1.optimize_coverage(task, grid_step_m=30.0)
+        self.assertGreater(len(res), 0)
+        for s in res:
+            self.assertEqual(s.get("quality_level"), "good")
+            self.assertGreater(s.get("gain_tiles", 0), 0)
+
+    def test_progress_callback_and_cancellation(self):
+        """Проверка вызова progress_callback с оценкой ETA и досрочной отмены."""
+        progress_events = []
+
+        def on_prog(pct, msg, eta_s):
+            progress_events.append((pct, msg, eta_s))
+
+        task = PlacementTask(
+            area=self.area_poly,
+            forbidden=[],
+            tower_type=self.tower_type,
+            max_towers=3,
+            progress_callback=on_prog,
+        )
+        res = algorithm_1.optimize_coverage(task, grid_step_m=30.0)
+        self.assertGreater(len(res), 0)
+        self.assertGreater(len(progress_events), 0)
+        # Проверяем, что прогресс дошёл до 100%
+        self.assertEqual(progress_events[-1][0], 100.0)
+
+        # Тест отмены
+        task_cancelled = PlacementTask(
+            area=self.area_poly,
+            forbidden=[],
+            tower_type=self.tower_type,
+            max_towers=5,
+            is_cancelled=lambda: True,
+        )
+        res_cancelled = algorithm_1.optimize_coverage(task_cancelled, grid_step_m=30.0)
+        self.assertEqual(res_cancelled, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,8 +4,8 @@ import math
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-                             QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextBrowser,
-                             QVBoxLayout, QWidget)
+                             QGroupBox, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton,
+                             QTextBrowser, QVBoxLayout, QWidget)
 
 import geo
 from calculations import ZONE_LABELS_RU, eirp_dbm, quality_of
@@ -345,3 +345,66 @@ class CalculatorDialog(QDialog):
         q = quality_of(prx)
         self.prx_out.setText(f"<b>{prx:.1f} дБм</b> — <span style='color:{QUALITY_COLORS[q]}'>"
                              f"{ZONE_LABELS_RU.get(q, 'нет покрытия')}</span>")
+
+
+class AlgoProgressDialog(QDialog):
+    """Окно отображения прогресса работы алгоритма расстановки вышек и оставшегося времени."""
+
+    def __init__(self, parent=None, on_cancel=None):
+        super().__init__(parent)
+        self.setWindowTitle("Расчёт автоматической расстановки вышек")
+        self.setFixedWidth(480)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._on_cancel = on_cancel
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(12)
+        lay.setContentsMargins(20, 18, 20, 18)
+
+        self.title_lbl = QLabel("<b>Оптимизация радиопокрытия (Алгоритм 1)</b>")
+        self.title_lbl.setStyleSheet("font-size: 14px; font-weight: bold;")
+        lay.addWidget(self.title_lbl)
+
+        self.phase_lbl = QLabel("Инициализация алгоритма...")
+        self.phase_lbl.setWordWrap(True)
+        self.phase_lbl.setStyleSheet("color: #64748b; font-size: 12px;")
+        lay.addWidget(self.phase_lbl)
+
+        self.pbar = QProgressBar()
+        self.pbar.setRange(0, 100)
+        self.pbar.setValue(0)
+        self.pbar.setTextVisible(True)
+        self.pbar.setStyleSheet("QProgressBar { height: 18px; border-radius: 4px; text-align: center; }")
+        lay.addWidget(self.pbar)
+
+        info_box = QHBoxLayout()
+        self.time_lbl = QLabel("Оценка времени...")
+        self.time_lbl.setStyleSheet("font-weight: 600; color: #2563eb;")
+        info_box.addWidget(self.time_lbl)
+        info_box.addStretch()
+        lay.addLayout(info_box)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        self.btn_cancel = QPushButton("Отмена")
+        self.btn_cancel.setFixedWidth(100)
+        self.btn_cancel.clicked.connect(self._handle_cancel)
+        btn_box.addWidget(self.btn_cancel)
+        lay.addLayout(btn_box)
+
+    def update_progress(self, pct: int, msg: str, eta_s: float):
+        self.pbar.setValue(max(0, min(100, pct)))
+        self.phase_lbl.setText(msg)
+        if eta_s is not None and eta_s >= 0:
+            m = int(eta_s // 60)
+            s = int(eta_s % 60)
+            self.time_lbl.setText(f"Осталось времени: ~{m:02d}:{s:02d}")
+        else:
+            self.time_lbl.setText("Расчёт оставшегося времени...")
+
+    def _handle_cancel(self):
+        self.btn_cancel.setEnabled(False)
+        self.phase_lbl.setText("Прерывание расчёта...")
+        if self._on_cancel:
+            self._on_cancel()
+        self.reject()

@@ -21,8 +21,8 @@ import theme as theming
 import netcatalog
 from buildings import BuildingData
 from calculations import FRONT_TO_BACK_DB, THRESHOLDS, ZONE_LABELS_RU, link_analysis
-from dialogs import (CalculatorDialog, CreateTypeDialog, EditTowerDialog, LinkProfileDialog,
-                     QUALITY_COLORS)
+from dialogs import (AlgoProgressDialog, CalculatorDialog, CreateTypeDialog, EditTowerDialog,
+                     LinkProfileDialog, QUALITY_COLORS)
 from net_ui import NetworkMixin
 from network import Network
 from ribbon import RibbonBar
@@ -122,16 +122,36 @@ class CalcWorker(QThread):
 
 
 class AlgoWorker(QThread):
+    progress = pyqtSignal(int, str, float)       # pct, msg, eta_seconds
     done = pyqtSignal(object)
     failed = pyqtSignal(str, bool)               # сообщение, «не реализован»
+    cancelled = pyqtSignal()
 
     def __init__(self, func, task):
         super().__init__()
         self.func, self.task = func, task
+        self._is_cancelled = False
+        self.task.is_cancelled = self.is_cancelled
+        self.task.progress_callback = self.on_progress
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._is_cancelled
+
+    def on_progress(self, pct: float, msg: str, eta_s=None):
+        if self._is_cancelled:
+            return
+        self.progress.emit(int(pct), str(msg), float(eta_s) if eta_s is not None else -1.0)
 
     def run(self):
         try:
-            self.done.emit(self.func(self.task))
+            res = self.func(self.task)
+            if self._is_cancelled:
+                self.cancelled.emit()
+            else:
+                self.done.emit(res)
         except NotImplementedError as exc:
             self.failed.emit(str(exc), True)
         except Exception as exc:                  # ошибка в алгоритме не должна ронять программу
@@ -451,6 +471,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                                              tip="<b>Каталог антенн</b><br>База данных серийных антенн (Huawei, Kathrein, Ericsson, CommScope...).<br>Выбор усиления, частот и мощности.")
         self.act_create_structure = self._act("Каркас вышки", "structure", self.open_create_structure_dialog,
                                               tip="<b>Каркас вышки</b><br>Создание опорной конструкции (решётчатой башни, мачты, столба).<br>Позволяет размещать несколько секторов на одной опоре.")
+        self.act_auto_network = self._act("Авто-сеть", "network", self.auto_build_network, shortcut="Ctrl+W",
+                                          tip="<b>Авто-сеть (Ctrl+W)</b><br>Автоматически объединить вышки в маршрутизаторы CSR и ядро сети (5GC).")
         self.act_net_auto = self._act("Авто-IP", "sliders", self.net_autoconfigure,
                                       tip="<b>Авто-IP</b><br>Автоматическое назначение IP-адресов подсетей (/30, /24) и построение таблиц маршрутизации.")
         self.act_bom = self._act("Спецификация", "list", self.net_export_bom,
@@ -549,6 +571,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self._cable_menu = self.build_cable_menu()
         g.add_action(m["device"], self._device_menu)
         g.add_action(m["cable"], self._cable_menu)
+        g.add_action(self.act_auto_network)
         g.add_action(self.act_net_auto)
         g.add_action(self.act_snmp)
         g.add_action(self.act_bom)
@@ -673,13 +696,58 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.algo_combo = QComboBox()
         self.algo_combo.addItems(list(auto_placement.ALGORITHMS.keys()))
         lay.addWidget(self.algo_combo)
-        row = QLabel("Максимум вышек:")
-        row.setProperty("role", "dim")
-        lay.addWidget(row)
+
+        form_algo = QFormLayout()
+        form_algo.setContentsMargins(0, 4, 0, 4)
+        form_algo.setSpacing(4)
+
+        self.algo_target_cov_spin = QSpinBox()
+        self.algo_target_cov_spin.setRange(50, 100)
+        self.algo_target_cov_spin.setValue(95)
+        self.algo_target_cov_spin.setSuffix(" %")
+        form_algo.addRow("Цель покрытия:", self.algo_target_cov_spin)
+
+        self.algo_quality_combo = QComboBox()
+        self.algo_quality_combo.addItem("Средняя и лучше (≥ -85 дБм)", "good")
+        self.algo_quality_combo.addItem("Отличная и лучше (≥ -70 дБм)", "excellent")
+        self.algo_quality_combo.addItem("Любое покрытие (≥ -105 дБм)", "weak")
+        form_algo.addRow("Качество зоны:", self.algo_quality_combo)
+
         self.max_towers_spin = QSpinBox()
         self.max_towers_spin.setRange(1, 500)
         self.max_towers_spin.setValue(10)
-        lay.addWidget(self.max_towers_spin)
+        form_algo.addRow("Максимум вышек:", self.max_towers_spin)
+
+        self.algo_grid_step_spin = QSpinBox()
+        self.algo_grid_step_spin.setRange(5, 100)
+        self.algo_grid_step_spin.setValue(20)
+        self.algo_grid_step_spin.setSuffix(" м")
+        form_algo.addRow("Шаг сетки:", self.algo_grid_step_spin)
+
+        self.algo_azimuth_combo = QComboBox()
+        self.algo_azimuth_combo.addItem("45° (8 направлений)", 45.0)
+        self.algo_azimuth_combo.addItem("30° (12 направлений)", 30.0)
+        self.algo_azimuth_combo.addItem("60° (6 направлений)", 60.0)
+        self.algo_azimuth_combo.addItem("90° (4 направления)", 90.0)
+        form_algo.addRow("Шаг азимута:", self.algo_azimuth_combo)
+
+        self.algo_max_sectors_site = QSpinBox()
+        self.algo_max_sectors_site.setRange(1, 6)
+        self.algo_max_sectors_site.setValue(3)
+        form_algo.addRow("Секторов/крыша:", self.algo_max_sectors_site)
+
+        self.algo_min_gain_spin = QSpinBox()
+        self.algo_min_gain_spin.setRange(1, 50)
+        self.algo_min_gain_spin.setValue(3)
+        self.algo_min_gain_spin.setSuffix(" тчк")
+        form_algo.addRow("Мин. прирост:", self.algo_min_gain_spin)
+
+        self.chk_algo_build_net = QCheckBox("Построить сеть (CSR + ядро 5GC)")
+        self.chk_algo_build_net.setChecked(True)
+        form_algo.addRow("", self.chk_algo_build_net)
+
+        lay.addLayout(form_algo)
+
         self.btn_run_algo = QPushButton("Запустить алгоритм")
         self.btn_run_algo.setProperty("primary", True)
         self.btn_run_algo.clicked.connect(self.run_algorithm)
@@ -1369,13 +1437,18 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             self._bump_counter(tower.name)
             t_id = tower.db_id
             t_name = tower.name
-            def undo_place():
-                self.db.delete_tower(t_id)
-                self.towers = [x for x in self.towers if x.db_id != t_id]
-                if self.selected_id == t_id:
-                    self.selected_id = None
-                self._refresh_all()
-            self.push_undo(undo_place, f"Размещение «{t_name}»")
+            if job.get("from_algorithm"):
+                if not hasattr(self, "_algo_created_ids"):
+                    self._algo_created_ids = []
+                self._algo_created_ids.append(t_id)
+            else:
+                def undo_place():
+                    self.db.delete_tower(t_id)
+                    self.towers = [x for x in self.towers if x.db_id != t_id]
+                    if self.selected_id == t_id:
+                        self.selected_id = None
+                    self._refresh_all()
+                self.push_undo(undo_place, f"Размещение «{t_name}»")
 
     def _bump_counter(self, name):
         """Счётчик имён «Вышка #N» не должен выдавать уже занятые номера (импорт, алгоритм)."""
@@ -1415,6 +1488,35 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         if getattr(self, "_pending_network", None) and not self._job_queue:
             self._apply_pending_network()
         self._refresh_all()
+
+        if getattr(self, "_algo_in_progress", False) and not self._job_queue:
+            self._algo_in_progress = False
+            created_ids = list(getattr(self, "_algo_created_ids", []))
+            self._algo_created_ids = []
+            pre_net = getattr(self, "_algo_pre_net_dict", None)
+            build_net = getattr(self, "_algo_build_net", False)
+
+            net_stats = None
+            if build_net and self.towers:
+                from networking.auto_network import build_backhaul_network
+                net_stats = build_backhaul_network(self.net, self.towers, self.building_data)
+                self.net_after_change(persist=True)
+
+            def undo_entire_algorithm():
+                for tid in created_ids:
+                    self.db.delete_tower(tid)
+                self.towers = [x for x in self.towers if x.db_id not in set(created_ids)]
+                if pre_net:
+                    self.net = Network.from_dict(pre_net)
+                    self.net_after_change(persist=True)
+                self._refresh_all()
+                self.statusBar().showMessage(f"Откат алгоритма: удалено вышек: {len(created_ids)}")
+
+            desc = f"Алгоритм: размещение {len(created_ids)} вышек"
+            if net_stats and net_stats.get("routers", 0) > 0:
+                desc += f" и сети ({net_stats['routers']} маршр.)"
+            self.push_undo(undo_entire_algorithm, desc)
+
         use_bd = self.chk_buildings.isChecked()
         if info["count"] == 1:
             t = self._current_tower()
@@ -2125,27 +2227,81 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         if self._algo_worker and self._algo_worker.isRunning():
             return
         type_name = self.active_type_combo.currentText()
+
+        target_ratio = self.algo_target_cov_spin.value() / 100.0
+        quality_level = self.algo_quality_combo.currentData() or "good"
+        grid_step = float(self.algo_grid_step_spin.value())
+        azimuth_step = float(self.algo_azimuth_combo.currentData() if self.algo_azimuth_combo.currentData() is not None else 45.0)
+        max_sec_site = self.algo_max_sectors_site.value()
+        min_gain = self.algo_min_gain_spin.value()
+
+        self._algo_pre_tower_ids = [t.db_id for t in self.towers]
+        self._algo_pre_net_dict = self.net.to_dict()
+        self._algo_build_net = self.chk_algo_build_net.isChecked()
+        self._algo_created_ids = []
+        self._algo_in_progress = True
+
         task = auto_placement.PlacementTask(
-            area=[tuple(p) for p in self.zone_algo], forbidden=[[tuple(p) for p in f] for f in self.zone_forbidden],
-            tower_type=dict(self.tower_types[type_name]), max_towers=self.max_towers_spin.value(),
-            building_data=self.building_data if self.chk_buildings.isChecked() else None)
+            area=[tuple(p) for p in self.zone_algo],
+            forbidden=[[tuple(p) for p in f] for f in self.zone_forbidden],
+            tower_type=dict(self.tower_types[type_name]),
+            max_towers=self.max_towers_spin.value(),
+            building_data=self.building_data if self.chk_buildings.isChecked() else None,
+            target_coverage_ratio=target_ratio,
+            min_quality_level=quality_level,
+            grid_step_m=grid_step,
+            azimuth_step_deg=azimuth_step,
+            min_gain_tiles=min_gain,
+            max_sectors_per_site=max_sec_site,
+        )
         func = auto_placement.ALGORITHMS[self.algo_combo.currentText()]
         self._algo_worker = AlgoWorker(func, task)
-        self._algo_worker.done.connect(lambda pts: self._on_algo_done(pts, type_name))
-        self._algo_worker.failed.connect(self._on_algo_failed)
+
+        prog_dlg = AlgoProgressDialog(self, on_cancel=self._algo_worker.cancel)
+        self._algo_progress_dlg = prog_dlg
+
+        self._algo_worker.progress.connect(prog_dlg.update_progress)
+        self._algo_worker.done.connect(lambda pts: self._on_algo_done(pts, type_name, prog_dlg))
+        self._algo_worker.failed.connect(lambda msg, ni: self._on_algo_failed(msg, ni, prog_dlg))
+        self._algo_worker.cancelled.connect(lambda: self._on_algo_cancelled(prog_dlg))
+
         self.btn_run_algo.setEnabled(False)
         self.statusBar().showMessage("Алгоритм работает…")
         self._algo_worker.start()
+        prog_dlg.show()
 
-    def _on_algo_done(self, points, type_name):
+    def _on_algo_done(self, points, type_name, dlg=None):
+        if dlg:
+            dlg.close()
         self.btn_run_algo.setEnabled(True)
         td = self.tower_types[type_name]
         jobs = []
         for p in points or []:
             lat, lon = (p["lat"], p["lon"]) if isinstance(p, dict) else (p[0], p[1])
             job = self._job_from_type(self._next_name(), lat, lon, type_name, td)
+            job["from_algorithm"] = True
+
+            # Установка на кровлю здания (если есть высота здания)
+            bld_h = 0.0
+            if self.building_data:
+                try:
+                    bld_h = float(self.building_data.heights_at([lat], [lon])[0])
+                except Exception:
+                    bld_h = 0.0
+            if bld_h <= 0.0 and isinstance(p, dict) and p.get("height", 0) > 10.0:
+                bld_h = float(p["height"]) - 5.0
+
+            if bld_h > 0.0:
+                bid = p.get("building_id") if isinstance(p, dict) else ""
+                job["mount"] = {"type": "building", "id": str(bid or ""), "offset": 5.0, "bld_h": bld_h}
+                job["params"]["height"] = bld_h + 5.0
+            else:
+                job["mount"] = {"type": "ground", "id": None, "offset": 0.0, "bld_h": 0.0}
+                if isinstance(p, dict) and "height" in p:
+                    job["params"]["height"] = float(p["height"])
+
             if isinstance(p, dict):
-                for k in ("azimuth", "beamwidth", "height", "tilt"):
+                for k in ("azimuth", "beamwidth", "tilt"):
                     if k in p:
                         job["params"][k] = float(p[k])
             jobs.append(job)
@@ -2153,10 +2309,40 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         if jobs:
             self._enqueue(jobs)
 
-    def _on_algo_failed(self, msg, not_implemented):
+    def _on_algo_failed(self, msg, not_implemented, dlg=None):
+        if dlg:
+            dlg.close()
         self.btn_run_algo.setEnabled(self.zone_algo is not None)
         self.statusBar().showMessage("Алгоритм не выполнен")
         (QMessageBox.information if not_implemented else QMessageBox.warning)(self, "Алгоритм", msg)
+
+    def _on_algo_cancelled(self, dlg=None):
+        if dlg:
+            dlg.close()
+        self.btn_run_algo.setEnabled(self.zone_algo is not None)
+        self.statusBar().showMessage("Расчёт алгоритма отменён пользователем")
+
+    def auto_build_network(self):
+        """Автоматическое построение транспортной сети вышек (Ctrl+W): БС, маршрутизаторы CSR, ядро 5GC."""
+        if not self.towers:
+            self.statusBar().showMessage("Нет вышек на карте для построения сети.")
+            QMessageBox.information(self, "Авто-сеть", "Сначала расставьте или добавьте вышки на карте.")
+            return
+
+        prev_net = self.net.to_dict()
+        from networking.auto_network import build_backhaul_network
+        stats = build_backhaul_network(self.net, self.towers, self.building_data)
+
+        self.net_after_change(persist=True)
+        msg = f"Сеть построена: маршрутизаторов {stats.get('routers', 0)}, линков {stats.get('links', 0)}. Ядро: 5GC."
+        self.statusBar().showMessage(msg)
+
+        def undo_autonet():
+            self.net = Network.from_dict(prev_net)
+            self.net_after_change(persist=True)
+            self.statusBar().showMessage("Откат авто-построения сети.")
+
+        self.push_undo(undo_autonet, "Авто-построение сети")
 
     # ------------------------------------------------------------------ #
     #  Линейка и замер сигнала
