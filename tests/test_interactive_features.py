@@ -2,6 +2,11 @@
 радиальное меню, 3D луч камеры и режим лучшего покрытия со штриховкой.
 """
 import math
+try:
+    import _bootstrap
+except ImportError:
+    pass
+
 import os
 import sys
 import unittest

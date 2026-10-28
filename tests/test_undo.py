@@ -1,4 +1,9 @@
 """Тесты функции Отмены действий (Ctrl+Z / Undo)."""
+try:
+    import _bootstrap
+except ImportError:
+    pass
+
 import unittest
 import theme
 

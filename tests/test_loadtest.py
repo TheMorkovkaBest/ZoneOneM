@@ -1,3 +1,8 @@
+try:
+    import _bootstrap
+except ImportError:
+    pass
+
 import os
 import sys
 import unittest

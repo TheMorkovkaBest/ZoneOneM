@@ -1,3 +1,8 @@
+try:
+    import _bootstrap
+except ImportError:
+    pass
+
 import json
 import os
 import random

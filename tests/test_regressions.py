@@ -1,4 +1,9 @@
 """Регрессионные тесты к исправлениям: загрузка зданий, растеризация, сеть (кабели, импорт, пути L2)."""
+try:
+    import _bootstrap
+except ImportError:
+    pass
+
 import math
 import os
 import random

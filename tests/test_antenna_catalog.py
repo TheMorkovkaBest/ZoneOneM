@@ -1,4 +1,9 @@
 """Тесты каталога антенн и опорных конструкций."""
+try:
+    import _bootstrap
+except ImportError:
+    pass
+
 import os
 import sqlite3
 import unittest

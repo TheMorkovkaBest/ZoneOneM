@@ -1,4 +1,9 @@
 """Дымовой тест логики gui.py на заглушке Qt (см. qt_stub.py)."""
+try:
+    import _bootstrap
+except ImportError:
+    pass
+
 import json
 import math
 import os
