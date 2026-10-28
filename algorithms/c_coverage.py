@@ -32,15 +32,20 @@ def get_c_library() -> Optional[ctypes.CDLL]:
     if _LIB is not None:
         return _LIB
 
-    lib_name = "libc_coverage.dylib" if sys.platform == "darwin" else "libc_coverage.so"
+    if sys.platform == "darwin":
+        lib_name = "libc_coverage.dylib"
+    elif sys.platform == "win32":
+        lib_name = "libc_coverage.dll"
+    else:
+        lib_name = "libc_coverage.so"
     lib_path = _DIR / lib_name
     c_source = _DIR / "c_coverage.c"
 
     if not lib_path.exists() and c_source.exists():
         _compile_c_lib(c_source, lib_path)
 
-    if not lib_path.exists():
-        # Попробуем альтернативное расширение
+    if not lib_path.exists() and sys.platform != "win32":
+        # Попробуем альтернативное расширение (macOS / Linux)
         alt_path = _DIR / ("libc_coverage.so" if sys.platform == "darwin" else "libc_coverage.dylib")
         if alt_path.exists():
             lib_path = alt_path

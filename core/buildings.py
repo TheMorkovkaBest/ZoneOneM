@@ -27,17 +27,17 @@ TILE = 256
 # Публичные серверы Overpass часто отвечают 502/504 или по 20–35 с, поэтому опрашиваются
 # параллельно (по OVERPASS_PARALLEL), а первым идёт сервер, ответивший успешно в прошлый раз.
 OVERPASS_URLS = [
+    "https://overpass.openstreetmap.fr/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
     "https://lz4.overpass-api.de/api/interpreter",
     "https://z.overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-    "https://overpass.openstreetmap.fr/api/interpreter",
 ]
 OVERPASS_PARALLEL = 3
-HTTP_TIMEOUT = (10.0, 60.0)       # (соединение, чтение), с
+HTTP_TIMEOUT = (4.0, 30.0)       # (соединение, чтение), с
 FAIL_COOLDOWN_S = 20.0
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 ZoneM/1.0"
+USER_AGENT = "ZoneOneM/1.0 (https://github.com/TheMorkovkaBest/ZoneOneM; radio planning student project)"
 RASTER_CHUNK = 200               # зданий за один захват блокировки (расчёт вышки не ждёт всю пачку)
 RASTER_FILE = "raster_cache.npz"
 RASTER_VERSION = 1
@@ -103,7 +103,7 @@ def _urllib_download(url, query, headers):
         # 1. Попытка POST
         try:
             req = urllib.request.Request(url, data=encoded_data, headers=headers)
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT[0] + HTTP_TIMEOUT[1], context=ctx) as r:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT[0] + min(20.0, HTTP_TIMEOUT[1]), context=ctx) as r:
                 raw = r.read()
                 if r.headers.get("Content-Encoding") == "gzip" or (len(raw) >= 2 and raw[:2] == b"\x1f\x8b"):
                     raw = gzip.decompress(raw)
@@ -119,7 +119,7 @@ def _urllib_download(url, query, headers):
         try:
             get_url = f"{url}?{urllib.parse.urlencode({'data': query})}"
             req = urllib.request.Request(get_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT[0] + HTTP_TIMEOUT[1], context=ctx) as r:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT[0] + min(20.0, HTTP_TIMEOUT[1]), context=ctx) as r:
                 raw = r.read()
                 if r.headers.get("Content-Encoding") == "gzip" or (len(raw) >= 2 and raw[:2] == b"\x1f\x8b"):
                     raw = gzip.decompress(raw)
@@ -159,7 +159,8 @@ def _download_from_url(url, query, headers):
             raise RuntimeError(f"HTTP {resp.status_code}")
         except Exception as exc:
             ssl_err_cls = getattr(getattr(requests, "exceptions", None), "SSLError", ())
-            if isinstance(exc, ssl_err_cls):
+            proxy_err_cls = getattr(getattr(requests, "exceptions", None), "ProxyError", ())
+            if isinstance(exc, (ssl_err_cls, proxy_err_cls)):
                 try:
                     resp = requests.post(url, data={"data": query}, headers=headers, timeout=HTTP_TIMEOUT, verify=False)
                     if resp.status_code == 200:
@@ -170,11 +171,12 @@ def _download_from_url(url, query, headers):
                         return data
                 except Exception:
                     pass
-            # Запасной путь через стандартную библиотеку urllib
-            try:
-                return _urllib_download(url, query, headers)
-            except Exception:
-                raise exc
+                # Запасной путь через urllib только для обхода специфичных SSL/прокси ошибок requests на Windows
+                try:
+                    return _urllib_download(url, query, headers)
+                except Exception:
+                    raise exc
+            raise exc
 
     return _urllib_download(url, query, headers)
 
@@ -368,11 +370,14 @@ class BuildingData:
                         "ids": [i for i in self._ids if isinstance(i, (str, int))], "sources": self._sources()}
             tmp = self._raster_path().with_suffix(".tmp.npz")
             np.savez_compressed(tmp, keys=keys, tiles=tiles, meta=np.array(json.dumps(meta)))
-            try:
-                tmp.replace(self._raster_path())
-            except PermissionError:
-                # На Windows файл может быть кратковременно заблокирован антивирусом
-                time.sleep(0.05)
+            for attempt in range(5):
+                try:
+                    tmp.replace(self._raster_path())
+                    break
+                except OSError:
+                    # На Windows файл может быть кратковременно заблокирован антивирусом
+                    time.sleep(0.05 * (attempt + 1))
+            else:
                 tmp.replace(self._raster_path())
         except Exception as exc:
             self.last_error = f"растр не сохранён: {exc}"
