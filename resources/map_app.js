@@ -46,7 +46,7 @@
     zones: { algo: null, forbidden: [] }, measure: [], draft: [], rectShape: false,
     probe: null, ready: false, azPreview: null,
     net: { devices: [], links: [] }, selDevice: null, selLink: null, cableFrom: null, traffic: null,
-    mouse: null, towerDrag: null,
+    mouse: null, towerDrag: null, terrainEnabled: true,
     coverageMode: 'standard', selectedTowers: [], selectedDevices: [],
   };
   let map = null, deckOverlay = null;
@@ -784,6 +784,38 @@
   /* ---------------- слои карты (пересоздаются при смене подложки) ---------------- */
   function setupLayers() {
     if (map.getSource('coverage')) return;
+
+    // Источник 3D-рельефа и холмов (AWS Terrarium Elevation Tiles)
+    try {
+      if (!map.getSource('terrain-dem')) {
+        map.addSource('terrain-dem', {
+          type: 'raster-dem',
+          tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+          tileSize: 256,
+          maxzoom: 15,
+          encoding: 'terrarium'
+        });
+      }
+      if (state.terrainEnabled && map.setTerrain) {
+        map.setTerrain({ source: 'terrain-dem', exaggeration: 1.0 });
+      }
+      if (!map.getLayer('hillshade-layer')) {
+        map.addLayer({
+          id: 'hillshade-layer',
+          type: 'hillshade',
+          source: 'terrain-dem',
+          paint: {
+            'hillshade-exaggeration': 0.6,
+            'hillshade-shadow-color': state.theme === 'dark' ? '#11151c' : '#473b24',
+            'hillshade-highlight-color': state.theme === 'dark' ? '#3d4856' : '#ffffff',
+            'hillshade-accent-color': '#000000'
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('Terrain DEM setup error:', e);
+    }
+
     for (const id of ['coverage', 'coverage-active', 'towers', 'zones', 'draft', 'measure', 'azline',
       'netlinks', 'flow', 'trfusers', 'trflines']) map.addSource(id, { type: 'geojson', data: EMPTY });
     for (const src of ['coverage', 'coverage-active']) {
@@ -800,10 +832,10 @@
     try {
       map.addSource('openfreemap-buildings', { type: 'vector', url: 'https://tiles.openfreemap.org/planet' });
       map.addLayer({ id: '3d-buildings-extrusion', source: 'openfreemap-buildings', 'source-layer': 'building',
-        type: 'fill-extrusion', minzoom: 15.5, paint: {
+        type: 'fill-extrusion', minzoom: 15.0, paint: {
           'fill-extrusion-color': state.theme === 'dark' ? '#4a5160' : '#c5ccd6',
-          'fill-extrusion-height': ['*', ['coalesce', ['get', 'render_height'], ['get', 'height'], 15], 1.2],
-          'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], ['get', 'min_height'], 0],
+          'fill-extrusion-height': ['coalesce', ['get', 'render_height'], ['get', 'height'], 15],
+          'fill-extrusion-base': 0,
           'fill-extrusion-opacity': 0.85 } });
     } catch (e) { console.warn('3D buildings unavailable: ' + e); }
     map.addLayer({ id: 'zones-fill', type: 'fill', source: 'zones', paint: {
@@ -1248,6 +1280,27 @@
     flyTo(lat, lon, zoom) { if (map) map.flyTo({ center: [lon, lat], zoom: zoom || map.getZoom() }); },
     fitBounds(latMin, latMax, lonMin, lonMax) {
       if (map) map.fitBounds([[lonMin, latMin], [lonMax, latMax]], { padding: 60, duration: 600 });
+    },
+    setTerrain(enabled) {
+      state.terrainEnabled = !!enabled;
+      if (!map) return;
+      try {
+        if (state.terrainEnabled) {
+          if (map.setTerrain && map.getSource('terrain-dem')) {
+            map.setTerrain({ source: 'terrain-dem', exaggeration: 1.0 });
+          }
+          if (map.getLayer('hillshade-layer')) {
+            map.setLayoutProperty('hillshade-layer', 'visibility', 'visible');
+          }
+        } else {
+          if (map.setTerrain) map.setTerrain(null);
+          if (map.getLayer('hillshade-layer')) {
+            map.setLayoutProperty('hillshade-layer', 'visibility', 'none');
+          }
+        }
+      } catch (err) {
+        console.warn('setTerrain error:', err);
+      }
     },
     setTheme(theme) {
       state.theme = theme;

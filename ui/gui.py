@@ -20,6 +20,7 @@ import geo
 import theme as theming
 import netcatalog
 from buildings import BuildingData
+from terrain import TerrainData
 from calculations import FRONT_TO_BACK_DB, THRESHOLDS, ZONE_LABELS_RU, link_analysis
 from dialogs import (AlgoProgressDialog, CalculatorDialog, CreateTypeDialog, EditTowerDialog,
                      LinkProfileDialog, QUALITY_COLORS)
@@ -62,6 +63,12 @@ class BuildingFetchWorker(QThread):
                 break
             ok = self.building_data.ensure_loaded(lat, lon, need_m=BUILDINGS_NEED_M,
                                                   cancel=lambda: self.cancelled)
+            terrain_data = getattr(self.building_data, "terrain_data", None)
+            if terrain_data is not None and not self.cancelled:
+                try:
+                    terrain_data.ensure_loaded(lat, lon, radius_m=BUILDINGS_NEED_M)
+                except Exception:
+                    pass
             if not self.cancelled:
                 self.area_done.emit(ok)
 
@@ -200,6 +207,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.db = TowerDB()
         self._net_init()
         self.building_data = BuildingData(cache_dir=BASE_DIR / "buildings_cache")
+        self.terrain_data = TerrainData(cache_dir=BASE_DIR / "buildings_cache")
+        self.building_data.terrain_data = self.terrain_data
         self.towers = []
         self.selected_id = None
         self.tower_counter = 1
@@ -394,6 +403,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         QShortcut(QKeySequence("Esc"), self, activated=lambda: self._mode_actions["navigate"].setChecked(True))
         self._mode_actions["navigate"].setChecked(True)      # только теперь: set_mode трогает виджеты интерфейса
         self._update_action_states()
+        self.act_terrain.setChecked(self._setting_bool("model_terrain", True))
         self.web_view.setHtml(load_map_html(), QUrl("http://localhost"))
 
     def _build_actions(self):
@@ -488,6 +498,8 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
                                   tip="<b>Координаты (Ctrl+G)</b><br>Быстрый центрированный переход к точке (широта, долгота).")
         self.act_calc = self._act("Калькулятор", "calc", self.show_calculator, shortcut="Ctrl+K",
                                   tip="<b>Радиокалькулятор (Ctrl+K)</b><br>Бюджет линии связи, зона Френеля и тепловой шум.")
+        self.act_terrain = self._act("3D-рельеф", "layers", self.toggle_terrain, checkable=True)
+        self.act_terrain.setToolTip("<b>3D-рельеф местности (DEM)</b><br>Включение/выключение отображения неровностей земли и холмов на карте.")
         self.act_theme = self._act("Сменить тему", "moon", self.toggle_theme, shortcut="Ctrl+T",
                                    tip="<b>Сменить тему (Ctrl+T)</b><br>Переключение тёмного и светлого оформления.")
         self.act_import = self._act("Импорт проекта…", "upload", self.import_project,
@@ -539,6 +551,7 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
             m.addAction(a)
         m = mb.addMenu("Вид")
         m.addAction(self.act_theme)
+        m.addAction(self.act_terrain)
         m.addAction(self.act_best_server)
         bm = m.addMenu("Подложка карты")
         for a in self.base_actions.values():
@@ -650,6 +663,11 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         self.chk_buildings.setChecked(True)
         self.chk_buildings.toggled.connect(lambda _: self.recalc_all())
         lay.addWidget(self.chk_buildings)
+        self.chk_terrain = QCheckBox("Учитывать неровности рельефа (DEM)")
+        self.chk_terrain.setToolTip("Учёт высот холмов и неровностей местности при расчёте распространения радиосигнала и дифракции")
+        self.chk_terrain.setChecked(self._setting_bool("model_terrain", True))
+        self.chk_terrain.toggled.connect(self._on_terrain_toggled)
+        lay.addWidget(self.chk_terrain)
         self.chk_fresnel = QCheckBox("Дифракция в зоне Френеля (дома ниже антенны)")
         self.chk_fresnel.setToolTip("Здания ниже антенны, попавшие в 1-ю зону Френеля трассы «вышка → абонент», "
                                     "дают потери дифракции (ITU-R P.526, доминирующее препятствие)")
@@ -1251,6 +1269,24 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     # ------------------------------------------------------------------ #
     #  Типы вышек
     # ------------------------------------------------------------------ #
+    def _on_terrain_toggled(self, checked):
+        self.settings.setValue("model_terrain", bool(checked))
+        if hasattr(self, "act_terrain") and self.act_terrain.isChecked() != bool(checked):
+            self.act_terrain.setChecked(bool(checked))
+        if hasattr(self, "building_data") and hasattr(self, "terrain_data"):
+            self.building_data.terrain_data = self.terrain_data if checked else None
+        self._js(f"api.setTerrain({str(checked).lower()});")
+        self.recalc_all()
+
+    def toggle_terrain(self, checked=None):
+        if hasattr(self, "chk_terrain"):
+            if checked is None:
+                checked = not self.chk_terrain.isChecked()
+            if self.chk_terrain.isChecked() != bool(checked):
+                self.chk_terrain.setChecked(bool(checked))
+        else:
+            self._on_terrain_toggled(bool(checked))
+
     def _setting_bool(self, key, default):
         v = self.settings.value(key, default)
         return v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes")

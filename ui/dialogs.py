@@ -212,6 +212,17 @@ class LinkProfileWidget(QWidget):
             p.setBrush(QBrush(QColor(62, 139, 255, 45)))
             p.drawPolygon(QPolygonF(up + low[::-1]))
 
+        # Неровности рельефа (DEM): зелёно-коричневая линия рельефа с полупрозрачной заливкой
+        terrain_h = prof.get("terrain_h")
+        if terrain_h is not None and getattr(terrain_h, "size", 0) > 0 and np.any(terrain_h != 0):
+            t_poly = [QPointF(X(0), Y(0))]
+            for a, th in zip(d, terrain_h):
+                t_poly.append(QPointF(X(a), Y(th)))
+            t_poly.append(QPointF(X(D), Y(0)))
+            p.setPen(QPen(QColor(46, 125, 50, 200), 2))
+            p.setBrush(QBrush(QColor(76, 175, 80, 50)))
+            p.drawPolygon(QPolygonF(t_poly))
+
         # здания: красные — учитываются моделью (не ниже антенны), серые — ниже антенны
         if d.size:
             step_px = X(d[0]) - X(0) if d.size else 1

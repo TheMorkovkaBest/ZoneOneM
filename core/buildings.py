@@ -573,6 +573,28 @@ class BuildingData:
                         tile[ya - ty * TILE:yb - ty * TILE, xa - tx * TILE:xb - tx * TILE]
         if win is None:
             return None
+        terrain_data = getattr(self, "terrain_data", None)
+        if terrain_data is not None:
+            t_elev = terrain_data.get_elevation(lat, lon)
+            if t_elev is not None:
+                # Векторизованно вычисляем координаты ячеек окна
+                m_lon = M_PER_DEG_LAT * math.cos(math.radians(lat))
+                dx_m = (np.arange(side) - (cx - gx0)) * GRID_RES_M
+                dy_m = (np.arange(side) - (cy - gy0)) * GRID_RES_M
+                # Выборочно сэмплируем сетку рельефа (сетка с шагом 8 ячеек ~10 м)
+                step = 8
+                sub_y = np.arange(0, side, step)
+                sub_x = np.arange(0, side, step)
+                grid_dy, grid_dx = np.meshgrid(dy_m[sub_y], dx_m[sub_x], indexing="ij")
+                pts_lat = lat + grid_dy.ravel() / M_PER_DEG_LAT
+                pts_lon = lon + grid_dx.ravel() / m_lon
+                sub_elevs = terrain_data.elevations_at(pts_lat, pts_lon).reshape(grid_dy.shape)
+                rel_elev = sub_elevs - t_elev
+                # Интерполируем на полный размер окна
+                if rel_elev.size > 0 and np.any(rel_elev > 1.0):
+                    full_rel = np.repeat(np.repeat(rel_elev, step, axis=0), step, axis=1)[:side, :side]
+                    pos_relief = np.clip(np.maximum(0.0, full_rel), 0, 255).astype(np.uint8)
+                    win = np.maximum(win, pos_relief)
         return win, cx - gx0, cy - gy0
 
     def _gather(self, gx, gy):
@@ -592,11 +614,19 @@ class BuildingData:
         dists_m = np.asarray(dists_m, dtype=float)
         with self._lock:
             if self._origin is None or not self._tiles or dists_m.size == 0:
-                return np.zeros(dists_m.shape, dtype=float)
-            cx, cy = self._to_cells(lat, lon)
-            gx = np.floor(float(cx) + ux * dists_m / GRID_RES_M).astype(np.int64)
-            gy = np.floor(float(cy) + uy * dists_m / GRID_RES_M).astype(np.int64)
-            return self._gather(gx, gy)
+                b_heights = np.zeros(dists_m.shape, dtype=float)
+            else:
+                cx, cy = self._to_cells(lat, lon)
+                gx = np.floor(float(cx) + ux * dists_m / GRID_RES_M).astype(np.int64)
+                gy = np.floor(float(cy) + uy * dists_m / GRID_RES_M).astype(np.int64)
+                b_heights = self._gather(gx, gy)
+
+        terrain_data = getattr(self, "terrain_data", None)
+        if terrain_data is not None and dists_m.size > 0:
+            t_rel = terrain_data.heights_along(lat, lon, ux, uy, dists_m)
+            # Неровности рельефа (возвышенности) добавляются к профилю высот
+            return np.maximum(0.0, b_heights + np.maximum(0.0, t_rel))
+        return b_heights
 
     def heights_at(self, lats, lons):
         """Высоты зданий (м, 0 — пусто) в массиве точек."""

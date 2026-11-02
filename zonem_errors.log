@@ -1,0 +1,7 @@
+2026-11-01 19:33:04
+Traceback (most recent call last):
+  File "/Users/vladfridman/PycharmProjects/ZoneOneM/ui/gui.py", line 1281, in toggle_terrain
+    checked = not self.chk_terrain.isChecked()
+                  ^^^^^^^^^^^^^^^^
+AttributeError: 'CellTower3DApp' object has no attribute 'chk_terrain'. Did you mean: 'act_terrain'?
+

@@ -437,6 +437,11 @@ def link_analysis(tower, lat, lon, building_data=None, rx_height_m=RX_HEIGHT_M):
     los_clear = bool(not np.any(heights > los_h)) if n else True
     fresnel_clear = float(np.min((los_h - heights) / np.maximum(fresnel_r, 1e-6))) if n else 9.99
 
+    terrain_data = getattr(building_data, "terrain_data", None) if building_data else None
+    terrain_h = np.zeros(n)
+    if terrain_data is not None and n > 0:
+        terrain_h = terrain_data.heights_along(tower.lat, tower.lon, ux, uy, d_arr)
+
     return {
         "distance_m": dist, "azimuth": az, "in_sector": in_sector,
         "eirp_dbm": eirp, "path_loss_db": pl, "wall_loss_db": wall_total,
@@ -447,5 +452,6 @@ def link_analysis(tower, lat, lon, building_data=None, rx_height_m=RX_HEIGHT_M):
         "los_clear": los_clear, "fresnel_clearance": fresnel_clear,
         "profile": {"dist": d_arr, "heights": heights, "hit": hit,
                     "los_h": los_h, "fresnel_r": fresnel_r,
+                    "terrain_h": terrain_h,
                     "tx_h": float(tower.height), "rx_h": float(rx_height_m)},
     }
