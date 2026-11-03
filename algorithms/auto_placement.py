@@ -53,9 +53,15 @@ def algorithm_1(task):
     return algo1.optimize_coverage(task)
 
 
-@register_algorithm("Алгоритм 2 (заглушка)")
+@register_algorithm("Алгоритм 2 (ИИ: нейросеть + проверка)")
 def algorithm_2(task):
-    raise NotImplementedError("Алгоритм 2 ещё не реализован (auto_placement.algorithm_2)")
+    import ai_placement
+    model = ai_placement.load_model()
+    if model is None:            # модель ещё не обучена (нет models/ai_surrogate.npz) — честный запасной путь
+        if task.progress_callback:
+            task.progress_callback(1.0, "ИИ-модель не найдена, работает Алгоритм 1", None)
+        return algorithm_1(task)
+    return ai_placement.ai_place(task, model)
 
 
 @register_algorithm("Алгоритм 3 (заглушка)")
