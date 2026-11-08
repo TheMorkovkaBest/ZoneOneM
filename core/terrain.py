@@ -44,14 +44,29 @@ class TerrainData:
 
         # Кэш: {(round(lat, 4), round(lon, 4)): elevation_m}
         self._point_cache: Dict[Tuple[float, float], float] = {}
+        self._cache_lats: np.ndarray = np.empty(0, dtype=np.float64)
+        self._cache_lons: np.ndarray = np.empty(0, dtype=np.float64)
+        self._cache_elevs: np.ndarray = np.empty(0, dtype=np.float32)
         self.status = "готов"
         self.last_error = ""
         self._load_cache()
+
+    def _rebuild_cache_arrays(self) -> None:
+        if self._point_cache:
+            pts = list(self._point_cache.items())
+            self._cache_lats = np.array([p[0][0] for p in pts], dtype=np.float64)
+            self._cache_lons = np.array([p[0][1] for p in pts], dtype=np.float64)
+            self._cache_elevs = np.array([p[1] for p in pts], dtype=np.float32)
+        else:
+            self._cache_lats = np.empty(0, dtype=np.float64)
+            self._cache_lons = np.empty(0, dtype=np.float64)
+            self._cache_elevs = np.empty(0, dtype=np.float32)
 
     def _load_cache(self) -> int:
         """Загружает сохранённый кэш рельефа с диска."""
         with self._lock:
             if not self.cache_file.exists():
+                self._rebuild_cache_arrays()
                 return 0
             try:
                 data = np.load(self.cache_file, allow_pickle=True)
@@ -60,9 +75,11 @@ class TerrainData:
                 elevs = data.get("elevs", np.array([], dtype=np.float32))
                 for lat, lon, el in zip(lats, lons, elevs):
                     self._point_cache[(round(float(lat), 4), round(float(lon), 4))] = float(el)
+                self._rebuild_cache_arrays()
                 return len(self._point_cache)
             except Exception as e:
                 self.last_error = f"Ошибка чтения кэша рельефа: {e}"
+                self._rebuild_cache_arrays()
                 return 0
 
     def save_cache(self) -> None:
@@ -80,34 +97,79 @@ class TerrainData:
                 self.last_error = f"Ошибка сохранения кэша рельефа: {e}"
 
     def get_elevation(self, lat: float, lon: float) -> Optional[float]:
-        """Возвращает высоту рельефа в точке или None, если данных нет."""
+        """Возвращает высоту рельефа в точке или ближайшую из кэша, либо None, если данных нет."""
         key = (round(lat, 4), round(lon, 4))
         with self._lock:
             if key in self._point_cache:
                 return self._point_cache[key]
+            if len(self._cache_elevs) == 0 and self._point_cache:
+                self._rebuild_cache_arrays()
+            if len(self._cache_elevs) > 0:
+                d_lat = self._cache_lats - lat
+                d_lon = self._cache_lons - lon
+                mask = (np.abs(d_lat) <= 0.008) & (np.abs(d_lon) <= 0.012)
+                if np.any(mask):
+                    sub_idx = np.flatnonzero(mask)
+                    sub_d2 = d_lat[sub_idx] ** 2 + d_lon[sub_idx] ** 2
+                    best_i = sub_idx[np.argmin(sub_d2)]
+                    return float(self._cache_elevs[best_i])
         return None
 
-    def elevations_at(self, lats: Sequence[float], lons: Sequence[float]) -> np.ndarray:
+    def elevations_at(
+        self,
+        lats: Sequence[float],
+        lons: Sequence[float],
+        allow_fetch: bool = False,
+    ) -> np.ndarray:
         """Возвращает массив высот для списка координат (с интерполяцией или кэшем)."""
         if len(lats) == 0:
             return np.zeros(0, dtype=np.float32)
 
-        out = np.zeros(len(lats), dtype=np.float32)
+        arr_lats = np.asarray(lats, dtype=np.float64)
+        arr_lons = np.asarray(lons, dtype=np.float64)
+        out = np.zeros(len(arr_lats), dtype=np.float32)
         missing_indices = []
-        missing_lats = []
-        missing_lons = []
 
         with self._lock:
-            for idx, (lat, lon) in enumerate(zip(lats, lons)):
+            if len(self._cache_elevs) == 0 and self._point_cache:
+                self._rebuild_cache_arrays()
+
+            for idx, (lat, lon) in enumerate(zip(arr_lats, arr_lons)):
                 key = (round(float(lat), 4), round(float(lon), 4))
                 if key in self._point_cache:
                     out[idx] = self._point_cache[key]
                 else:
                     missing_indices.append(idx)
-                    missing_lats.append(float(lat))
-                    missing_lons.append(float(lon))
 
-        if missing_indices:
+            if missing_indices and len(self._cache_elevs) > 0:
+                rem_indices = np.array(missing_indices, dtype=np.intp)
+                m_lats = arr_lats[rem_indices]
+                m_lons = arr_lons[rem_indices]
+
+                min_lat, max_lat = m_lats.min() - 0.01, m_lats.max() + 0.01
+                min_lon, max_lon = m_lons.min() - 0.015, m_lons.max() + 0.015
+
+                c_mask = (
+                    (self._cache_lats >= min_lat)
+                    & (self._cache_lats <= max_lat)
+                    & (self._cache_lons >= min_lon)
+                    & (self._cache_lons <= max_lon)
+                )
+                if np.any(c_mask):
+                    sub_c_lats = self._cache_lats[c_mask]
+                    sub_c_lons = self._cache_lons[c_mask]
+                    sub_c_elevs = self._cache_elevs[c_mask]
+
+                    dist2 = (sub_c_lats[:, None] - m_lats[None, :]) ** 2 + (
+                        sub_c_lons[:, None] - m_lons[None, :]
+                    ) ** 2
+                    nearest = np.argmin(dist2, axis=0)
+                    out[rem_indices] = sub_c_elevs[nearest]
+                    missing_indices = []
+
+        if missing_indices and allow_fetch:
+            missing_lats = arr_lats[missing_indices].tolist()
+            missing_lons = arr_lons[missing_indices].tolist()
             fetched = self._fetch_open_meteo(missing_lats, missing_lons)
             with self._lock:
                 for idx, lat, lon, el in zip(missing_indices, missing_lats, missing_lons, fetched):
@@ -116,6 +178,7 @@ class TerrainData:
                         self._point_cache[(round(lat, 4), round(lon, 4))] = el
                     else:
                         out[idx] = 0.0
+                self._rebuild_cache_arrays()
 
         return out
 
@@ -142,16 +205,14 @@ class TerrainData:
 
         # Загружаем пачками до 80 точек
         all_fetched = True
-        for b_start in range(0, len(sample_lats), 80):
-            b_lats = sample_lats[b_start : b_start + 80]
-            b_lons = sample_lons[b_start : b_start + 80]
-            elevs = self._fetch_open_meteo(b_lats, b_lons)
-            if not elevs or any(e is None for e in elevs):
-                all_fetched = False
-            with self._lock:
-                for p_lat, p_lon, el in zip(b_lats, b_lons, elevs):
-                    if el is not None:
-                        self._point_cache[(round(p_lat, 4), round(p_lon, 4))] = el
+        elevs = self._fetch_open_meteo(sample_lats, sample_lons)
+        if not elevs or any(e is None for e in elevs):
+            all_fetched = False
+        with self._lock:
+            for p_lat, p_lon, el in zip(sample_lats, sample_lons, elevs):
+                if el is not None:
+                    self._point_cache[(round(p_lat, 4), round(p_lon, 4))] = el
+            self._rebuild_cache_arrays()
 
         self.save_cache()
         return all_fetched
@@ -197,27 +258,33 @@ class TerrainData:
         return rel_heights
 
     def _fetch_open_meteo(self, lats: Sequence[float], lons: Sequence[float]) -> List[Optional[float]]:
-        """Выполняет HTTP-запрос к Open-Meteo Elevation API для списка точек."""
+        """Выполняет HTTP-запрос к Open-Meteo Elevation API для списка точек пачками до 80."""
         if not lats:
             return []
 
-        lat_str = ",".join(f"{x:.5f}" for x in lats)
-        lon_str = ",".join(f"{x:.5f}" for x in lons)
-        url = f"{ELEVATION_API_URL}?latitude={lat_str}&longitude={lon_str}"
-
+        out: List[Optional[float]] = []
         ctx = None
         try:
             ctx = ssl._create_unverified_context()
         except Exception:
             pass
 
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        try:
-            kwargs = {"context": ctx} if ctx else {}
-            with urllib.request.urlopen(req, timeout=4.0, **kwargs) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                elevs = data.get("elevation", [])
-                return [float(e) if e is not None else None for e in elevs]
-        except Exception as e:
-            self.last_error = f"Open-Meteo elevation error: {e}"
-            return [None] * len(lats)
+        for b_start in range(0, len(lats), 80):
+            b_lats = lats[b_start : b_start + 80]
+            b_lons = lons[b_start : b_start + 80]
+            lat_str = ",".join(f"{x:.5f}" for x in b_lats)
+            lon_str = ",".join(f"{x:.5f}" for x in b_lons)
+            url = f"{ELEVATION_API_URL}?latitude={lat_str}&longitude={lon_str}"
+
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            try:
+                kwargs = {"context": ctx} if ctx else {}
+                with urllib.request.urlopen(req, timeout=4.0, **kwargs) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    elevs = data.get("elevation", [])
+                    out.extend([float(e) if e is not None else None for e in elevs])
+            except Exception as e:
+                self.last_error = f"Open-Meteo elevation error: {e}"
+                out.extend([None] * len(b_lats))
+
+        return out

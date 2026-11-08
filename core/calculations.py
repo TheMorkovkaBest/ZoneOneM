@@ -135,6 +135,11 @@ def ray_angles(num_rays=NUM_RAYS):
     return np.arange(num_rays) * (360.0 / num_rays)
 
 
+_DEFAULT_ANGLES = ray_angles(NUM_RAYS)
+_DEFAULT_SIN = np.sin(np.radians(_DEFAULT_ANGLES))
+_DEFAULT_COS = np.cos(np.radians(_DEFAULT_ANGLES))
+
+
 def pattern_attenuation_db(angle_deg, azimuth_deg, beamwidth_deg, pattern=True):
     """Ослабление диаграммы направленности относительно главного направления, дБ (число или массив).
 
@@ -292,10 +297,16 @@ def compute_ray_reach(lat, lon, freq_mhz, power_w, height_m, wall_loss_db,
         return RayResult(angles, reach, False)
 
     hw, px, py = win
-    a = np.radians(angles[sel])
+    if len(angles) == NUM_RAYS:
+        sin_a = _DEFAULT_SIN[sel]
+        cos_a = _DEFAULT_COS[sel]
+    else:
+        a = np.radians(angles[sel])
+        sin_a = np.sin(a)
+        cos_a = np.cos(a)
     s = np.arange(1, n_steps + 1, dtype=float)[None, :]            # шаги в ячейках
-    cx = np.floor(px + np.sin(a)[:, None] * s).astype(np.intp)
-    cy = np.floor(py + np.cos(a)[:, None] * s).astype(np.intp)
+    cx = np.floor(px + sin_a[:, None] * s).astype(np.intp)
+    cy = np.floor(py + cos_a[:, None] * s).astype(np.intp)
     np.clip(cx, 0, hw.shape[1] - 1, out=cx)
     np.clip(cy, 0, hw.shape[0] - 1, out=cy)
     heights = hw[cy, cx]                                           # [S, шаги] uint8

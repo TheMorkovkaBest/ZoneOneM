@@ -195,6 +195,8 @@ class BuildingData:
         self._fail_until = 0.0
         self._good_url = None         # сервер, ответивший успешно последним
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self._last_win_key = None
+        self._last_win = None
 
     # ------------------------------------------------------------------ #
     #  Загрузка
@@ -449,6 +451,9 @@ class BuildingData:
         """
         added = 0
         items = list(items)
+        with self._lock:
+            self._last_win_key = None
+            self._last_win = None
         for start in range(0, len(items), RASTER_CHUNK):
             recs = []
             with self._lock:
@@ -554,6 +559,11 @@ class BuildingData:
         with self._lock:
             if self._origin is None or not self._tiles:
                 return None
+            cache_key = (round(lat, 6), round(lon, 6), float(half_m), id(getattr(self, "terrain_data", None)))
+            if self._last_win_key == cache_key and self._last_win is not None:
+                win, px, py = self._last_win
+                return win.copy(), px, py
+
             cx, cy = self._to_cells(lat, lon)
             cx, cy = float(cx), float(cy)
             half = int(math.ceil(half_m / GRID_RES_M)) + 2
@@ -581,20 +591,24 @@ class BuildingData:
                 m_lon = M_PER_DEG_LAT * math.cos(math.radians(lat))
                 dx_m = (np.arange(side) - (cx - gx0)) * GRID_RES_M
                 dy_m = (np.arange(side) - (cy - gy0)) * GRID_RES_M
-                # Выборочно сэмплируем сетку рельефа (сетка с шагом 8 ячеек ~10 м)
-                step = 8
+                # Выборочно сэмплируем сетку рельефа (шаг ~30 м соответствует нативному SRTM DEM)
+                step = 24
                 sub_y = np.arange(0, side, step)
                 sub_x = np.arange(0, side, step)
                 grid_dy, grid_dx = np.meshgrid(dy_m[sub_y], dx_m[sub_x], indexing="ij")
                 pts_lat = lat + grid_dy.ravel() / M_PER_DEG_LAT
                 pts_lon = lon + grid_dx.ravel() / m_lon
-                sub_elevs = terrain_data.elevations_at(pts_lat, pts_lon).reshape(grid_dy.shape)
+                sub_elevs = terrain_data.elevations_at(pts_lat, pts_lon, allow_fetch=False).reshape(grid_dy.shape)
                 rel_elev = sub_elevs - t_elev
                 # Интерполируем на полный размер окна
                 if rel_elev.size > 0 and np.any(rel_elev > 1.0):
                     full_rel = np.repeat(np.repeat(rel_elev, step, axis=0), step, axis=1)[:side, :side]
                     pos_relief = np.clip(np.maximum(0.0, full_rel), 0, 255).astype(np.uint8)
                     win = np.maximum(win, pos_relief)
+
+        with self._lock:
+            self._last_win_key = cache_key
+            self._last_win = (win.copy(), cx - gx0, cy - gy0)
         return win, cx - gx0, cy - gy0
 
     def _gather(self, gx, gy):

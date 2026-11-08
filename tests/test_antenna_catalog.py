@@ -38,26 +38,32 @@ class TestAntennaCatalog(unittest.TestCase):
 
     def test_init_and_load_antennas_db(self):
         conn = sqlite3.connect(":memory:")
-        antennas = antenna_catalog.load_all_antennas(conn)
-        self.assertGreaterEqual(len(antennas), 35)
-        mfrs = {a.manufacturer for a in antennas}
-        self.assertIn("Huawei", mfrs)
-        self.assertIn("Ericsson", mfrs)
-        self.assertIn("Kathrein", mfrs)
-        self.assertIn("CommScope", mfrs)
-        self.assertIn("Nokia", mfrs)
-        self.assertIn("MikroTik", mfrs)
-        self.assertIn("Ubiquiti", mfrs)
+        try:
+            antennas = antenna_catalog.load_all_antennas(conn)
+            self.assertGreaterEqual(len(antennas), 35)
+            mfrs = {a.manufacturer for a in antennas}
+            self.assertIn("Huawei", mfrs)
+            self.assertIn("Ericsson", mfrs)
+            self.assertIn("Kathrein", mfrs)
+            self.assertIn("CommScope", mfrs)
+            self.assertIn("Nokia", mfrs)
+            self.assertIn("MikroTik", mfrs)
+            self.assertIn("Ubiquiti", mfrs)
+        finally:
+            conn.close()
 
     def test_antenna_images_svg_and_pixmaps_for_all_models(self):
         """Проверяет, что для каждой модели в каталоге создаётся корректный SVG и QPixmap/QIcon."""
         conn = sqlite3.connect(":memory:")
-        antennas = antenna_catalog.load_all_antennas(conn)
-        self.assertGreaterEqual(len(antennas), 35)
+        try:
+            antennas = antenna_catalog.load_all_antennas(conn)
+            self.assertGreaterEqual(len(antennas), 35)
 
-        for a in antennas:
-            svg = antenna_images.generate_antenna_svg(a, width=320, height=180, dark_theme=True)
-            self.assertTrue(svg.startswith("<svg"))
+            for a in antennas:
+                svg = antenna_images.generate_antenna_svg(a, width=320, height=180, dark_theme=True)
+                self.assertTrue(svg.startswith("<svg"))
+        finally:
+            conn.close()
             self.assertTrue(svg.endswith("</svg>"))
             # Валидный XML без синтаксических ошибок
             root = ET.fromstring(svg)
@@ -90,20 +96,23 @@ class TestAntennaCatalog(unittest.TestCase):
     def test_antenna_catalog_dialog_preview_and_icons(self):
         """Проверяет, что диалог каталога заполняет иконки строк и отображает картинку выбранной модели."""
         conn = sqlite3.connect(":memory:")
-        dlg = antenna_catalog.AntennaCatalogDialog(conn)
-        self.assertTrue(hasattr(dlg, "lbl_image"))
-        self.assertGreaterEqual(dlg.table.rowCount(), 35)
+        try:
+            dlg = antenna_catalog.AntennaCatalogDialog(conn)
+            self.assertTrue(hasattr(dlg, "lbl_image"))
+            self.assertGreaterEqual(dlg.table.rowCount(), 35)
 
-        # Первая колонка таблицы должна содержать иконку оборудования
-        first_item = dlg.table.item(0, 0)
-        self.assertIsNotNone(first_item)
-        self.assertFalse(first_item.icon().isNull())
+            # Первая колонка таблицы должна содержать иконку оборудования
+            first_item = dlg.table.item(0, 0)
+            self.assertIsNotNone(first_item)
+            self.assertFalse(first_item.icon().isNull())
 
-        # Проверяем отрисовку изображения при выборе
-        dlg.table.selectRow(0)
-        self.assertIsNotNone(dlg.selected_antenna)
-        self.assertIsNotNone(dlg.lbl_image.pixmap())
-        self.assertFalse(dlg.lbl_image.pixmap().isNull())
+            # Проверяем отрисовку изображения при выборе
+            dlg.table.selectRow(0)
+            self.assertIsNotNone(dlg.selected_antenna)
+            self.assertIsNotNone(dlg.lbl_image.pixmap())
+            self.assertFalse(dlg.lbl_image.pixmap().isNull())
+        finally:
+            conn.close()
 
     def test_theme_structure_icon_present(self):
         self.assertIn("structure", theme.ICONS)

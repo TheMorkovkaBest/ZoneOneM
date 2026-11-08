@@ -17,6 +17,7 @@ import time
 
 import numpy as np
 
+import c_coverage
 import coverage
 import geo
 from calculations import M_PER_DEG_LAT
@@ -51,10 +52,11 @@ def roof_height(building_data, lat, lon):
         return 0.0
 
 
-def make_tower(task, lat, lon, azimuth=0.0, name="ai"):
+def make_tower(task, lat, lon, azimuth=0.0, name="ai", bld_h=None):
     """Вышка типа task.tower_type в точке; на крыше — высота здания + мачта (как ставит GUI)."""
     tt = dict(task.tower_type or {})
-    bld_h = roof_height(task.building_data, lat, lon)
+    if bld_h is None:
+        bld_h = roof_height(task.building_data, lat, lon)
     height = bld_h + MAST_ON_ROOF_M if bld_h > 0.0 else float(tt.get("height", 30.0))
     return Tower(name, lat, lon,
                  freq=float(tt.get("freq", 1800.0)), power=float(tt.get("power", 20.0)),
@@ -79,25 +81,45 @@ class CoverageEvaluator:
 
     def __init__(self, task, max_points=25000):
         self.req = QUALITY_LEVEL.get(getattr(task, "min_quality_level", "good"), 2)
+        self._reach_col = {4: 0, 3: 1, 2: 2, 1: 3}.get(self.req, 2)
         self.lats, self.lons, self.step_m = coverage.sample_polygon(
             task.area, task.forbidden, step_m=getattr(task, "grid_step_m", None), max_points=max_points)
         self.best = np.zeros(self.lats.shape, dtype=int)
+        self._c_available = c_coverage.is_c_available()
+        num_words = (self.n_points + 63) // 64
+        self.current_mask_u64 = np.zeros(num_words, dtype=np.uint64)
 
     @property
     def n_points(self):
         return int(self.lats.size)
 
     def ratio(self, best=None):
-        best = self.best if best is None else best
-        return float((best >= self.req).mean()) if best.size else 0.0
+        if best is not None:
+            if isinstance(best, np.ndarray) and best.dtype == np.uint64:
+                return float(np.bitwise_count(best).sum()) / self.n_points if self.n_points else 0.0
+            return float((best >= self.req).mean()) if best.size else 0.0
+        if self._c_available and self.n_points > 0:
+            return float(np.bitwise_count(self.current_mask_u64).sum()) / self.n_points
+        return float((self.best >= self.req).mean()) if self.best.size else 0.0
 
     def try_tower(self, tower):
-        """Доля покрытия, если добавить вышку, и новый массив уровней (состояние не меняется)."""
+        """Доля покрытия, если добавить вышку, и новый массив уровней/маски (состояние не меняется)."""
+        if self._c_available and tower.reach.ndim == 2 and tower.reach.shape[1] >= 4 and self.n_points > 0:
+            reach_1d = tower.reach[:, self._reach_col]
+            mask_u64, _ = c_coverage.c_compute_sector_mask(
+                self.lats, self.lons, tower.lat, tower.lon, reach_1d
+            )
+            combined = self.current_mask_u64 | mask_u64
+            ratio = float(np.bitwise_count(combined).sum()) / self.n_points
+            return ratio, combined
         best = np.maximum(self.best, coverage.level_at_points(tower, self.lats, self.lons))
         return self.ratio(best), best
 
     def add(self, best):
-        self.best = best
+        if isinstance(best, np.ndarray) and best.dtype == np.uint64:
+            self.current_mask_u64 = best
+        else:
+            self.best = best
 
 
 # ---------------------------------------------------------------------------
@@ -271,8 +293,9 @@ def ai_place(task, model, top_k=TOP_K):
 
         best = None
         for lat, lon, r, c in cands:
+            bld_h = roof_height(task.building_data, lat, lon)
             for az in azimuths:
-                t = make_tower(task, lat, lon, az, name=f"ai{len(placed) + 1}")
+                t = make_tower(task, lat, lon, az, name=f"ai{len(placed) + 1}", bld_h=bld_h)
                 val, lv = ev.try_tower(t)
                 if best is None or val > best[0]:
                     best = (val, lv, t, r, c, az)

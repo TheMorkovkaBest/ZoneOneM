@@ -403,7 +403,9 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         QShortcut(QKeySequence("Esc"), self, activated=lambda: self._mode_actions["navigate"].setChecked(True))
         self._mode_actions["navigate"].setChecked(True)      # только теперь: set_mode трогает виджеты интерфейса
         self._update_action_states()
+        self.act_terrain.blockSignals(True)
         self.act_terrain.setChecked(self._setting_bool("model_terrain", True))
+        self.act_terrain.blockSignals(False)
         self.web_view.setHtml(load_map_html(), QUrl("http://localhost"))
 
     def _build_actions(self):
@@ -665,7 +667,9 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
         lay.addWidget(self.chk_buildings)
         self.chk_terrain = QCheckBox("Учитывать неровности рельефа (DEM)")
         self.chk_terrain.setToolTip("Учёт высот холмов и неровностей местности при расчёте распространения радиосигнала и дифракции")
+        self.chk_terrain.blockSignals(True)
         self.chk_terrain.setChecked(self._setting_bool("model_terrain", True))
+        self.chk_terrain.blockSignals(False)
         self.chk_terrain.toggled.connect(self._on_terrain_toggled)
         lay.addWidget(self.chk_terrain)
         self.chk_fresnel = QCheckBox("Дифракция в зоне Френеля (дома ниже антенны)")
@@ -1270,22 +1274,30 @@ class CellTower3DApp(NetworkMixin, QMainWindow):
     #  Типы вышек
     # ------------------------------------------------------------------ #
     def _on_terrain_toggled(self, checked):
-        self.settings.setValue("model_terrain", bool(checked))
-        if hasattr(self, "act_terrain") and self.act_terrain.isChecked() != bool(checked):
-            self.act_terrain.setChecked(bool(checked))
+        checked = bool(checked)
+        self.settings.setValue("model_terrain", checked)
+        if hasattr(self, "act_terrain") and self.act_terrain.isChecked() != checked:
+            self.act_terrain.blockSignals(True)
+            self.act_terrain.setChecked(checked)
+            self.act_terrain.blockSignals(False)
+        if hasattr(self, "chk_terrain") and self.chk_terrain.isChecked() != checked:
+            self.chk_terrain.blockSignals(True)
+            self.chk_terrain.setChecked(checked)
+            self.chk_terrain.blockSignals(False)
         if hasattr(self, "building_data") and hasattr(self, "terrain_data"):
             self.building_data.terrain_data = self.terrain_data if checked else None
         self._js(f"api.setTerrain({str(checked).lower()});")
         self.recalc_all()
 
     def toggle_terrain(self, checked=None):
-        if hasattr(self, "chk_terrain"):
-            if checked is None:
+        if checked is None:
+            if hasattr(self, "chk_terrain"):
                 checked = not self.chk_terrain.isChecked()
-            if self.chk_terrain.isChecked() != bool(checked):
-                self.chk_terrain.setChecked(bool(checked))
-        else:
-            self._on_terrain_toggled(bool(checked))
+            elif hasattr(self, "act_terrain"):
+                checked = not self.act_terrain.isChecked()
+            else:
+                checked = True
+        self._on_terrain_toggled(bool(checked))
 
     def _setting_bool(self, key, default):
         v = self.settings.value(key, default)
