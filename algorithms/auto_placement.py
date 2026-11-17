@@ -64,9 +64,10 @@ def algorithm_2(task):
     return ai_placement.ai_place(task, model)
 
 
-@register_algorithm("Алгоритм 3 (заглушка)")
+@register_algorithm("Алгоритм 3 (генетический)")
 def algorithm_3(task):
-    raise NotImplementedError("Алгоритм 3 ещё не реализован (auto_placement.algorithm_3)")
+    import ga_placement
+    return ga_placement.ga_place(task)
 
 
 def auto_place_towers(area_bounds, tower_params):
