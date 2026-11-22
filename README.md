@@ -1,414 +1,279 @@
-# ZoneM — планирование радиопокрытия
+<p align="center">
+  <img src="docs/assets/banner.png" alt="ZoneM — 3D Cellular Coverage, Auto-Placement & Transport Backhaul Planning" width="100%">
+</p>
 
-Десктопное приложение (PyQt6 + карта MapLibre/deck.gl) для инженера связи: ставит вышки на карте,
-считает зоны покрытия с учётом затухания в зданиях (OpenStreetMap), измеряет расстояния и уровень сигнала,
-**строит транспортную сеть вышек в стиле Cisco Packet Tracer** (коммутаторы, маршрутизаторы, кабели, радиорелейные линии, PoE,
-ping с анимацией) и **тестирует нагрузку**: абоненты, трафик, загрузка линков, потери и задержки.
-Следующий этап — **три алгоритма автоматической расстановки вышек** на выделенном участке карты по заданным условиям.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/UI-PyQt6%20%2B%20QtWebEngine-41CD52?style=for-the-badge&logo=qt&logoColor=white" alt="PyQt6 + QtWebEngine">
+  <img src="https://img.shields.io/badge/3D%20GIS-MapLibre%20GL%20%2B%20deck.gl-207561?style=for-the-badge" alt="MapLibre GL + deck.gl">
+  <img src="https://img.shields.io/badge/AI%20%26%20Optimizers-NumPy%20FCN%20%2B%20GA%20%2B%20C99-6B46C1?style=for-the-badge" alt="Pure-NumPy Dilated FCN + Memetic GA + C99">
+  <img src="https://img.shields.io/badge/Database-SQLite%20WAL%20%2B%20NPZ%20Cache-9E6F20?style=for-the-badge" alt="SQLite WAL + NPZ Cache">
+</p>
 
-> Последнее обновление: 6 октября 2026. Все отчёты — в разделе «Отчёты» ниже.
+**ZoneM** is a desktop 3D radio network planning, transport backhaul engineering, and end-to-end traffic load testing platform built with **PyQt6**, **MapLibre GL JS 4.7.1 + deck.gl 8.9.0**, **NumPy**, and an optional **C99 bitset acceleration kernel**. It combines building-aware deterministic RF propagation, terrain relief, three automated base-station placement engines (Greedy Bitset Set Cover, a Pure-NumPy Dilated Convolutional Surrogate + REINFORCE RL, and a Hybrid Memetic Genetic Algorithm), automated L1/L2/L3 + 5G Core transport synthesis, SNMPv2c simulation, and subscriber-level capacity stress testing in a unified workstation.
 
 ---
 
-## 1. Задача проекта
+## Visual Overview
 
-1. **GUI** (текущий приоритет): удобная программа для инженера связи.
-2. **Расчётное ядро**: зоны покрытия, затухание в зданиях, быстрое — оно будет вызываться алгоритмами тысячи раз.
-3. **Три алгоритма расстановки** вышек на выделенном участке (пишутся отдельно, см. раздел 6).
+### Interactive 3D Coverage & Transport Viewport
 
-## 2. Быстрый старт
+Real-time raytraced four-tier RSRP zones carved around 3D OpenStreetMap extruded buildings, linked with optical/microwave backhaul paths, hardware blueprints, and dark/light Fusion themes.
+
+<p align="center">
+  <img src="docs/assets/screenshot_main_3d.png" alt="ZoneM Main 3D Viewport — OSM Buildings, 4-Tier RF Coverage & Backhaul" width="100%">
+</p>
+
+### Link Budget, Terrain Relief & Fresnel Clearance Analyzer
+
+Click **Signal Probe (`Ctrl+4`)** anywhere on the map to inspect the vertical terrain + building obstruction cross-section, first Fresnel ellipsoid clearance, wall crossings, diffraction loss, and 3GPP antenna pattern attenuation.
+
+<p align="center">
+  <img src="docs/assets/screenshot_link_profile.png" alt="ZoneM Link Profile Dialog — Fresnel Zone & Building Obstructions" width="88%">
+</p>
+
+### Multi-Step Network Load Test & Live Traffic Animation
+
+Simulate hundreds of indoor/hotspot subscribers across realistic urban traffic mixes, scheduling radio slots via proportional **water-filling**, routing over **max-min fair** full-duplex backhaul links, and rendering per-link utilization and degraded UEs directly in 3D.
+
+<p align="center">
+  <img src="docs/assets/screenshot_load_test.png" alt="ZoneM Load Test Simulation — Active UEs, Link Utilization & Throughput Chart" width="100%">
+</p>
+
+---
+
+## Key Capabilities
+
+### 1. 3D GIS Engine & Offline Spatial Caching (`core/`, `resources/`)
+* **3D Urban Extrusions & Relief:** Renders OpenStreetMap building footprints, 3D heights, DEM terrain relief (`hillshade` + elevation tiles), coverage heatmaps/hatched contours, and backhaul topology via **MapLibre GL JS 4.7.1** and **deck.gl 8.9.0** inside `QWebEngineView`. Supports Dark, Light, and Detailed (Liberty) basemaps.
+* **Fast Binary Raster Cache:** Asynchronous Overpass API tile fetcher (`BuildingFetchWorker`) saves spatial windows on a `256 x 256` tile grid into `buildings_cache/raster_cache.npz` for near-instant project startup (`19,130` cached urban footprints in the bundled Chișinău cache).
+* **Terrain Elevation (DEM):** `core/terrain.py` queries elevation grids from the Open-Meteo Elevation API, persists tiles to `buildings_cache/terrain_cache.npz`, and feeds ground elevation directly into link-budget height offsets and Fresnel clearance checks.
+* **Direct 3D Editing Workflow:** Drag base stations and routers directly on the map, rotate sector azimuth handles visually, box-select groups with Copy/Paste (`Ctrl+C` / `Ctrl+V`), Undo/Redo (`Ctrl+Z`), open the quick Radial Hardware Menu (`Ctrl+A`), define mounting masts/structures (`core/structures.py`), and inspect Best-Server Hatch overlays.
+
+---
+
+### 2. Deterministic Urban RF Propagation Engine (`core/calculations.py`)
+
+Each site casts `180` radial rays sampled every `1.2 m` (`WINDOW_HALF_M = 600 m`, extended up to `1200 m` depending on link budget):
+
+* **Path Loss:** Extended COST 231 urban model parameterized by carrier frequency (`MHz`), transmit power (`W` / `EIRP dBm`), antenna height (`m`), and electrical/mechanical downtilt (`deg`).
+* **Multi-Wall Building Penetration:** Accumulates interior ray distance at `0.5 dB/m` (`INDOOR_LOSS_DB_PER_M`) plus per-entry `wall_loss` (`dB`) from cached OSM building height rasters.
+* **Knife-Edge Diffraction (ITU-R P.526):** Evaluates intermediate rooftops encroaching into the first Fresnel ellipsoid below geometric LOS, capping diffraction attenuation at `25.0 dB` (`DIFFRACTION_MAX_DB`).
+* **3GPP TR 36.814 Sector Antenna Pattern:** Models configurable horizontal beamwidth, side/back-lobe attenuation up to `25.0 dB` (`FRONT_TO_BACK_DB`), and vertical beam downtilt mismatch.
+* **Four RSRP Signal Tiers:**
+
+| Tier | RSRP Threshold | Interpretation |
+| :--- | :--- | :--- |
+| **Green** | `>= -55 dBm` | Deep indoor / ultra-high-capacity 5G NR / LTE MIMO |
+| **Excellent** | `>= -70 dBm` | Strong urban indoor & high-throughput mobile broadband |
+| **Good** | `>= -85 dBm` | Reliable outdoor / light indoor voice & data service |
+| **Weak** | `>= -105 dBm` | Cell edge / minimum connectivity boundary |
+
+<p align="center">
+  <img src="docs/assets/rf_propagation_en.png" alt="ZoneM RF Propagation Physics — COST 231, Fresnel Knife-Edge Diffraction & 3GPP Pattern" width="100%">
+</p>
+
+* **Equipment & Antenna Catalog (`catalog/`):** Includes `41` commercial antenna presets (Huawei, Ericsson, Nokia, Kathrein, CommScope, etc.) in `catalog/antenna_catalog.py` with dynamically rendered technical cards in `catalog/antenna_images.py`, plus an interactive RF Calculator dialog (`Ctrl+K`).
+
+---
+
+### 3. Automated Base-Station Placement Suite (`algorithms/`)
+
+All optimizers implement the unified `PlacementTask` / `@register_algorithm` interface (`algorithms/auto_placement.py`), supporting arbitrary polygon Regions of Interest (ROIs), rectangle drawing mode, and multiple forbidden exclusion zones.
+
+* **Algorithm 1 — Greedy Rooftop Cluster + 64-Bit Bitset Set Cover (`algorithm_1.py`, `c_coverage.c`):**
+  Clusters rooftop buildings into high-value candidate sites, sweeps candidate sector orientations, packs pixel reach masks into `uint64_t` bitsets, and runs greedy set cover accelerated via `POPCNT` in C99 (`libc_coverage.dll/.so/.dylib`, with automatic pure-NumPy fallback), followed by redundancy pruning.
+* **Algorithm 2 — Pure-NumPy Dilated Convolutional Surrogate + RL (`ai_model.py`, `ai_placement.py`):**
+  Encodes building heights, terrain clearance, ROI mask, forbidden masks, existing coverage deficit, and placed sites onto a `10 x 64 x 64` raster grid. A lightweight `23,041`-parameter pure-NumPy Dilated FCN (`width = 24`, dilations `1, 2, 4, 8, 16`) predicts optimal next-site coverage gain (`LABEL_SCALE = 10.0`). Inference applies sequential residual updates with `80 m` Non-Maximum Suppression (evaluating top-8 cells and up to 6 rooftops per step), without requiring PyTorch or TensorFlow.
+
+<p align="center">
+  <img src="docs/assets/surrogate_net_en.png" alt="Algorithm 2 Pure-NumPy Dilated FCN Surrogate Architecture & NMS Inference Loop" width="100%">
+</p>
+
+* **Algorithm 3 — Hybrid Memetic Genetic Algorithm (`ga_placement.py`):**
+  Evolves multi-tower configurations using `GAParams(population=60, generations=200, patience=20, elite=4, p_crossover=0.8, p_mutation=0.2, time_limit_s=120.0)` over a pre-evaluated `CandidatePool`. Chromosomes are warm-started with Algorithm 1 and Algorithm 2 solutions, combined via geometric line-cut crossover, refined with add/drop/move/azimuth mutations, and polished via first-improvement local search.
+
+#### Verified 10-Scene Benchmark (`tools/compare_ga.py --scenes 10 --seed 777`)
+
+Measured on `10` urban planning scenarios (`777` random seed) in this workspace:
+
+| Engine | Mean Coverage | Mean Towers | Mean Runtime | Key Strength |
+| :--- | :---: | :---: | :---: | :--- |
+| **Algorithm 1 (Greedy + C99 Bitset)** | `96.7%` | `3.4` | **`1.5 s`** | Fastest interactive placement |
+| **Algorithm 2 (AI SurrogateNet)** | `95.6%` | `3.3` | `2.8 s` | Pure-NumPy zero-framework neural prior |
+| **Algorithm 3 (Pure GA + Local Search)** | `96.2%` | `3.2` | `9.5 s` | Global combinatorial search |
+| **Algorithm 3 (Hybrid GA + Alg 1 Seed)** | **`97.0%`** | **`3.1`** | `7.9 s` | Highest coverage with fewest sites |
+
+<p align="center">
+  <img src="docs/assets/benchmarks_en.png" alt="10-Scene Optimizer Benchmark Comparison — Coverage, Tower Count & Runtime" width="100%">
+</p>
+
+---
+
+### 4. Transport Backhaul, Auto-Network (`Ctrl+W`), SNMP & Load Testing (`networking/`, `catalog/netcatalog.py`)
+
+* **Multi-Layer Backhaul Designer (`networking/network.py`):**
+  Models `19` network device classes (Access/Distribution/Core `L2`/`L3` switches, `CSR` aggregation routers, `5GC` Core gateways, microwave outdoor radios, media converters, PoE injectors, and splitters) connected by `37` fiber, Cat6/Cat6a/PoE, and point-to-point microwave link specifications. Enforces duplex speed negotiation, PoE wattage budgets (`802.3af/at/bt`), microwave rain fade + Fresnel clearance checks (`>= 60%` first zone clear), subnet collision checks, `/30` & `/24` Auto-IP provisioning, hop-by-hop Ping/Traceroute, and CSV Bill of Materials (BOM) costing.
+* **One-Click Backhaul Synthesis (`Ctrl+W`, `networking/auto_network.py`):**
+  Automatically provisions transport links from every base station through regional switching/routing tiers (`CSR`) up to `5GC` core infrastructure with valid IPv4 addressing and static routes.
+* **SNMPv2c Agent Inspector (`Ctrl+8`, `networking/snmp.py`):**
+  Emulates SNMPv2c queries across any tower or transport node: system uptime, `ifTable` counters, optical SFP temperature/Rx power, PoE load, and `LLDP` neighbor discovery.
+* **End-to-End Load Simulator (`Ctrl+L`, `networking/loadtest.py`):**
+  Simulates active users (`city`, `event`, `iot`, `night` profiles) distributed across indoor rooms and traffic hotspots:
+  1. Computes downlink/uplink SINR vs inter-cell interference (`NEIGHBOR_LOAD = 0.5`, noise figure `9.0 dB`, margin `10.0 dB`) and Shannon capacity capped at `5.0 bps/Hz` per MIMO layer.
+  2. Allocates radio PRBs fairly using proportional **water-filling** per cell (`max_users` admission cap).
+  3. Routes cell aggregate traffic through the physical backhaul graph using **max-min fairness** and estimates hop queuing delay via `M/M/1` latency modeling, producing per-step interactive charts, bottle-neck diagnostics, recommendations, and CSV reports.
+
+---
+
+### 5. Persistence, Undo/Redo & Interoperability
+
+* **SQLite WAL State (`core/tower.py`):** Automatically persists towers, custom equipment presets, polygons, structures, network topology, and IP tables to `towers.db` without blocking UI interaction.
+* **Project & GIS Exports (`ui/exporters.py`):** Full JSON project snapshots (`examples/demo_project.json`), CSV site inventory, GeoJSON coverage polygons for **QGIS**, BOM cost spreadsheets, Load Test CSV reports, and viewport PNG screenshots.
+
+---
+
+## Software Architecture
+
+<p align="center">
+  <img src="docs/assets/architecture_en.png" alt="ZoneM Modular Software Architecture" width="100%">
+</p>
+
+### Repository Layout
+
+```text
+ZoneOneM/
+├── main.py                      # Unified entry point (configures package paths & launches GUI)
+├── gui.py                       # Direct GUI launcher shim
+├── requirements.txt             # PyQt6, PyQt6-WebEngine, numpy, requests
+├── models/
+│   └── ai_surrogate.npz         # Pretrained SurrogateNet weights (10 ch, width=24, +300 RL episodes)
+├── examples/
+│   └── demo_project.json        # Sample 4-tower Chișinău project with full L2/L3 + MW backhaul
+├── core/
+│   ├── calculations.py          # 180-ray COST 231, multi-wall, ITU-R P.526 Fresnel & 3GPP patterns
+│   ├── buildings.py             # Overpass API fetcher + 256x256 tile rasterization & .npz cache
+│   ├── terrain.py               # Open-Meteo DEM elevation fetcher & height-profile sampler
+│   ├── geo.py                   # Haversine, bearings, polygon area, PIP & FSPL utilities
+│   ├── tower.py                 # Tower model, default presets & SQLite WAL TowerDB
+│   └── structures.py            # Multi-sector mounting towers, masts & rooftop poles
+├── algorithms/
+│   ├── auto_placement.py        # PlacementTask, @register_algorithm & progress signaling
+│   ├── algorithm_1.py           # Greedy rooftop clustering & bitset set cover optimizer
+│   ├── c_coverage.c / .py       # C99 POPCNT bitset kernel (Windows/Linux/macOS + NumPy fallback)
+│   ├── ai_model.py              # Pure-NumPy Dilated FCN + im2col/col2im + Adam optimizer
+│   ├── ai_placement.py          # 10-channel grid encoding, NMS inference & CoverageEvaluator
+│   ├── ga_placement.py          # Hybrid Memetic GA (line-cut crossover, mutations, local search)
+│   └── coverage.py              # Multi-tower union statistics across ROI & forbidden zones
+├── catalog/
+│   ├── antenna_catalog.py       # 41 industrial BS antennas with gain, beamwidth & dimensions
+│   ├── antenna_images.py        # Programmatic hardware preview cards & list icons
+│   └── netcatalog.py            # 19 network hardware models & 37 fiber/copper/MW link specs
+├── networking/
+│   ├── network.py               # Port, Device, Link, PoE, MW LOS, L3 routing & Ping/BOM engine
+│   ├── auto_network.py          # Automated backhaul & 5GC synthesis (Ctrl+W)
+│   ├── snmp.py                  # Simulated SNMPv2c MIB & LLDP agent poller
+│   └── loadtest.py              # SINR/MIMO, water-filling, max-min backhaul & M/M/1 load test
+├── ui/
+│   ├── gui.py                   # Main CellTower3DApp window, workers, Undo/Redo & exports
+│   ├── net_ui.py                # Network & Load Test tabs, device/link inspectors & charts
+│   ├── dialogs.py               # LinkProfileDialog, RF Calculator, Edit & Progress dialogs
+│   ├── ribbon.py                # Microsoft-style grouped RibbonBar toolbar
+│   ├── theme.py                 # Dark/Light QSS themes & crisp programmatic vector icons
+│   └── exporters.py             # JSON, CSV, BOM & GeoJSON project serializers
+├── resources/
+│   ├── map.html                 # MapLibre GL JS 4.7.1 + deck.gl 8.9.0 host page
+│   ├── map_app.js               # 3D buildings, coverage layers, dragging, radial menu & traffic
+│   └── geo_utils.js             # Client-side geodesic & polygon helpers
+├── tools/
+│   ├── make_dataset.py          # Supervised training sample generator (from Algorithm 1 / GA)
+│   ├── train_ai.py              # Supervised MSE + REINFORCE policy-gradient trainer
+│   ├── compare_ai.py            # Benchmark Algorithm 1 vs Algorithm 2
+│   ├── compare_ga.py            # Benchmark Alg 1 vs Alg 2 vs Pure GA vs Hybrid GA
+│   ├── benchmark.py             # Placement & raytracing performance profiler
+│   └── make_demo.py             # Builds examples/demo_project.json
+└── tests/                       # Comprehensive unittest suite (core, AI, GA, net, UI, JS)
+```
+
+---
+
+## Quick Start
+
+### 1. Environment Setup
 
 ```bash
+git clone https://github.com/TheMorkovkaBest/ZoneOneM.git
+cd ZoneOneM
+
+python -m venv .venv
+# Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+# Linux / macOS:
+# source .venv/bin/activate
+
 pip install -r requirements.txt
-python gui.py                       # запуск приложения (нужен интернет для карты и зданий)
-python -m unittest discover -s tests -t .      # тесты
-python tools/benchmark.py           # замер скорости расчёта
 ```
 
-* Первая загрузка зданий требует интернета (Overpass API). Загруженное кэшируется в `buildings_cache/` —
-  после этого повторные запуски работают без сети.
-* Тесты `tests/test_js.py` требуют Node.js (без него пропускаются), `tests/test_gui_smoke.py` работает на
-  заглушке Qt и автоматически пропускается, если установлен настоящий PyQt6.
+### 2. Launch the Application
 
-## 3. Структура проекта
-
-Проект организован по тематическим пакетам и модулям:
-
-| Директория / Модуль | Назначение |
-|---|---|
-| **Точки входа** | |
-| `main.py` / `gui.py` | Точки запуска приложения (PyQt6 + MapLibre/deck.gl), настройка путей и окружения |
-| **`core/`** | **Базовые физические и геометрические расчёты** |
-| `core/calculations.py` | Радиомодель (3GPP, Fresnel, ITU-R P.526), векторизованный расчёт зон покрытия, link_analysis |
-| `core/geo.py` | Геодезия: расстояния (Haversine/WGS84), азимуты, площади, попадание точки в полигон |
-| `core/buildings.py` | Загрузка зданий OSM (Overpass API), растр высот (плитки), дисковый кэш |
-| `core/tower.py` | Класс `Tower`, пресеты, БД SQLite (`TowerDB`) с автоматической миграцией |
-| `core/structures.py` | Классы строительных опор и мачт (столбы, моноподы, башни) |
-| **`catalog/`** | **Каталоги оборудования и антенн** |
-| `catalog/antenna_catalog.py` | Каталог антенн и секторов (диаграммы направленности, частоты, усиление) |
-| `catalog/antenna_images.py` | Генераторы векторных SVG/изображений антенн |
-| `catalog/netcatalog.py` | Каталог сетевого оборудования: порты, 37 типов кабелей/линков, 19 моделей устройств, РРЛ |
-| **`networking/`** | **Сетевой уровень и моделирование нагрузки (L1–L3)** |
-| `networking/network.py` | Сетевая модель: проверка соединений, физика линков, PoE, автонастройка IP/маршрутов, PDU/ping |
-| `networking/snmp.py` | SNMP-агент устройств: ifTable, IP/маршруты, LLDP, PoE, радио БС; опрос с NMS |
-| `networking/loadtest.py` | Моделирование нагрузки: абоненты, радиоёмкость, транспорт (max-min), задержки, потери |
-| **`algorithms/`** | **Алгоритмы авторасстановки и оптимизации покрытия** |
-| `algorithms/auto_placement.py` | Реестр алгоритмов и диспетчер фоновых задач `PlacementTask` |
-| `algorithms/coverage.py` | Оценка суммарного покрытия участка набором вышек (целевая функция) |
-| `algorithms/algorithm_1.py` | Алгоритм 1 авторасстановки (жадный выбор лучших позиций и секторов) |
-| `algorithms/c_coverage.c` / `.py` | Высокопроизводительное C-расширение с OpenMP для быстрого расчёта матриц покрытия |
-| `algorithms/ai_model.py` / `ai_placement.py` | Алгоритм 2: нейросеть-суррогат на numpy и цикл ИИ-расстановки (модель — `models/ai_surrogate.npz`, описание — `README_AI.md`) |
-| `algorithms/ga_placement.py` | Алгоритм 3: генетическая расстановка (особь — набор вышек, скрещивание разрезом карты, мутации, локальный поиск; описание — `README_GA.md`) |
-| **`ui/`** | **Графический интерфейс пользователя** |
-| `ui/gui.py` | Главное окно GUI, интеграция слоёв карты, потоки расчёта, импорт/экспорт |
-| `ui/dialogs.py` | Диалоги: типы вышек, редактирование, профиль трассы, радиокалькулятор |
-| `ui/ribbon.py` | Лента инструментов и группы управляющих кнопок |
-| `ui/theme.py` | Тёмная и светлая темы оформления (QSS) и векторные иконки |
-| `ui/net_ui.py` | Интерфейс управления транспортной сетью: палитры, выбор портов, графики нагрузки |
-| `ui/exporters.py` | Экспорт и импорт проектов (JSON, CSV, GeoJSON) |
-| **`resources/`** | HTML/JS интерфейс карты MapLibre (`map.html`, `map_app.js`, `geo_utils.js`) |
-| **`tests/`, `tools/`** | Набор автоматических тестов, бенчмарк производительности, генераторы демо-сетей |
-| **`docs/`** | Блок-схемы алгоритмов и документация (`coverage_algorithm_flowchart.svg`/`.png`) |
-| **`examples/`** | Готовые демонстрационные проекты (демо-сеть вышек, коммутаторов и РРЛ) |
-
-## 4. Радиомодель
-
-* Потери на трассе: `PL(d) = PL(10 м) + 10·γ·lg(d/10)`, где `γ = 3.4 + 0.35·f[ГГц] (+0.15·(10−h) при h < 10 м)`.
-* **Затухание в зданиях (многостеночная модель):** каждое пересечение границы здания (вход/выход) — `wall_loss` дБ
-  (параметр вышки), плюс 0.5 дБ на метр пути внутри здания.
-* Стенами считаются здания **не ниже высоты подвеса антенны**. Здание, на котором стоит сама вышка, игнорируется (антенна на крыше).
-* **Зона Френеля (дифракция):** здания ниже антенны, попавшие в 1-ю зону Френеля трассы «вышка → абонент (1.5 м)»,
-  дают потери на клиновидном препятствии по ITU-R P.526: `J(v) = 6.9 + 20·lg(√((v−0.1)²+1) + v − 0.1)`,
-  `v = √2·h / r1` (h — высота кромки над линией визирования, r1 — радиус зоны Френеля), берётся доминирующее
-  препятствие, не более 25 дБ. Препятствия и точки приёма — блоками по 6 м. Флажок «Дифракция в зоне Френеля».
-* **Диаграмма направленности (боковые и задний лепестки):** 3GPP TR 36.814, `A(θ) = −min(12·(θ/θ3дБ)², 25 дБ)` —
-  луч спадает плавно, а за сектором остаётся задний лепесток −25 дБ (раньше сигнал вне сектора обнулялся).
-  Флажок «Боковые и задний лепестки антенны».
-* Сигнал **проходит сквозь здания с потерями** и за зданием остаётся ослабленным (раньше луч обрывался на первой стене).
-* Четыре зоны по уровню: ≥ −55, ≥ −70, ≥ −85, ≥ −105 дБм. Граница зоны на луче — дальняя точка, где сигнал ещё в пределах бюджета
-  (с дифракцией потери вдоль луча немонотонны: сразу за низким домом — тень, дальше сигнал восстанавливается).
-* Если данных о зданиях нет (нет сети), расчёт идёт без них — в статус-баре об этом сообщается.
-
-**Как достигнута скорость.** Полигоны зданий растеризуются в растр высот один раз при загрузке (фоновый поток) и
-хранятся плитками 256×256 (uint8). Расчёт вышки = вырезать окно ±600 м, одним numpy-запросом взять значения вдоль
-всех 180 лучей, кумулятивными суммами получить потери и найти границы четырёх зон. Циклов «луч × шаг × здание» нет.
-
-**Ограничения модели (осознанные):** рельеф не учитывается; `tilt` в расчёт не входит (только для 3D-модели);
-здания дальше 600 м от вышки не учитываются; сектор антенны — без боковых и задних лепестков; высоты зданий берутся из OSM
-(`height` → `building:levels × 3 м` → по типу здания → 15 м).
-
-## 4a. Сетевая часть (как в Packet Tracer, но на карте)
-
-Режимы на ленте «Транспортная сеть»: **Устройство** (Ctrl+5), **Кабель** (Ctrl+6), **PDU** (Ctrl+7), кнопки **Авто-IP** и **Спецификация**.
-Рядом с «Устройство» и «Кабель» — стрелка со списком типов; те же палитры — на левой вкладке «Сеть».
-
-**Как работать.** Поставьте вышки (вкладка «Радио») → «Устройство»: коммутаторы/маршрутизаторы/ядро → «Кабель»: кликните
-первое устройство, потом второе (базовые станции тоже кликаются) → «Авто-IP» → «PDU»: кликните источник и получатель —
-пакет проедет по пути на карте, результат (✓/✗, RTT, причина отказа) — в журнале вкладки «Сеть». Кабель «★ Авто» сам подбирает
-порты и кабель (макс. скорость, затем дешевле); можно выбирать порты вручную. Устройства перетаскиваются, длина кабеля берётся
-с карты (×1.25 + 10 м запаса; DAC — почти без запаса).
-
-**Что моделируется и проверяется**
-* **Совместимость:** медь — только в RJ45; оптический модуль/DAC должен подходить порту (SFP+ принимает SFP, SFP28 — SFP/SFP+,
-  QSFP28 — QSFP+ и т.д.; QSFP-модуль в SFP+ порт нельзя); радиолиния — только между «Air»-портами терминалов одного диапазона.
-* **Физика линка** (состояния: работает / с ограничением / не работает, с причиной): медь — скорость по длине с автосогласованием
-  вниз (Cat6 тянет 10G лишь до 55 м, дальше согласует 5G); оптика — дальность модуля; порт ограничивает скорость.
-* **Радиорелейка:** бюджет линии (FSPL, газы, дождь), **прямая видимость и зона Френеля по зданиям OSM**, ступени модуляции.
-* **PoE:** класс PSE-порта (af 15.4 / at 30 / bt 60 / 90 Вт), общий бюджет коммутатора, питание только по меди;
-  без питания БС и её линки «лежат» (включается в настройках устройства: «PoE по кабелю»).
-* **L2/L3:** коммутаторы и РРЛ прозрачно передают кадры; маршрутизаторы, L3-коммутаторы и МЭ маршрутизируют. «Авто-IP»
-  раздаёт адреса и строит маршруты (аналог OSPF); можно задать IP, шлюз и статические маршруты вручную. Ping проверяет путь
-  туда **и обратно** (как настоящий ICMP) и объясняет, где сломалось («нет маршрута на CSR-1», «линк L7 не работает: …»).
-* **Спецификация (BOM)** с оценкой стоимости оборудования и кабелей — CSV.
-
-**Каталог (значения из стандартов и обзоров 2025–2026; РРЛ — инженерные оценки, не паспорт модели):**
-
-| Группа | Состав |
-|---|---|
-| Медь | Cat5e, Cat6, Cat6A, Cat6A уличный, Cat8.1 — 1G до 100 м; 10G: Cat6 до 55 м, Cat6A до 100 м; 25/40G: Cat8 до 30 м |
-| Оптика (+трансиверы) | 1G SX/LX/EX; 10G SR(OM3 300 м, OM4 400 м)/LR 10 км/ER 40 км/ZR 80 км; 25G SR/LR; 40G SR4/LR4; 100G SR4/CWDM4(2 км)/LR4/ER4/ZR4; 400G SR8/DR4/FR4/LR4/ZR |
-| DAC/AOC | 10G до 7 м, 25G до 5 м, 40G до 5 м, 100G до 5 м (AOC до 100 м), 400G до 3 м (AOC до 30 м) |
-| Радиорелейные | 6–42 ГГц (до 2.5 Гбит/с, до 40 км), E-band 71–86 ГГц (до 10 Гбит/с, до 5 км), V-band 57–66 ГГц (до 5 Гбит/с, до 1.5 км) |
-| Базовые станции | Малая сота (PoE), макро LTE (eNodeB), макро 5G NR (gNB) |
-| Коммутаторы L2 | промышленный 8×PoE+ (240 Вт); доступа 24/48×1G PoE+ + 4×10G (370/740 Вт); Multi-Gig PoE++ (1440 Вт) |
-| Коммутаторы L3 | агрегация 24×10G + 2×100G; 48×25G + 8×100G; ядро 32×100G; ядро 32×400G |
-| Маршрутизаторы | Cell Site Router (CSR), агрегирующий, ядра (PE); межсетевой экран NGFW |
-| Прочее | РРЛ-терминалы (3 диапазона), ядро сети 5GC/EPC + Интернет |
-
-## 4b. Тест нагрузки
-
-Кнопка **«Тест нагрузки»** на ленте (Ctrl+L, вкладка «Нагрузка») — запуск/остановка. На карте: абоненты (цвет = качество связи:
-зелёный — полная скорость, оранжевый — урезано, красный — нет связи, серый — не активен), линии к обслуживающим вышкам, **бегущие
-точки по кабелям** (цвет и густота — загрузка линка), подписи загрузки на линках. Ползунок/график — просмотр любого шага.
-
-Результат: запрошено/доставлено (вниз и вверх), доля «ок / урезано / без связи» с причинами (вне покрытия, лимит соты, нет
-транспорта), задержка (средняя и p95), таблицы по вышкам (радио и транспорт, %) и линкам, **автоматические рекомендации**
-(«линк X загружен на 96% — перейдите на 10G», «сота перегружена…»). Отчёт сохраняется в CSV.
-
-**Модель (оценочная, не пакетный симулятор):** абоненты — на участке (часть в зданиях, «горячие точки»), профили трафика по
-сценариям (город, стадион, IoT, ночь). RSRP — из рассчитанных зон покрытия; SINR учитывает интерференцию вышек той же частоты;
-скорость — Шеннон×0.75 (≤ 5 бит/с/Гц на слой) и слои MIMO; подключение к лучшей соте, при переполнении — к следующей;
-радиоресурс соты делится water-filling'ом; трафик по линкам делится max-min fairness (вниз и вверх отдельно);
-задержка = радио + распространение + очереди M/M/1 на линках. Без добавленного ядра тест идёт «только по радио».
-Режим «Учитывать IP-маршрутизацию» берёт пути из настоящей таблицы маршрутов (после «Авто-IP»).
-
-**Демо:** `python tools/make_demo.py` создаёт `examples/demo_project.json` (уже лежит в архиве): «Файл → Импорт проекта →
-Заменить» → «Авто-IP» → PDU «Центр → CORE» → «Тест нагрузки». (Импорт сети работает в режиме «Заменить»: БС сопоставляются по именам.)
-
-## 5. Возможности GUI
-
-* **Лента инструментов по группам:** Карта · Радиосеть · Транспортная сеть · Измерения · Нагрузка · Файл и вид.
-  Левая панель — вкладки «Радио», «Сеть» (палитры), «Участок»; правая — «Вышка», «Сигнал», «Измерения», «Сеть», «Нагрузка».
-* Тёмная/светлая тема (Ctrl+T), три подложки карты, 3D-здания, панели, иконки, горячие клавиши (Справка → Горячие клавиши).
-* **Линейка** — ломаная с длиной и азимутом каждого отрезка, суммой, обратным азимутом, потерями в свободном
-  пространстве на частоте активного типа вышки и задержкой распространения.
-* **Замер сигнала** — клик в любую точку: уровень (дБм) от каждой вышки, лучший сервер, число пересечённых стен;
-  кнопка «Профиль трассы» рисует здания вдоль линии, прямую видимость и зону Френеля.
-* **Участок алгоритма** и **запретные зоны** — полигон или прямоугольник; сохраняются в БД; считается доля покрытия участка.
-* **Азимут секторной вышки меняется прямо на карте:** выберите вышку (клик) и перетащите синюю ручку — сектор вращается
-  вживую, после отпускания зона точно пересчитывается со зданиями. Ручка есть у вышек с лучом уже 360°.
-* Редактирование вышки целиком (координаты, частота, мощность, высота, азимут, ширина луча, цвет).
-* Переключатель «Учитывать затухание в зданиях» — мгновенное сравнение покрытия с зданиями и без них.
-* Радиокалькулятор (дБм↔Вт, FSPL, зона Френеля, бюджет линии), переход по координатам.
-* Экспорт: проект JSON, таблица CSV, покрытие GeoJSON (для QGIS), снимок карты PNG; импорт проекта.
-* Типы вышек сохраняются между запусками; вышки из БД показываются сразу (зоны хранятся в БД).
-
-## 6. Для авторов алгоритмов расстановки
-
-В `auto_placement.py` три заглушки. Алгоритм — функция `f(task) -> [(lat, lon), ...]`:
-
-```python
-@register_algorithm("Мой алгоритм")
-def my_algo(task):                  # task.area, task.forbidden, task.tower_type, task.max_towers, task.building_data
-    towers = []
-    ...
-    t = Tower("x", lat, lon, building_data=task.building_data, color=[255, 0, 0, 255], tilt=0,
-              **{k: task.tower_type[k] for k in ("freq", "power", "height", "wall_loss", "azimuth", "beamwidth")})
-    stats = coverage.coverage_stats(towers + [t], task.area, task.forbidden)   # доля покрытия участка
-    return [(lat, lon), ...]
+```bash
+python main.py
 ```
 
-* Расчёт одной вышки с учётом зданий — **единицы миллисекунд** (см. отчёт о производительности).
-* `task.is_allowed(lat, lon)` — точка внутри участка и вне запретных зон.
-* `coverage.coverage_stats` возвращает доли участка по уровням (`covered`, `good_or_better`, `green`, …).
-* GUI сам запустит алгоритм в потоке, поставит вышки и обновит статистику.
+On first launch, **File -> Import Project...** can load [`examples/demo_project.json`](examples/demo_project.json) immediately with pre-cached Chișinău 3D buildings and an end-to-end fiber/microwave/5GC topology.
+
+> **Optional C99 Acceleration Kernel:** Prebuilt binaries (`libc_coverage.dll`, `libc_coverage.so`, `libc_coverage.dylib`) are shipped in `algorithms/`. If your platform lacks a compatible C runtime library, `algorithms/c_coverage.py` automatically falls back to vectorized NumPy or recompiles `algorithms/c_coverage.c` when `gcc`/`clang` is present on `PATH`.
 
 ---
 
-## 7. Статус задач
+## Keyboard Shortcuts
 
-### Сделано
-- [x] README с описанием, статусом и отчётами
-- [x] Современный интерфейс: темы, иконки, панели, меню, горячие клавиши
-- [x] Линейка (расстояние/азимут), замер сигнала, профиль трассы, калькулятор, переход по координатам
-- [x] Участок алгоритма и запретные зоны (рисование, хранение, статистика покрытия)
-- [x] Реестр алгоритмов и `PlacementTask`, интерфейс запуска в потоке
-- [x] Затухание сигнала в зданиях, скорость не хуже прежней (раздел «Отчёты»)
-- [x] Экспорт/импорт, кэш зданий на диске, миграция БД
-- [x] Тесты (91) и бенчмарк, исправление найденных багов
-- [x] **Транспортная сеть в стиле Packet Tracer:** 37 типов кабелей и линий, 19 моделей устройств, проверка совместимости и физики,
-      PoE, радиорелейка с проверкой видимости по зданиям, Авто-IP/маршруты, ping с анимацией, спецификация, демо-проект
-- [x] **Тест нагрузки** по кнопке: абоненты, радио и транспорт, графика на карте, статистика, рекомендации, CSV-отчёт
-- [x] Лента кнопок, сгруппированных по смыслу
-
-### Не сделано / планы
-- [ ] **Три алгоритма расстановки** (основная задача проекта)
-- [ ] **Проверка нового GUI на настоящем PyQt6** — см. отчёт №3, это обязательный следующий шаг
-- [ ] VLAN, ACL, DHCP, STP и консоль команд (CLI) устройств; PON (OLT/ONU); спутниковые каналы; резервирование (кольца, SPF по метрикам)
-- [ ] Учёт рельефа (высотные данные) и более точная геометрия лучей (наклонная линия «вышка → приёмник»)
-- [ ] Использование `tilt` в модели, диаграмма направленности с боковыми лепестками
-- [ ] Выбор 3D-модели вышки в интерфейсе (код поддержки `.glb` есть, выбора в GUI нет)
-- [ ] Поиск адреса (геокодер), отмена/повтор действий
+| Shortcut | Action |
+| :--- | :--- |
+| `Ctrl+1` / `Esc` | Navigate & select/drag sites |
+| `Ctrl+2` | Place base station |
+| `Ctrl+3` | Distance ruler |
+| `Ctrl+4` | Signal probe & Fresnel Link Profile dialog |
+| `Ctrl+5` | Place transport network device (`CORE`, `CSR`, `L2`/`L3` switch, `MW`) |
+| `Ctrl+6` | Connect devices with fiber, copper, PoE, or microwave link |
+| `Ctrl+8` | Query SNMPv2c agent on selected tower or device |
+| `Ctrl+A` | Open interactive Radial Hardware & Site menu |
+| `Ctrl+W` | Auto-build transport backhaul & 5GC core |
+| `Ctrl+L` | Run Network Load Test & traffic animation |
+| `Ctrl+G` | Jump map viewport to latitude/longitude coordinates |
+| `Ctrl+K` | Open RF Link Budget & Fresnel Calculator |
+| `Ctrl+T` | Toggle Dark / Light theme |
+| `Ctrl+Z` / `Ctrl+C` / `Ctrl+V` | Undo action / Copy / Paste selected towers |
+| `F5` / `Del` | Recalculate all RF coverage / Delete selected site |
 
 ---
 
-## 8. Отчёты
+## Training & Benchmarking the Optimizers
 
-### Отчёт №1. Аудит исходного кода: найденные ошибки
+All neural training and benchmark scripts run purely with NumPy on CPU—no GPU or deep-learning framework is required:
 
-Статус: ✅ — исправлено в новой версии.
+```bash
+# 1. Generate supervised training scenes using Algorithm 1
+python tools/make_dataset.py --out models/dataset.npz
 
-| № | Где | Проблема | Статус |
-|---|---|---|---|
-| 1 | `calculations.py` | Параметр `wall_loss` не использовался в расчёте; луч обрывался на первой стене — сигнала за зданием не было вовсе | ✅ |
-| 2 | `buildings.py` | `'level' in tags['building:levels']` — всегда ложь для числа: этажность `5` читалась как **5 м**, а не 15 м | ✅ |
-| 3 | `buildings.py` | Безымянные `way` (части мультиполигонов) принимались за здания высотой 15 м; сами relation-здания не читались | ✅ |
-| 4 | `buildings.py` | Здания не дедуплицировались: при перекрывающихся загрузках список рос, а расчёт замедлялся | ✅ |
-| 5 | `buildings.py` | Здания занимали весь bbox (повёрнутые дома «раздувались»); теперь растеризуется настоящий контур | ✅ |
-| 6 | `buildings.py` | Нет потокобезопасности (фоновая загрузка меняла данные во время расчёта); при отсутствии сети запросы повторялись каждые 1.2 с | ✅ |
-| 7 | `gui.py` | Вышки из БД загружались до загрузки страницы карты — JS-функция `updateTowers` ещё не существовала, вышки не рисовались до первого изменения | ✅ |
-| 8 | `gui.py` | Изменение вышки: сначала удаление из БД, потом расчёт; если шёл другой расчёт — вышка **терялась** | ✅ |
-| 9 | `gui.py` | Клик по карте во время расчёта молча игнорировался; теперь — очередь задач | ✅ |
-| 10 | `gui.py`/`tower.py` | Удаление по имени; после «Очистить карту» счётчик сбрасывался → дубли имён → удалялись чужие вышки. Теперь по `id` | ✅ |
-| 11 | `tower.py` | Цвет вышки не сохранялся в БД (после перезапуска всегда красный); пересчёт всех вышек при старте в потоке интерфейса | ✅ |
-| 12 | `gui.py` | Панель «Сигнал в точке» нигде не заполнялась | ✅ (зонд) |
-| 13 | `gui.py` | Нет ожидания потоков при закрытии окна (риск падения Qt) | ✅ |
-| 14 | `gui.py` | Тип вышки, созданный пользователем, пропадал после перезапуска | ✅ |
-| 15 | `calculations.py` | Бисекция по 12 итераций (погрешность до ~0.85 м на макросоте) | ✅ (закрытая формула) |
-| 16 | `gui.py` | Кнопка «Выбрать на карте» определяла «выбранную» вышку по тексту кнопки — хрупко | ✅ (выбор кликом в режиме навигации) |
+# 2. Supervised pretraining of the Pure-NumPy Dilated FCN
+python tools/train_ai.py --data models/dataset.npz --epochs 30 --out models/ai_surrogate.npz
 
-**Не исправлено (известные ограничения):** `tilt` в расчёт не входит; в окне ±600 м от вышки зданий вне загруженной области
-нет; сектор антенны — без боковых лепестков.
+# 3. Optional REINFORCE policy-gradient fine-tuning directly on true RF coverage reward
+python tools/train_ai.py --data models/dataset.npz --init models/ai_surrogate.npz --epochs 0 --rl-episodes 300 --out models/ai_surrogate.npz
 
-### Отчёт №2. Производительность расчёта вышки
+# 4. Run 10-scene benchmark across Algorithm 1, Algorithm 2, Pure GA, and Hybrid GA
+python tools/compare_ga.py --scenes 10 --seed 777
+```
 
-Синтетический город: 757 зданий в зоне 2×2 км, медиана по 8–30 запускам, `python tools/benchmark.py`.
+---
 
-| Сценарий | Старый код (без затухания) | Новый код (**с затуханием**) |
-|---|---|---|
-| Микросота 5 м / 1800 МГц | 12.5 мс | **3.1 мс** |
-| Макросота 35 м / 800 МГц | 46.6 мс | **4.7 мс** |
-| Без зданий | — | 0.1 мс |
-| Растеризация 757 зданий (один раз, фоновый поток) | — | ≈ 65–110 мс |
+## Running Tests
 
-Вывод: затухание в зданиях считается в 4–10 раз быстрее, чем старый расчёт, который затухания не считал.
-Предыдущие «медленные» реализации перебирали здания на каждый шаг каждого луча; здесь растр строится один раз.
-Замеры на реальных данных OSM выполнить не удалось (в среде тестирования нет сети) — на реальном городе
-число зданий больше, но стоимость расчёта от него не зависит (зависит только от числа лучей × шагов).
+Execute the full unit and regression suite from the project root:
 
-### Отчёт №3. Тестирование
+```bash
+python -m unittest discover -s tests -t .
+```
 
-Запуск: `python -m unittest discover -s tests -t .` — **40 тестов, все проходят** (на момент сдачи).
-
-**Что проверено автоматически**
-* **Радиомодель** (`tests/test_core.py`): закрытая формула радиуса совпадает со старой бисекцией; зоны вложены друг в друга;
-  сектор антенны; низкие здания и здание под вышкой игнорируются; больше `wall_loss` — меньше покрытие.
-* **Главный тест корректности:** векторизованный расчёт сверяется с независимой медленной скалярной реализацией
-  той же модели (цикл по лучам и шагам) на случайном «городе» для трёх типов вышек — результаты совпадают.
-* **Зонд сигнала согласован с границами зон:** точки чуть внутри границы имеют уровень ≥ порога, чуть снаружи — ниже.
-* Растеризация зданий (площадь повёрнутого прямоугольника ±5%), разбор высот и Overpass (relation, безымянные way), дубли.
-* БД: сохранение цвета, удаление по `id`, миграция БД старой схемы, хранение зон и типов.
-* Геодезия, статистика покрытия, экспорты (CSV, GeoJSON, проект).
-* **JavaScript** (`tests/test_js.py`, Node.js): формулы JS совпадают с Python на 200 случайных пар точек; сценарий карты на
-  заглушках MapLibre — режимы, линейка с отменой, зоны (двойной клик, прямоугольник), выбор вышки, смена подложки.
-* **Логика GUI** (`tests/test_gui_smoke.py`): `gui.py` прогнан на заглушке Qt — запуск, постановка вышки с учётом зданий,
-  сохранение и восстановление из БД, зонд, линейка, зоны, алгоритм (заглушка и работающий), редактирование без потери вышки,
-  удаление, тема, экспорт и импорт.
-
-**Что НЕ проверено — важно**
-* ⚠ **Настоящее окно PyQt6 в среде разработки не запускалось** (PyQt6 там не устанавливается). Заглушка проверяет нашу
-  логику, но не корректность вызовов реального Qt и не внешний вид. Возможны мелкие визуальные огрехи QSS и ошибки в API Qt,
-  которых заглушка не видит. **Первый запуск `python gui.py` у вас — это приёмочный тест**; при ошибке пришлите трейсбек.
-* Карта (MapLibre/deck.gl, подложки CARTO/OpenFreeMap) не запускалась в настоящем браузере; проверен только наш JS на заглушках.
-  Адреса стилей подложек (`dark-matter`, `positron`, `liberty`) взяты из публичной документации, но без сети не проверялись.
-* Загрузка с настоящего Overpass API и скорость на реальном городе не измерялись (нет сети).
-* Снимок карты в PNG (`QWebEngineView.grab()`) на некоторых видеодрайверах может выдать чёрный кадр.
-
-### Отчёт №4. Ошибка первого запуска (код 0xC0000409)
-
-При первом запуске на Windows программа закрывалась с кодом `0xC0000409` без сообщения. Причина — моя ошибка в `gui.py`:
-в `_build_actions` режим «Навигация» включался до создания остального интерфейса, обработчик `set_mode` обращался к
-ещё не существующему `lbl_mode`, а PyQt6 при необработанном исключении в слоте вызывает `abort()`.
-Заглушка Qt в тестах пропускала любые обращения к атрибутам и ошибку не показала.
-**Исправлено:** начальный режим включается в конце `init_ui`; заглушка стала строгой (теперь воспроизводит сбой);
-добавлены защита от аварийного закрытия (`sys.excepthook` → окно с ошибкой и запись в `zonem_errors.log`) и `faulthandler`.
-Урок: тесты на заглушке не заменяют запуск на настоящем PyQt6 (см. отчёт №3).
-
-### Отчёт №5. Сообщения консоли карты после первого запуска
-
-| Сообщение | Причина | Решение |
-|---|---|---|
-| `Access to fetch at '…/planet.json' … blocked by CORS` | Неверный адрес источника зданий: у OpenFreeMap это `…/planet` (адрес `planet.json` унаследован из исходного кода — там та же ошибка, 3D-здания не рисовались) | ✅ адрес исправлен |
-| `loaders.gl: The __VERSION__ variable is not injected…` | Безобидное предупреждение библиотеки загрузки 3D-моделей | скрыто в консоли |
-| `Expected value to be of type number, but found null` (×6, из воркера) | Не из наших слоёв (источник зданий не грузился). Предположительно выражения стиля CARTO dark-matter; **без запуска не подтверждено** | скрыто в консоли; если карта рисуется нормально — безвредно |
-
-Замечание: проверить подтверждение 3D-зданий на настоящей карте я не мог (нет сети) — это нужно посмотреть при запуске.
-
-### Отчёт №6. Сеть и тест нагрузки: что проверено
-
-Запуск: `python -m unittest discover -s tests -t .` — **91 тест, все проходят.**
-
-**Проверено автоматически**
-* Каталог: уникальность портов, согласованность параметров; ключевые числа (PoE, дальности оптики).
-* Совместимость портов и кабелей (отказ при QSFP-модуле в SFP+, меди в SFP+ и т.д.); занятость портов; удаление устройства убирает его кабели.
-* Физика: Cat6 на 50 м → 10G, на 70 м → согласование 5G («с ограничением»), на 130 м → «не работает»; дальности оптики и DAC;
-  радиорелейка по диапазонам и дальностям; **блокировка прямой видимости зданием 60 м** и её снятие при подъёме антенн.
-* PoE: бюджет 240 Вт и 8 малых сот (224 Вт), превышение бюджета отключает устройство и его линк, оптика не питает, слабый PSE-порт.
-* Автонастройка IP и маршрутов, ping (в том числе в одном L2-сегменте, без маршрутизаторов), понятные причины отказов:
-  обрыв линка, отсутствие шлюза, нет обратного маршрута, не-L3 устройство на пути; частичный путь для анимации.
-* Подбор кабеля («Авто»): 8 км → 10G LR, рядом → DAC, 300 км → «ничего не подходит».
-* Тест нагрузки: RSRP на границах зон совпадает с порогами; water-filling и max-min на эталонных примерах; интерференция
-  снижает скорость; **общий 1G-канал ограничивает 8 вышек (≤ 940 Мбит/с) и это попадает в рекомендации**; вышка без пути до ядра;
-  лимит абонентов соты; абоненты вне покрытия; детерминизм по seed.
-* Карта (Node.js, заглушка MapLibre): устройства и кабели, выбор линка, кабель/PDU двумя кликами с «резинкой», анимация пакета,
-  слой трафика с перекраской линков и бегущими точками.
-* Логика GUI на заглушке Qt: постановка устройств, кабелей, ping, удаление/настройка, сохранение сети в БД и восстановление,
-  перенос сети при импорте проекта (по именам БС), тест нагрузки с сетью и без.
-* Скорость: 5000 абонентов × 60 шагов × 8 вышек — **≈ 0.8 с**.
-
-**Найдено и исправлено при разработке:** `IndexError` в тесте нагрузки при менее чем 3 вышках; DAC не подходили из-за общего
-запаса длины кабеля (теперь у них свой); нельзя было задать `mount_h` при создании устройства; «Очистить карту» удаляла бы
-кабели вышек, оставшихся в БД; при импорте проекта связи сети терялись из-за новых id вышек.
-
-**Не проверено — важно**
-* ⚠ **Новый интерфейс (лента, палитры, диалоги, вкладки) не запускался в настоящем PyQt6** (как и раньше: PyQt6 в среде
-  разработки недоступен). Логика проверена на заглушке, внешний вид и реальные вызовы Qt — нет. Присылайте трейсбек, если что-то упадёт.
-* Анимация и бегущие точки проверены на заглушках: плавность и производительность в реальном браузере не измерялись.
-* Параметры РРЛ (мощности, усиления, пороги, дождь) — типовые инженерные оценки; для проектирования реальной линии нужен
-  расчёт по ITU-R для вашей зоны осадков, рельефа и конкретного оборудования. Рельеф не учитывается.
-* Тест нагрузки — оценочная модель уровня «ёмкость и узкие места», а не пакетный симулятор: нет HARQ, планировщика,
-  TCP-динамики, хэндовера по мере движения, реального трафика по времени суток.
-* Стоимости в каталоге — ориентировочные, для сравнения вариантов, не прайс.
-
-### Журнал изменений
-* **2026-10-06** — транспортная сеть (Packet Tracer-стиль), тест нагрузки, лента кнопок по группам, демо-проект; файлы
-  `netcatalog.py`, `network.py`, `loadtest.py`, `net_ui.py`, `ribbon.py`; тесты 40 → 91.
-* **2026-10-04 (3)** — исправлен адрес источника зданий (CORS), ручка азимута на карте, фильтр шума консоли.
-* **2026-10-04 (2)** — исправлено аварийное закрытие при старте (отчёт №4), добавлен перехват ошибок.
-* **2026-10-04** — переписаны `calculations.py`, `buildings.py`, `tower.py`, `gui.py`; добавлены `geo.py`, `coverage.py`,
-  `exporters.py`, `theme.py`, `dialogs.py`, `resources/`, тесты, бенчмарк; исправлены ошибки из отчёта №1.
-  Режим «Выбрать на карте» объединён с навигацией (клик по вышке выбирает её).
-
-### Отчёт №4. Оптимизация: провода между вышками, первая вышка, найденные ошибки (15 октября 2026)
-
-| № | Где | Проблема | Исправление |
-|---|---|---|---|
-| 1 | `map.html` | **Кабель не цеплялся к вышке.** Маркер центрировался по «значок + подпись», точка вышки рисовалась в 35 px от реальных координат (значок устройства — в 23 px), а клик засчитывается в радиусе 26 px | Точка привязки = центр значка, подпись вынесена вбок; проверено в браузере: смещение 0–1 px |
-| 2 | `map_app.js` | В режиме «Кабель»/PDU устройства перетаскивались: клик с малейшим движением мыши двигал устройство вместо соединения | Перетаскивание только в режиме «Навигация»; клик прямо по значку выбирает устройство без поиска по расстоянию; ПКМ/Backspace отменяет первый конец кабеля |
-| 3 | `net_ui.py`, `network.py` | После «Очистить карту» установка любой новой вышки удаляла все кабели вышек, оставшихся в БД | БС вышек из БД сохраняются (на карте не рисуются) |
-| 4 | `network.py` | Ручной выбор кабеля брал первые попавшиеся порты (а не лучшие для этого кабеля) | Подбор лучшей пары портов для выбранного кабеля |
-| 5 | `network.py` | `from_dict`: устаревшие счётчики `next_link/next_dev` → новый кабель с тем же id затирал существующий; лишние поля в файле роняли загрузку; два кабеля в один порт | Счётчики не меньше существующих id, лишние поля игнорируются, дубли портов отбрасываются |
-| 6 | `gui.py` | Импорт проекта сопоставлял сеть с вышками по имени — при одинаковых именах кабели «переезжали» на чужие вышки | Сопоставление по старому id вышки |
-| 7 | `network.py` | Поиск L2-пути перебирал все простые пути: на кольцах коммутаторов ping «зависал» | BFS с общим множеством посещённых, индекс портов вместо перебора линков |
-| 8 | `network.py` | Отредактированная вышка (высота/частота) сохраняла старую модель БС | Модель обновляется, если к БС не подключены кабели |
-| 9 | `gui.py`, `buildings.py` | **Долгая установка первой вышки.** Расчёт ждал загрузку зданий: публичные Overpass отвечают 17–35 с, а тайм-аут был 20 с на сервер — после 40 с ожидания вышка часто считалась вовсе без зданий | Вышка считается и показывается сразу; здания качаются в фоне, затем вышка пересчитывается автоматически |
-| 10 | `buildings.py` | Серверы опрашивались строго по очереди, только два | 4 зеркала, по 2 параллельно, первым — последний удачный; тайм-аут чтения 75 с; неполный ответ (`remark: runtime error`) не кэшируется; отмена при закрытии |
-| 11 | `gui.py`, `map_app.js` | Предзагрузка зданий слала запросы при любом движении мыши → отказы серверов и пауза «нет сети» | Только в режимах «Поставить вышку»/«Замер»; одновременные загрузки одного района объединяются |
-| 12 | `gui.py` | Очередь расчётов «зависала»: `isRunning()` в обработчике завершения ещё был True, и вышка, поставленная во время расчёта, не появлялась | Флаги занятости; ссылки на потоки держатся до завершения |
-| 13 | `gui.py` | Исключение в расчёте одной вышки останавливало очередь навсегда | Ошибка выводится в строке состояния, очередь продолжается |
-| 14 | `buildings.py` | Растеризация O(h·E·w) по памяти; блокировка удерживалась на всю загрузку кэша — расчёт вышки ждал | Построчная развёртка (результат идентичен); блокировка только на запись плиток |
-| 15 | `tower.py` | `to_js` — цикл Python по 180 лучам каждой вышки при каждом обновлении карты | Векторизация + кэш |
-| 16 | `gui.py` | Счётчик «Вышка #N» после импорта/алгоритма выдавал занятые номера | Счётчик учитывает добавленные имена |
-| 17 | `tests/` | На Windows 23 теста падали: не закрытая БД мешала удалить временную папку, вывод Node читался в cp1251 | Исправлено |
-
-Тесты: **108**, все проходят (`tests/test_regressions.py` и `TestGuiRegressions` — новые; 14 из них падают на прежнем коде).
-
-### Отчёт №5. Подвисания при работе с кабелями, зона Френеля, лепестки антенн, SNMP (20 октября 2026)
-
-**Подвисания.** Замер (заглушка Qt, 40 вышек, 40 устройств, 80 кабелей): Python тратил ~12 мс на действие, из них ~7 мс —
-`fsync` SQLite. Основная задержка была на карте и при запуске:
-
-| Где | Причина | Исправление |
-|---|---|---|
-| `map_app.js` | Каждая вышка и **каждая подпись кабеля — DOM-маркер**; MapLibre двигает их все на каждом кадре панорамы/перетаскивания | Вышки (точка + имя) и подписи кабелей — слои карты (GPU). В демо-проекте DOM-маркеров 6 вместо 20 |
-| `map_app.js` | При повороте сектора полигоны **всех** вышек пересобирались на каждое движение мыши | Активная вышка рисуется в отдельном источнике, у остальных полигоны кэшируются по версии расчёта |
-| `map_app.js` | Кабель при перетаскивании устройства «прыгал» только после отпускания | Концы кабелей двигаются вместе с устройством |
-| `gui.py` | Лучи всех вышек пересылались на карту после любого изменения | Пересылаются только лучи вышек с новой версией расчёта (`rev`) |
-| `tower.py` | Каждое изменение в БД ждало сброса диска | SQLite в режиме WAL, `synchronous=NORMAL` |
-| `net_ui.py` | Перетаскивание устройства писало сеть в БД на каждое событие | Запись через 0.4 с после последнего движения (и при закрытии) |
-| `gui.py` | **При каждом запуске пересчитывались все вышки**, хотя актуальные зоны лежат в БД | В БД хранится, чем посчитаны зоны (версия модели, флаги, здания); пересчёт только устаревших |
-| `buildings.py` | При запуске фоновый поток заново разбирал все ответы Overpass (секунды захвата GIL — интерфейс тормозил) | Растр зданий сохраняется в `buildings_cache/raster_cache.npz` и грузится за миллисекунды |
-
-**Новое.**
-* Перенос вышки мышью в режиме «Навигация»: зоны и кабели БС следуют за курсором, после отпускания — пересчёт.
-* Дифракция в зоне Френеля и диаграмма антенны с задним лепестком (см. раздел 4). Расчёт вышки с учётом зданий:
-  микросота ~6 мс, макросота 35 м ~18 мс (без новой физики было 3–5 мс).
-  Сохранённые зоны пересчитываются один раз (новая версия модели).
-* **SNMP:** двойной клик по вышке/устройству, кнопка «SNMP-опрос вышки…», «SNMP…» на вкладке «Сеть» или Ctrl+8.
-  Окно показывает команду `snmpwalk`, путь запроса от NMS (на ядре сети) и RTT. Таблицы: «Система», ifTable
-  (скорость, состояние, счётчики октетов по загрузке из теста нагрузки, ошибки), IP и маршруты, соседи LLDP,
-  PoE у коммутаторов или радиопараметры у БС, а также сырой вывод snmpwalk для копирования. Нет маршрута →
-  «Timeout: No Response» и данные с локального порта управления; нет питания — агент не отвечает.
-  Ядра в проекте нет → опрос локальный (craft-порт).
-
-Тесты: **121**, все проходят, включая тесты карты в Node.js.
+The test suite verifies RF propagation physics (`test_core.py`), Algorithm 1 set cover (`test_algorithm_1.py`), Pure-NumPy SurrogateNet forward/backward gradients and placement (`test_ai_placement.py`), Memetic GA operators (`test_ga_placement.py`), DEM terrain elevation (`test_terrain.py`), L1/L2/L3 + SNMP + Auto-Network + Load Testing (`test_network.py`, `test_auto_network.py`, `test_loadtest.py`), JS map client logic via Node/harness (`test_js.py`), Undo/Redo, antenna catalog, GUI smoke checks, and historical bug regressions (`test_regressions.py`).
